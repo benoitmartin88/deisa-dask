@@ -1,5 +1,5 @@
 # =============================================================================
-# Copyright (C) 2025 Commissariat a l'energie atomique et aux energies alternatives (CEA)
+# Copyright (C) 2026 Commissariat a l'energie atomique et aux energies alternatives (CEA)
 #
 # All rights reserved.
 #
@@ -26,21 +26,29 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 # =============================================================================
-
-from typing import Any
+import collections
+import math
+import uuid
+from numbers import Number
+from typing import Any, Iterator, List
 
 import numpy as np
-from deisa.core import validate_system_metadata, validate_arrays_metadata, IBridge
-from distributed import Client, Queue, Variable, Lock
-from distributed.utils import TimeoutError
+from dask.tokenize import tokenize
+from deisa.core import validate_system_metadata, validate_arrays_metadata, IBridge, ICommunicator
+from distributed import Client, Variable, Future
+from distributed.protocol import to_serialize
+from distributed.utils_comm import scatter_to_workers
+from tlz import valmap
 
-from deisa.dask.deisa import LOCK_PREFIX, VARIABLE_PREFIX
+from deisa.dask.communicator import resolve_comm
+from deisa.dask.deisa import VARIABLE_PREFIX
 from deisa.dask.handshake import Handshake
 
 
 class Bridge(IBridge):
-
-    def __init__(self, id: int, arrays_metadata: dict[str, dict], system_metadata: dict[str, Any], *args, **kwargs):
+    def __init__(self, id: int,
+                 arrays_metadata: dict[str, dict], system_metadata: dict[str, Any],
+                 comm: ICommunicator = None, *args, **kwargs):
         """
         Initializes an object to manage communication between an MPI-based distributed
         system and a Dask-based framework. The class ensures proper allocation of workers
@@ -74,12 +82,31 @@ class Bridge(IBridge):
         self.system_metadata = validate_system_metadata(system_metadata)
         self.client: Client = self.system_metadata['connection']
         self.arrays_metadata = validate_arrays_metadata(arrays_metadata)
-        self.mpi_rank = id
-        self.futures = []
+        self.id = id
+        self.workers = list(self.client.scheduler_info()["workers"].keys())
+
+        # for each array, compute total number of chunks and sum. For headroom, x10 iterations.
+        maxlen = 10 * (sum(math.prod(s // ss for s, ss in zip(meta['size'], meta['subsize']))
+                           for meta in self.arrays_metadata.values()))
+        self._inflight_futures = collections.deque(maxlen=maxlen)
+
+        # handle 3 cases for Comm:
+        # - if comm is None: use_mpi_if_available or no MPI
+        # - if comm is an MPI Comm: use it
+        self.comm: ICommunicator = resolve_comm(comm, use_mpi_if_available=True,
+                                                client=self.client,
+                                                size=self.system_metadata['nb_bridges'])
 
         # blocking until analytics is ready
         Handshake('bridge', self.client, id=id, max=self.system_metadata['nb_bridges'],
                   arrays_metadata=self.arrays_metadata, **kwargs)
+
+    def __del__(self):
+        self.client.close()
+        self.system_metadata.clear()
+
+    def close(self):
+        self.__del__()
 
     def send(self, array_name: str, data: np.ndarray, iteration: int, chunked: bool = True):
         """
@@ -101,35 +128,130 @@ class Bridge(IBridge):
 
         assert self.client.status == 'running', "Client is not connected to a scheduler. Please check your connection."
 
-        # TODO: select workers to send data to. self.client.scatter(data, direct=True, workers=self.workers)
-        f = self.client.scatter(data, direct=True)  # send data to workers
+        # Send data to worker
+        # TODO: select workers to send data to.
+        res = self._better_scatter(data, workers=self.workers, hash=False)  # send data to workers
 
-        # TODO: this is a memory leak. Find a way to release the futures once they are used to build a dask array in the client code.
-        self.futures.append(f)
-
+        # Barrier. Wait for all bridges.
         to_send = {
-            'rank': self.mpi_rank,
-            'shape': data.shape,
-            'dtype': data.dtype,
+            'array_name': array_name,
+            'id': self.id,
             'iteration': iteration,
-            'future': f
+            'future-info': res
         }
+        print(f"[Bridge {self.id}] send() to_send={to_send}", flush=True)
+        gathered_data = self.comm.gather(to_send, root=0)
+        print(f"[Bridge {self.id}] send() gathered_data={gathered_data}", flush=True)  # TODO: use logger
 
-        q = Queue(array_name, client=self.client)
-        q.put(to_send)
+        if gathered_data is not None:
+            # rank 0 (root=0 in comm.gather)
+            # aggregate who has what
+            who_has = {}
+            nbytes = {}
+            for d in gathered_data:
+                who_has = {**who_has, **d['future-info']['who_has']}
+                nbytes = {**nbytes, **d['future-info']['nbytes']}
+
+                # TODO: might be an issue: if analytics is slow, future may be released before use, leading to FutureCancelledError
+                self._inflight_futures.append(d['future-info']['future'])
+
+            # only update the scheduler with who has what and register the future once
+            self.client.sync(self.client.scheduler.update_data, who_has=who_has, nbytes=nbytes)
+
+            to_send = {
+                'array_name': array_name,
+                'iteration': iteration,
+
+                'futures': [{
+                    'future': d['future-info']['future'],
+                    'id': d['id'],
+                    'shape': data.shape,  # TODO: remove
+                    'dtype': str(data.dtype),  # TODO: remove
+                } for d in gathered_data]
+            }
+            self.client.log_event(array_name, to_send)
 
         # TODO: what to do if error ?
 
     def get(self, key: str, default: Any = None, chunked: bool = False, delete: bool = True):
+        def get_variable(dask_scheduler, name):
+            ext = dask_scheduler.extensions["variables"]
+            v = ext.variables.get(name)
+            return v if v is not None else None
+
         if chunked:
             raise NotImplementedError()  # TODO
         else:
-            try:
-                with Lock(f'{LOCK_PREFIX}{key}'):
-                    return Variable(f'{VARIABLE_PREFIX}{key}', client=self.client).get(timeout=0)
-            except TimeoutError:
-                return default
-            finally:
+            var_name = f"{VARIABLE_PREFIX}{key}"
+            is_set = self.client.run_on_scheduler(get_variable, name=var_name)
+            if is_set:
+                var = Variable(var_name, client=self.client)
+                res = var.get()
                 if delete:
-                    with Lock(f'{LOCK_PREFIX}{key}'):
-                        Variable(f'{VARIABLE_PREFIX}{key}', client=self.client).delete()
+                    var.delete()
+                return res
+            else:
+                return default
+
+    def _better_scatter(self, data: np.ndarray, workers: List[str] = None, hash=False):
+        if workers is None:
+            workers = self.workers
+
+        return self.client.sync(
+            self.__scatter,
+            data,
+            workers=workers,
+            hash=hash)
+
+    async def __scatter(self, data, workers=None, hash=False):
+        if isinstance(workers, (str, Number)):
+            workers = [workers]
+        if isinstance(data, type(range(0))):
+            data = list(data)
+
+        input_type = type(data)
+        names = False
+        unpack = False
+        if isinstance(data, Iterator):
+            data = list(data)
+        if isinstance(data, (set, frozenset)):
+            data = list(data)
+        if not isinstance(data, (dict, list, tuple, set, frozenset)):
+            unpack = True
+            data = [data]
+        if isinstance(data, (list, tuple)):
+            if hash:
+                names = [type(x).__name__ + "-" + tokenize(x) for x in data]
+            else:
+                names = [type(x).__name__ + "-" + uuid.uuid4().hex for x in data]
+            data = dict(zip(names, data))
+
+        assert isinstance(data, dict)
+
+        types = valmap(type, data)
+        data2 = valmap(to_serialize, data)
+
+        _, who_has, nbytes = await scatter_to_workers(workers, data2, self.client.rpc)
+
+        # await self.client.scheduler.update_data(
+        #     who_has=who_has, nbytes=nbytes, client=self.client.id
+        # )
+
+        out = {
+            k: {
+                'future': Future(k, self.client).key,
+                'who_has': who_has,
+                'nbytes': nbytes
+            }
+            for k in data
+        }
+        for key, typ in types.items():
+            self.client.futures[key].finish(type=typ)
+
+        if issubclass(input_type, (list, tuple, set, frozenset)):
+            out = input_type(out[k] for k in names)
+
+        if unpack:
+            assert len(out) == 1
+            out = list(out.values())[0]
+        return out

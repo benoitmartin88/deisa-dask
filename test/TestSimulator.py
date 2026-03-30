@@ -1,5 +1,5 @@
 # =============================================================================
-# Copyright (C) 2025 Commissariat a l'energie atomique et aux energies alternatives (CEA)
+# Copyright (C) 2026 Commissariat a l'energie atomique et aux energies alternatives (CEA)
 #
 # All rights reserved.
 #
@@ -29,9 +29,25 @@
 from typing import Tuple
 
 import numpy as np
+from deisa.core import ICommunicator
 from distributed import Client
 
 from deisa.dask import Bridge
+from deisa.dask.communicator import DaskComm
+
+
+class FakeComm(ICommunicator):
+    def __init__(self, size):
+        self.size = size
+        self._buffer = []
+
+    def gather(self, value, root=0):
+        self._buffer.append(value)
+        if len(self._buffer) == self.size:
+            result = self._buffer.copy()
+            self._buffer.clear()
+            return result
+        return None
 
 
 class TestSimulation:
@@ -43,8 +59,11 @@ class TestSimulation:
         self.mpi_parallelism = mpi_parallelism
         nb_mpi_ranks = mpi_parallelism[0] * mpi_parallelism[1]
         self.bridges: list[Bridge] = [
-            Bridge(id=rank, arrays_metadata=arrays_metadata,
-                   system_metadata={'connection': client, 'nb_bridges': nb_mpi_ranks}, *args, **kwargs)
+            Bridge(id=rank,
+                   arrays_metadata=arrays_metadata,
+                   system_metadata={'connection': client, 'nb_bridges': nb_mpi_ranks},
+                   comm=DaskComm(self.client, nb_mpi_ranks),
+                   *args, **kwargs)
             for rank in range(nb_mpi_ranks)]
 
     def __gen_data(self, array_name: str, noise_level: int = 0) -> np.ndarray:
@@ -93,12 +112,12 @@ class TestSimulation:
             assert len(chunks) == len(self.bridges), "There should be as many chunks as bridges."
 
             if send_order_fn is None:
-                for i, bridge in enumerate(self.bridges):
-                    print(f"sending data for array={array_name} to bridge id={bridge.mpi_rank}")
+                for i, bridge in reversed(list(enumerate(self.bridges))):
+                    print(f"[TestSimulator] generate_data for array={array_name} to bridge id={bridge.id}")
                     bridge.send(array_name, chunks[i], iteration)
             else:
                 send_order = send_order_fn(chunks)
-                for i, chunk in enumerate(send_order):
+                for i, (_, chunk) in zip(reversed(range(len(send_order))), enumerate(send_order)):
                     self.bridges[i].send(array_name, chunk, iteration)
 
         assert len(global_datas) == len(array_names)

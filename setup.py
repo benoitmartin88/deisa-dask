@@ -65,9 +65,11 @@ setup(name='deisa-dask',
       packages=find_namespace_packages(where='src', include=['deisa.dask']),
 
       install_requires=[
-          "deisa-core==0.1.0",
+          "deisa-core>=0.3.0",
           'dask',
-          'distributed'
+          'distributed',
+          "toolz", # version constraint from distributed
+          "uuid"
       ],
 
       extras_require={
@@ -75,6 +77,9 @@ setup(name='deisa-dask',
               "pytest",
               "pytest-xdist",
               "numpy",
+          ],
+          "mpi": [
+              "mpi4py"
           ]
       },
       test_suite='test',
