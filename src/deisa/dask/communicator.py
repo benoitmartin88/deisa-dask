@@ -27,9 +27,10 @@
 # POSSIBILITY OF SUCH DAMAGE.
 # =============================================================================
 import time
-from typing import Any, Optional
-
 import uuid
+from typing import Any, Optional, List, Sequence
+
+import numpy as np
 from deisa.core import ICommunicator
 from distributed import Client
 
@@ -44,12 +45,31 @@ def is_mpi_comm(comm):
         return False
 
 
-def resolve_comm(comm, use_mpi_if_available=True, *args, **kwargs) -> ICommunicator:
+def is_running_on_mpi():
+    try:
+        import mpi4py
+        mpi4py.rc.initialize = False
+        from mpi4py import MPI
+        return MPI.Is_initialized() and MPI.COMM_WORLD.Get_size() > 1
+    except ImportError:
+        return False
+
+
+def resolve_comm(comm, cart_coord_dims=None, use_mpi_if_available=True, *args, **kwargs) -> ICommunicator:
+    """
+    1 comm per array
+    handle 3 cases for Comm:
+    - if comm is None: use_mpi_if_available or no MPI
+    - if comm is an MPI Comm: use it
+    """
     if comm is None:
-        if use_mpi_if_available:
+        if use_mpi_if_available and is_running_on_mpi():
             try:
                 from mpi4py import MPI
-                return MPI.COMM_WORLD
+                mpi_comm = MPI.COMM_WORLD
+                dims = MPI.Compute_dims(mpi_comm.Get_size(), dims=cart_coord_dims)
+                cart_comm = mpi_comm.Create_cart(dims)
+                return cart_comm
             except ImportError:
                 return DaskComm(*args, **kwargs)
         return DaskComm(*args, **kwargs)
@@ -61,9 +81,16 @@ def resolve_comm(comm, use_mpi_if_available=True, *args, **kwargs) -> ICommunica
 
 
 class DaskComm(ICommunicator):
-    def __init__(self, client: Client, size: int):
+    def __init__(self, client: Client, size: int, cart_coord_dims: Optional[Sequence[int]] = None, *args, **kwargs):
         self.client = client
         self.size = size
+
+        # Cartesian topology
+        if cart_coord_dims is None:
+            # simple fallback: 1D
+            cart_coord_dims = (size,)
+        self.dims = tuple(cart_coord_dims)
+
         self._seq = 0
         self._rank = None
         self._actor = _get_actor(client, CommActor, size=size)
@@ -78,6 +105,9 @@ class DaskComm(ICommunicator):
 
     def Get_size(self) -> int:
         return self.size
+
+    def Get_coords(self, rank) -> List[int]:
+        return self._actor.get_coords(rank, dims=self.dims).result()
 
     def gather(self, data: Any, root: int = 0) -> Optional[list[Any]]:
         seq = self._seq
@@ -132,3 +162,7 @@ class CommActor:
 
     def gather_get(self, seq: int):
         return self.gathers.pop(seq, [])
+
+    # cartesian topology
+    def get_coords(self, rank: int, dims):
+        return tuple(int(c) for c in np.unravel_index(rank, dims))

@@ -57,9 +57,6 @@ class Bridge(IBridge):
         :param id: Unique identifier in the computation. This may be the rank of this MPI process.
         :type id: int
 
-        :param mpi_comm_size: Total number of MPI processes involved in the computation.
-        :type mpi_comm_size: int
-
         :param arrays_metadata: A dictionary containing metadata about the Dask arrays
                 eg: arrays_metadata = {
                     'global_t': {
@@ -72,10 +69,10 @@ class Bridge(IBridge):
                     }
         :type arrays_metadata: dict[str, dict]
 
-        :param connection: A function that returns a connected Dask Client.
-        :type connection: Callable
+        :param args: Passed to Communicator
+        type: args: tuple
 
-        :param kwargs: Passed to Handshake
+        :param kwargs: Passed to Handshake and Communicator
         :type kwargs: dict
         """
         super().__init__(id, arrays_metadata, system_metadata, *args, **kwargs)
@@ -90,12 +87,10 @@ class Bridge(IBridge):
                            for meta in self.arrays_metadata.values()))
         self._inflight_futures = collections.deque(maxlen=maxlen)
 
-        # handle 3 cases for Comm:
-        # - if comm is None: use_mpi_if_available or no MPI
-        # - if comm is an MPI Comm: use it
         self.comm: ICommunicator = resolve_comm(comm, use_mpi_if_available=True,
                                                 client=self.client,
-                                                size=self.system_metadata['nb_bridges'])
+                                                size=self.system_metadata['nb_bridges'],
+                                                *args, **kwargs)
 
         # blocking until analytics is ready
         Handshake('bridge', self.client, id=id, max=self.system_metadata['nb_bridges'],
@@ -134,10 +129,8 @@ class Bridge(IBridge):
 
         # Barrier. Wait for all bridges.
         to_send = {
-            'array_name': array_name,
-            'id': self.id,
-            'iteration': iteration,
-            'future-info': res
+            'future-info': res,
+            'placement': self.comm.Get_coords(self.comm.Get_rank()) if hasattr(self.comm, 'Get_coords') else self.id
         }
         print(f"[Bridge {self.id}] send() to_send={to_send}", flush=True)
         gathered_data = self.comm.gather(to_send, root=0)
@@ -164,9 +157,9 @@ class Bridge(IBridge):
 
                 'futures': [{
                     'future': d['future-info']['future'],
-                    'id': d['id'],
-                    'shape': data.shape,  # TODO: remove
-                    'dtype': str(data.dtype),  # TODO: remove
+                    'shape': data.shape,
+                    'dtype': str(data.dtype),
+                    'placement': d['placement']
                 } for d in gathered_data]
             }
             self.client.log_event(array_name, to_send)
