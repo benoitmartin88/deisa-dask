@@ -28,6 +28,7 @@
 # =============================================================================
 import logging
 import os
+import sys
 
 from distributed import Client, Lock, Variable
 
@@ -40,11 +41,11 @@ def get_connection_info(dask_scheduler_address: str | Client) -> Client:
         client = dask_scheduler_address
     elif isinstance(dask_scheduler_address, str):
         try:
-            client = Client(address=dask_scheduler_address)
+            client = Client(address=dask_scheduler_address, heartbeat_interval=f"{sys.maxsize}w")
         except ValueError:
             # try scheduler_file
             if os.path.isfile(dask_scheduler_address):
-                client = Client(scheduler_file=dask_scheduler_address)
+                client = Client(scheduler_file=dask_scheduler_address, heartbeat_interval=f"{sys.maxsize}w")
             else:
                 raise ValueError(
                     "dask_scheduler_address must be a string containing the address of the scheduler, "
