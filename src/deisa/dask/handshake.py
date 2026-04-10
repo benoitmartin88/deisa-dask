@@ -27,15 +27,14 @@
 # POSSIBILITY OF SUCH DAMAGE.
 # =============================================================================
 
-from dask.distributed import Variable
-from distributed import Client, Future, get_client, Lock
+from distributed import Client, Future, get_client, Event
 
 from deisa.dask.utils import _get_actor
 
 
 class Handshake:
     DEISA_HANDSHAKE_ACTOR_FUTURE_VARIABLE = 'deisa_handshake_actor_future'
-    DEISA_WAIT_FOR_GO_VARIABLE = 'deisa_handshake_wait_for_go'
+    DEISA_WAIT_FOR_GO_EVENT = 'deisa_handshake_wait_for_go'
 
     class HandshakeActor:
         bridges = []
@@ -85,7 +84,7 @@ class Handshake:
             return self.__are_bridges_ready() and self.analytics_ready
 
         def __go(self):
-            Variable(Handshake.DEISA_WAIT_FOR_GO_VARIABLE, client=self.client).set(None)
+            Event(Handshake.DEISA_WAIT_FOR_GO_EVENT, client=self.client).set()
 
     def __init__(self, who: str, client: Client, **kwargs):
         self.client = client
@@ -107,6 +106,7 @@ class Handshake:
         assert self.handshake_actor is not None
         self.handshake_actor.add_bridge(id, max).result()
 
+        # TODO: change this so that the check is not done on id=0
         if id == 0:
             self.handshake_actor.set_arrays_metadata(arrays_metadata).result()
 
@@ -134,4 +134,4 @@ class Handshake:
         return self.handshake_actor.get_max_bridges().result()
 
     def __wait_for_go(self) -> None:
-        Variable(Handshake.DEISA_WAIT_FOR_GO_VARIABLE, client=self.client).get()
+        Event(Handshake.DEISA_WAIT_FOR_GO_EVENT, client=self.client).wait()
