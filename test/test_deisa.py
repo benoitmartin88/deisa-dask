@@ -46,82 +46,6 @@ from utils import wait_for, dask_array_element_wise_equal
 logging.basicConfig(level=logging.DEBUG)
 
 
-@pytest.mark.parametrize('global_shape', [(32, 32), (32, 16), (16, 32)])
-@pytest.mark.parametrize('local_shape', [(16, 16), (2, 2), (8, 1), (8, 1)])
-def test_reconstruct_global_dask_array_2d(global_shape, local_shape):
-    print(f"global_shape={global_shape} local_shape={local_shape}")
-
-    state = da.random.RandomState(42)
-    global_data = state.random(global_shape)
-
-    global_len_x, global_len_y = global_shape
-    local_len_x, local_len_y = local_shape
-
-    expected_nb_blocks = (global_len_x // local_len_x
-                          * global_len_y // local_len_y)
-
-    # create blocks (i.e. 1 block per mpi rank)
-    blocks = []
-    for x in range(0, global_len_x, local_len_x):
-        for y in range(0, global_len_y, local_len_y):
-            block = global_data[x:x + local_len_x, y:y + local_len_y]
-            blocks.append(block)
-
-    assert len(blocks) == expected_nb_blocks, "number of blocks does not match expected"
-
-    # tested method
-    reconstructed_global_data = Deisa._Deisa__tile_dask_blocks(blocks, global_shape)  # access private staticmethod
-
-    assert reconstructed_global_data.shape == global_data.shape, "reconstructed global data shape does not match original"
-    assert reconstructed_global_data.chunksize == (local_len_x,
-                                                   local_len_y), "reconstructed global data chunksize does not match original"
-    assert reconstructed_global_data.all() == global_data.all(), "reconstructed global data does not match original"
-
-
-@pytest.mark.parametrize('global_shape', [(32, 32, 32), (32, 32, 16), (32, 16, 32), (16, 32, 32), (128, 64, 16)])
-@pytest.mark.parametrize('local_shape', [(16, 16, 16), (8, 8, 1), (8, 1, 8), (1, 8, 8)])
-def test_reconstruct_global_dask_array_3d(global_shape, local_shape):
-    print(f"global_shape={global_shape} local_shape={local_shape}")
-
-    state = da.random.RandomState(42)
-    global_data = state.random(global_shape)
-
-    global_len_x, global_len_y, global_len_z = global_shape
-    local_len_x, local_len_y, local_len_z = local_shape
-
-    expected_nb_blocks = (global_len_x // local_len_x
-                          * global_len_y // local_len_y
-                          * global_len_z // local_len_z)
-
-    # create blocks (i.e. 1 block per mpi rank)
-    blocks = []
-    for x in range(0, global_len_x, local_len_x):
-        for y in range(0, global_len_y, local_len_y):
-            for z in range(0, global_len_z, local_len_z):
-                block = global_data[x:x + local_len_x, y:y + local_len_y, z:z + local_len_z]
-                blocks.append(block)
-
-    assert len(blocks) == expected_nb_blocks, "number of blocks does not match expected"
-
-    # tested method
-    reconstructed_global_data = Deisa._Deisa__tile_dask_blocks(blocks, global_shape)  # access private staticmethod
-
-    assert reconstructed_global_data.shape == global_data.shape, "reconstructed global data shape does not match original"
-    assert reconstructed_global_data.chunksize == (local_len_x, local_len_y,
-                                                   local_len_z), "reconstructed global data chunksize does not match original"
-    assert reconstructed_global_data.all() == global_data.all(), "reconstructed global data does not match original"
-
-
-def test_reconstruct_global_dask_array_none():
-    with pytest.raises(ValueError):
-        Deisa._Deisa__tile_dask_blocks(None, (2, 2))  # access private staticmethod
-
-
-def test_reconstruct_global_dask_array_empty():
-    with pytest.raises(ValueError):
-        Deisa._Deisa__tile_dask_blocks([], (2, 2))  # access private staticmethod
-
-
 @pytest.mark.xdist_group(name="serial")
 class TestDeisaCtor:
     @pytest.fixture(scope="class")
@@ -173,6 +97,80 @@ class TestUsingDaskCluster:
         # teardown
         client.close()
         cluster.close()
+
+    @pytest.mark.parametrize('global_shape', [(32, 32), (32, 16), (16, 32)])
+    @pytest.mark.parametrize('local_shape', [(16, 16), (2, 2), (8, 1), (8, 1)])
+    def test_reconstruct_global_dask_array_2d(self, env_setup, global_shape, local_shape):
+        print(f"global_shape={global_shape} local_shape={local_shape}")
+
+        state = da.random.RandomState(42)
+        global_data = state.random(global_shape)
+
+        global_len_x, global_len_y = global_shape
+        local_len_x, local_len_y = local_shape
+
+        expected_nb_blocks = (global_len_x // local_len_x
+                              * global_len_y // local_len_y)
+
+        # create blocks (i.e. 1 block per mpi rank)
+        blocks = []
+        for x in range(0, global_len_x, local_len_x):
+            for y in range(0, global_len_y, local_len_y):
+                block = global_data[x:x + local_len_x, y:y + local_len_y]
+                blocks.append(block)
+
+        assert len(blocks) == expected_nb_blocks, "number of blocks does not match expected"
+
+        # tested method
+        reconstructed_global_data = Deisa._Deisa__tile_dask_blocks(blocks, global_shape)  # access private staticmethod
+
+        assert reconstructed_global_data.shape == global_data.shape, "reconstructed global data shape does not match original"
+        assert reconstructed_global_data.chunksize == (local_len_x,
+                                                       local_len_y), "reconstructed global data chunksize does not match original"
+        assert dask_array_element_wise_equal(reconstructed_global_data,
+                                             global_data), "reconstructed global data does not match original"
+
+    @pytest.mark.parametrize('global_shape', [(32, 32, 32), (32, 32, 16), (32, 16, 32), (16, 32, 32), (128, 64, 16)])
+    @pytest.mark.parametrize('local_shape', [(16, 16, 16), (8, 8, 1), (8, 1, 8), (1, 8, 8)])
+    def test_reconstruct_global_dask_array_3d(self, env_setup, global_shape, local_shape):
+        print(f"global_shape={global_shape} local_shape={local_shape}")
+
+        state = da.random.RandomState(42)
+        global_data = state.random(global_shape)
+
+        global_len_x, global_len_y, global_len_z = global_shape
+        local_len_x, local_len_y, local_len_z = local_shape
+
+        expected_nb_blocks = (global_len_x // local_len_x
+                              * global_len_y // local_len_y
+                              * global_len_z // local_len_z)
+
+        # create blocks (i.e. 1 block per mpi rank)
+        blocks = []
+        for x in range(0, global_len_x, local_len_x):
+            for y in range(0, global_len_y, local_len_y):
+                for z in range(0, global_len_z, local_len_z):
+                    block = global_data[x:x + local_len_x, y:y + local_len_y, z:z + local_len_z]
+                    blocks.append(block)
+
+        assert len(blocks) == expected_nb_blocks, "number of blocks does not match expected"
+
+        # tested method
+        reconstructed_global_data = Deisa._Deisa__tile_dask_blocks(blocks, global_shape)  # access private staticmethod
+
+        assert reconstructed_global_data.shape == global_data.shape, "reconstructed global data shape does not match original"
+        assert reconstructed_global_data.chunksize == (local_len_x, local_len_y,
+                                                       local_len_z), "reconstructed global data chunksize does not match original"
+        assert dask_array_element_wise_equal(reconstructed_global_data,
+                                             global_data), "reconstructed global data does not match original"
+
+    def test_reconstruct_global_dask_array_none(self, env_setup):
+        with pytest.raises(ValueError):
+            Deisa._Deisa__tile_dask_blocks(None, (2, 2))  # access private staticmethod
+
+    def test_reconstruct_global_dask_array_empty(self, env_setup):
+        with pytest.raises(ValueError):
+            Deisa._Deisa__tile_dask_blocks([], (2, 2))  # access private staticmethod
 
     def test_dask_queue(self, env_setup):
         client, cluster = env_setup

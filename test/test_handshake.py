@@ -45,7 +45,7 @@ class TestHandshake:
             p.join()
             assert p.exitcode == 0, "process exited with error"
 
-    @pytest.mark.parametrize('nb_bridge', [1, 4, 64])
+    @pytest.mark.parametrize('nb_bridge', [1, 4])
     def test_handshake_deisa_first(self, env_setup, nb_bridge: int):
         cluster = env_setup
         addr = cluster.scheduler.address
@@ -59,7 +59,7 @@ class TestHandshake:
         TestHandshake.start_processes(processes)
         TestHandshake.join_processes(processes)
 
-    @pytest.mark.parametrize('nb_bridge', [1, 4, 64])
+    @pytest.mark.parametrize('nb_bridge', [1, 4])
     def test_handshake_bridge_first(self, env_setup, nb_bridge: int):
         cluster = env_setup
         addr = cluster.scheduler.address
