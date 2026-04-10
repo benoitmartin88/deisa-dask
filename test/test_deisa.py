@@ -122,12 +122,14 @@ def test_reconstruct_global_dask_array_empty():
         Deisa._Deisa__tile_dask_blocks([], (2, 2))  # access private staticmethod
 
 
+@pytest.mark.xdist_group(name="serial")
 class TestDeisaCtor:
     @pytest.fixture(scope="class")
     def env_setup_tcp_cluster(self):
-        cluster = LocalCluster(n_workers=1, threads_per_worker=1, processes=True, host='127.0.0.1', scheduler_port=4242)
+        cluster = LocalCluster(n_workers=1, threads_per_worker=1, processes=True, dashboard_address=None,
+                               host='127.0.0.1', scheduler_port=4242)
         client = Client(cluster)
-        client.wait_for_workers(1, timeout=10)
+        client.wait_for_workers(1, timeout=20)
         yield cluster
         cluster.close()
 

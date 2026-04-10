@@ -75,6 +75,7 @@ setup(name='deisa-dask',
       extras_require={
           "test": [
               "pytest",
+              "pytest-timeout",
               "pytest-xdist",
               "numpy",
           ],
