@@ -87,6 +87,13 @@ class Bridge(IBridge):
                                                 size=self.system_metadata['nb_bridges'],
                                                 *args, **kwargs)
 
+        logger.debug(f"[{self.id}] Bridge __init__() with:\n"
+                     f"comm={self.comm}\n"
+                     f"client={self.client}\n"
+                     f"arrays_metadata={self.arrays_metadata}\n"
+                     f"system_metadata={self.system_metadata}\n"
+                     f"workers={self.workers}")
+
         # blocking until analytics is ready
         Handshake('bridge', self.client, id=id, max=self.system_metadata['nb_bridges'],
                   arrays_metadata=self.arrays_metadata, **kwargs)

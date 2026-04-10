@@ -26,10 +26,13 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 # =============================================================================
+import logging
 
 from distributed import Client, Future, get_client, Event
 
 from deisa.dask.utils import _get_actor
+
+logger = logging.getLogger(__name__)
 
 
 class Handshake:
@@ -43,6 +46,7 @@ class Handshake:
         analytics_ready = False
 
         def __init__(self):
+            logger.debug('HandshakeActor.__init__()')
             self.bridges = []
             self.max_bridges = 0
             self.arrays_metadata = {}

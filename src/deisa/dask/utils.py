@@ -26,14 +26,16 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 # =============================================================================
-
-
+import logging
 import os
 
 from distributed import Client, Lock, Variable
 
+logger = logging.getLogger(__name__)
+
 
 def get_connection_info(dask_scheduler_address: str | Client) -> Client:
+    logger.info(f"get_connection_info: {dask_scheduler_address}")
     if isinstance(dask_scheduler_address, Client):
         client = dask_scheduler_address
     elif isinstance(dask_scheduler_address, str):
