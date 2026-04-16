@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools >= 77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deisa-dask"
+version = "0.3.0"
+description = "In Situ Analytics with Dask backend"
+requires-python = ">=3.10"
+readme = "README.md"
+license = "MIT"
+
+authors = [
+    { name = "Benoit Martin", email = "bmartin@cea.fr" }
+]
+maintainers = [
+    { name = "Benoit Martin", email = "bmartin@cea.fr" },
+]
+
+classifiers = [
+    "Programming Language :: Python :: 3.10",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Development Status :: 3 - Alpha",
+]
+
+dependencies = [
+    "deisa-core>=0.4.0",
+    "dask",
+    "distributed",
+    "toolz", # version constraint from distributed
+    "uuid"
+]
+
+[project.urls]
+Homepage = "https://github.com/deisa-project/deisa-dask"
+#Documentation = "https://readthedocs.org"
+Repository = "https://github.com/deisa-project/deisa-dask.git"
+Issues = "https://github.com/deisa-project/deisa-dask/issues"
+Changelog = "https://github.com/deisa-project/deisa-dask/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+mpi = [
+    "mpi4py"
+]
+
+
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/deisa"]
+
+[dependency-groups]
+test = [
+    "ruff",
+    "pytest",
+    "pytest-timeout",
+    "pytest-xdist",
+    "numpy"
+]
+
+[tool.ruff]
+line-length = 120
+exclude = ["build", "dist", ".venv"]
