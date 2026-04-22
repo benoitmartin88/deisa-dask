@@ -29,17 +29,17 @@
 import logging
 import uuid
 from numbers import Number
-from typing import Any, Iterator, List
+from typing import Any, Iterator, List, Optional
 
 import numpy as np
 from dask.tokenize import tokenize
 from deisa.core import validate_system_metadata, validate_arrays_metadata, IBridge, ICommunicator
-from distributed import Client, Variable
+from distributed import Client, Variable, rpc
 from distributed.protocol import to_serialize
 from distributed.utils_comm import scatter_to_workers
 from tlz import valmap
 
-from deisa.dask.communicator import resolve_comm
+from deisa.dask.communicator import setup_comm, CommClient
 from deisa.dask.deisa import VARIABLE_PREFIX, CLIENT_KEY
 from deisa.dask.handshake import Handshake
 
@@ -77,27 +77,56 @@ class Bridge(IBridge):
         :type kwargs: dict
         """
         super().__init__(id, arrays_metadata, system_metadata, *args, **kwargs)
-        self.system_metadata = validate_system_metadata(system_metadata)
-        self.client: Client = self.system_metadata['connection']
-        self.arrays_metadata = validate_arrays_metadata(arrays_metadata)
         self.id = id
-        self.workers = list(self.client.scheduler_info(n_workers=-1)["workers"].keys())
-        self.comm: ICommunicator = resolve_comm(comm, use_mpi_if_available=True,
-                                                client=self.client,
-                                                size=self.system_metadata['nb_bridges'],
-                                                *args, **kwargs)
+        self.system_metadata = validate_system_metadata(system_metadata)
+        self.arrays_metadata = validate_arrays_metadata(arrays_metadata)
+        self.workers = None
+        self.handshake = None
+
         self._has_close_been_called = False
 
+        self.client: Optional[Client] = None
+
+        if self.id == 0:
+            # only id 0 has a real dask client
+            self.client: Client = self.system_metadata['connection']
+            # get all workers from scheduler
+            self.workers = self.client.scheduler_info(n_workers=-1)["workers"]
+
+            # self.bridge_comm: ICommunicator = resolve_comm(comm, use_mpi_if_available=True,
+            #                                                client=self.client,
+            #                                                size=self.system_metadata['nb_bridges'],
+            #                                                *args, **kwargs)
+
+            # add rpc handlers to scheduler to handle collective ops
+            self.client.run_on_scheduler(setup_comm, size=2)
+            # Use existing rpc connection to the scheduler. Also, use existing client event loop.
+            self.bridge_comm = CommClient(self.client.scheduler, client=self.client)
+        else:
+            # other bridges use a direct rpc to send data to workers
+            self.bridge_comm = CommClient(rpc(self.system_metadata['connection'].scheduler.addr))
+
+        # wait for all bridges
+        ids = self.bridge_comm.gather(self.id, root=0)
+        if ids:
+            # rank 0
+            assert len(ids) == self.bridge_comm.Get_size(), "gathered id should be of length comm size."
+
+            # all bridges are ready, tell handshake actor
+            self.handshake = Handshake(self.client)
+            self.handshake.all_bridges_ready(arrays_metadata=self.arrays_metadata, **kwargs)
+
+        logger.debug(f"================================ id={self.id}")
+
+        # retrieve workers from rank 0 and bcast
+        self.workers = self.bridge_comm.bcast(self.workers, root=0)
+
         logger.debug(f"[{self.id}] Bridge __init__() with:\n"
-                     f"comm={self.comm}\n"
+                     f"comm={self.bridge_comm}\n"
                      f"client={self.client}\n"
                      f"arrays_metadata={self.arrays_metadata}\n"
                      f"system_metadata={self.system_metadata}\n"
                      f"workers={self.workers}")
-
-        # blocking until analytics is ready
-        self.handshake = Handshake('bridge', self.client, id=id, max=self.system_metadata['nb_bridges'],
-                                   arrays_metadata=self.arrays_metadata, **kwargs)
 
     def __del__(self):
         self.close()
@@ -106,7 +135,9 @@ class Bridge(IBridge):
         logger.info(f"Closing Bridge. id={self.id}")
         if not self._has_close_been_called:
             self._has_close_been_called = True
-            self.handshake.stop_bridge(self.id)
+            ids = self.bridge_comm.gather(self.id, root=0)
+            if ids:
+                self.handshake.set_bridges_done()
 
     def send(self, array_name: str, data: np.ndarray, iteration: int, chunked: bool = True, *args, **kwargs):
         """
@@ -128,7 +159,7 @@ class Bridge(IBridge):
 
         assert self.client.status == 'running', "Client is not connected to a scheduler. Please check your connection."
 
-        rank = self.comm.Get_rank()
+        rank = self.bridge_comm.Get_rank()
         workers = self.workers
 
         if 'update_workers' in kwargs and kwargs['update_workers']:
@@ -141,7 +172,7 @@ class Bridge(IBridge):
 
             # bcast
             logger.debug(f"[{self.id}] send() pre-bcast workers={workers}")
-            workers = self.comm.bcast(workers, root=0)
+            workers = self.bridge_comm.bcast(workers, root=0)
             logger.debug(f"[{self.id}] send() post-bcast workers={workers}")
 
             # reformat workers to only keep addresses
@@ -164,10 +195,10 @@ class Bridge(IBridge):
         # Barrier. Wait for all bridges.
         to_send = {
             'future-info': res,
-            'placement': self.comm.Get_coords(rank) if hasattr(self.comm, 'Get_coords') else self.id
+            'placement': self.bridge_comm.Get_coords(rank) if hasattr(self.bridge_comm, 'Get_coords') else self.id
         }
         logger.debug(f"[{self.id}] send() gather: to_send={to_send}")
-        gathered_data = self.comm.gather(to_send, root=0)
+        gathered_data = self.bridge_comm.gather(to_send, root=0)
         logger.debug(f"[{self.id}] send() gathered_data={gathered_data}")
 
         if gathered_data is not None:
@@ -260,7 +291,10 @@ class Bridge(IBridge):
 
         data2 = valmap(to_serialize, data)
 
-        _, who_has, nbytes = await scatter_to_workers(workers, data2, self.client.rpc)
+        if self.id == 0:
+            _, who_has, nbytes = await scatter_to_workers(workers, data2, self.client.rpc)
+        else:
+            _, who_has, nbytes = await scatter_to_workers(workers, data2, self.rpc)
 
         out = {
             k: {

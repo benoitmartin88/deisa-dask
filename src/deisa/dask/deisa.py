@@ -72,7 +72,8 @@ class Deisa(IDeisa):
         self.client: Client = get_connection_info()
 
         # blocking until all bridges are ready
-        self.handshake = Handshake('deisa', self.client, **kwargs)
+        self.handshake = Handshake(self.client)
+        self.handshake.deisa_ready(**kwargs)
 
         self.mpi_comm_size = self.handshake.get_nb_bridges()
         self.arrays_metadata = self.handshake.get_arrays_metadata()

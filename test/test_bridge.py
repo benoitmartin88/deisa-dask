@@ -27,12 +27,14 @@
 # POSSIBILITY OF SUCH DAMAGE.
 # =============================================================================
 import logging
+import time
+from threading import Thread
 
 import numpy as np
 import pytest
 from distributed import Client, LocalCluster
 
-from deisa.dask import Bridge
+from deisa.dask import Bridge, Deisa
 from deisa.dask.communicator import DaskComm
 
 logging.basicConfig(level=logging.DEBUG)
@@ -42,26 +44,28 @@ class TestBridge:
     @pytest.fixture(scope="function")
     def env_setup(self):
         cluster = LocalCluster(n_workers=1, threads_per_worker=1,
-                               processes=False, dashboard_address=None)
+                               processes=True, dashboard_address=None)
         client = Client(cluster)
         client.wait_for_workers(1, timeout=10)
         yield client, cluster
         client.close()
         cluster.close()
 
-    def get_new_bridge(self, client):
+    def get_new_bridge(self, client, id=0):
         arrays_metadata = {
             'temperature': {
                 'size': (1,),
                 'subsize': (1,)
             }}
         system_metadata = {'connection': client, 'nb_bridges': 1}
-        bridge = Bridge(
-            id=0,
-            arrays_metadata=arrays_metadata,
-            system_metadata=system_metadata,
-            wait_for_go=False
-        )
+        bridge = Thread(target=Bridge,
+                        name=f"Deisa-Bridge-{id}",
+                        kwargs={'id': id,
+                                'arrays_metadata': arrays_metadata,
+                                'system_metadata': system_metadata,
+                                'wait_for_go': False}
+                        )
+        bridge.start()
         return bridge, arrays_metadata, system_metadata
 
     def test_ctor(self, env_setup):
@@ -71,7 +75,7 @@ class TestBridge:
         assert bridge.arrays_metadata == arrays_metadata
         assert bridge.system_metadata == system_metadata
         assert bridge.workers == [w.address for w in cluster.workers.values()]
-        assert isinstance(bridge.comm, DaskComm)
+        assert isinstance(bridge.bridge_comm, DaskComm)
         assert not bridge._has_close_been_called
 
     def test__del__(self, env_setup):
@@ -81,7 +85,7 @@ class TestBridge:
         assert bridge.arrays_metadata == arrays_metadata
         assert bridge.system_metadata == system_metadata
         assert bridge.workers == [w.address for w in cluster.workers.values()]
-        assert isinstance(bridge.comm, DaskComm)
+        assert isinstance(bridge.bridge_comm, DaskComm)
         assert not bridge._has_close_been_called
         bridge.__del__()
         assert bridge._has_close_been_called
@@ -140,3 +144,33 @@ class TestBridge:
             return list(workers.keys())
 
         bridge.send('temperature', np.ones(1), iteration=0, update_workers=True, filter_workers=filter)
+
+    def test_send_id_0(self, env_setup):
+        client, cluster = env_setup
+        bridge, _, _ = self.get_new_bridge(client, id=0)
+
+        def filter(workers):
+            assert isinstance(workers, dict)
+            return list(workers.keys())
+
+        bridge.send('temperature', np.ones(1), iteration=0)
+
+    def test_send_id_1(self, env_setup):
+        client, cluster = env_setup
+        bridge0, _, _ = self.get_new_bridge(client, id=0)
+        time.sleep(.5)
+        bridge1, _, _ = self.get_new_bridge(client, id=1)
+
+        deisa = Thread(target=Deisa, kwargs={'get_connection_info': lambda: client})
+        deisa.start()
+
+        #
+        # def filter(workers):
+        #     assert isinstance(workers, dict)
+        #     return list(workers.keys())
+
+        # bridge.send('temperature', np.ones(1), iteration=0)
+
+        bridge0.join()
+        bridge1.join()
+        deisa.join()

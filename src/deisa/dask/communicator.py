@@ -26,6 +26,9 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 # =============================================================================
+import asyncio
+import logging
+import threading
 import time
 import uuid
 from typing import Any, Optional, List, Sequence
@@ -35,6 +38,8 @@ from deisa.core import ICommunicator
 from distributed import Client
 
 from deisa.dask.utils import _get_actor
+
+logger = logging.getLogger(__name__)
 
 
 def is_mpi_comm(comm):
@@ -199,3 +204,150 @@ class CommActor:
 
     def cleanup(self):
         self.bcast_data = None
+
+
+class CommState:
+    def __init__(self, scheduler, size: int):
+        self.scheduler = scheduler
+        self.size = size
+
+        self.ranks = {}
+        self.next_rank = 0
+
+        self.gathers = {}  # seq -> [(rank, data)]
+        self.gather_futures = {}  # seq -> Future
+
+        self.bcast_futures = {}  # seq -> Future
+        self.bcast_readers = {}  # seq -> set
+
+    def register(self, cid: str) -> int:
+        if cid not in self.ranks:
+            self.ranks[cid] = self.next_rank
+            self.next_rank += 1
+        return self.ranks[cid]
+
+    def get_size(self) -> int:
+        return self.size
+
+    async def gather(self, seq: str, rank: int, data):
+        loop = asyncio.get_running_loop()
+        g = self.gathers.setdefault(seq, [])
+        fut = self.gather_futures.get(seq)
+        if fut is None:
+            fut = loop.create_future()
+            self.gather_futures[seq] = fut
+
+        g.append((rank, data))
+
+        if len(g) == self.size:
+            g.sort(key=lambda x: x[0])
+            result = [v for _, v in g]
+
+            if not fut.done():
+                fut.set_result(result)
+
+        result = await fut
+
+        if rank == 0:
+            self.gathers.pop(seq, None)
+            self.gather_futures.pop(seq, None)
+
+        return result
+
+    async def bcast(self, seq: str, rank: int, obj, root: int):
+        loop = asyncio.get_running_loop()
+        fut = self.bcast_futures.get(seq)
+        if fut is None:
+            fut = loop.create_future()
+            self.bcast_futures[seq] = fut
+            self.bcast_readers[seq] = set()
+
+        # root sets value
+        if rank == root and not fut.done():
+            fut.set_result(obj)
+
+        value = await fut
+
+        readers = self.bcast_readers[seq]
+        readers.add(rank)
+
+        if len(readers) == self.size:
+            self.bcast_futures.pop(seq, None)
+            self.bcast_readers.pop(seq, None)
+
+        return value
+
+
+def setup_comm(dask_scheduler, size: int):
+    comm = CommState(dask_scheduler, size=size)
+
+    dask_scheduler.handlers.update({
+        "deisa_register": comm.register,
+        "deisa_get_size": comm.get_size,
+        "deisa_gather": comm.gather,
+        "deisa_bcast": comm.bcast
+    })
+
+
+class CommClient:
+    def __init__(self, rpc, client: Optional[Client] = None):
+        self.rpc = rpc
+        self.client = client
+        self._rank = None
+        self._seq = 0
+
+        if self.client is None:
+            # persistent loop for raw RPC
+            self._loop = asyncio.new_event_loop()
+            self._thread = threading.Thread(
+                target=self._loop.run_forever, daemon=True
+            )
+            self._thread.start()
+
+    def _next_seq(self):
+        s = self._seq
+        self._seq += 1
+        return s
+
+    def _run(self, func, *args, **kwargs):
+        if self.client:
+            return self.client.sync(func, *args, **kwargs)
+        else:
+            fut = asyncio.run_coroutine_threadsafe(func(*args, **kwargs), self._loop)
+            return fut.result()
+
+    async def Get_rank_async(self):
+        if self._rank is None:
+            cid = str(uuid.uuid4())
+            self._rank = await self.rpc.deisa_register(cid=cid)
+        return self._rank
+
+    def Get_rank(self):
+        if self._rank is None:
+            cid = str(uuid.uuid4())
+            self._rank = self._run(self.rpc.deisa_register, cid=cid)
+        return self._rank
+
+    def Get_size(self) -> int:
+        return self._run(self.rpc.deisa_get_size)
+
+    def gather(self, data, root=0):
+        async def _gather_async():
+            seq = self._next_seq()
+            rank = await self.Get_rank_async()
+
+            r = await self.rpc.deisa_gather(seq=seq, rank=rank, data=data)
+
+            if rank == root:
+                return r
+            return None
+
+        return self._run(_gather_async)
+
+    def bcast(self, obj, root=0):
+        async def _bcast_async():
+            seq = self._next_seq()
+            rank = await self.Get_rank_async()
+            return await self.rpc.deisa_bcast(seq=seq, rank=rank, obj=obj, root=root)
+
+        return self._run(_bcast_async)
