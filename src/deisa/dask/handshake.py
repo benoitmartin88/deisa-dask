@@ -140,11 +140,6 @@ class Handshake:
     DEISA_WAIT_FOR_DONE_EVENT = 'deisa_handshake_done'
 
     class HandshakeActor:
-        max_bridges = 0
-        arrays_metadata = {}
-        bridges_ready = False
-        analytics_ready = False
-
         def __init__(self):
             logger.debug('HandshakeActor.__init__()')
             self.client = get_client()
@@ -163,10 +158,7 @@ class Handshake:
             if self.bridges_ready:
                 self.__go()
 
-        def set_bridges_done(self) -> None:
-            Event(Handshake.DEISA_WAIT_FOR_DONE_EVENT, client=self.client).set()
-
-        def set_arrays_metadata(self, arrays_metadata: dict) -> None | Future:
+        def set_arrays_metadata(self, arrays_metadata: dict):
             self.arrays_metadata = arrays_metadata
 
         def get_arrays_metadata(self) -> dict | Future:
@@ -188,6 +180,7 @@ class Handshake:
         """
         Bridge must wait for analytics to be ready.
         """
+        logger.debug(f"All bridges ready. arrays_metadata={arrays_metadata}")
         assert self.handshake_actor is not None
         self.handshake_actor.set_arrays_metadata(arrays_metadata).result()
         self.handshake_actor.set_bridges_ready().result()
@@ -222,4 +215,5 @@ class Handshake:
         Event(Handshake.DEISA_WAIT_FOR_DONE_EVENT, client=self.client).wait()
 
     def set_bridges_done(self):
-        self.handshake_actor.set_bridges_done().result()
+        logger.debug("set_bridges_done()")
+        Event(Handshake.DEISA_WAIT_FOR_DONE_EVENT, client=self.client).set()

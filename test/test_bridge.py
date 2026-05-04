@@ -35,7 +35,7 @@ import pytest
 from distributed import Client, LocalCluster
 
 from deisa.dask import Bridge, Deisa
-from deisa.dask.communicator import DaskComm
+from deisa.dask.communicator import CommClient
 
 logging.basicConfig(level=logging.DEBUG)
 
@@ -75,7 +75,7 @@ class TestBridge:
         assert bridge.arrays_metadata == arrays_metadata
         assert bridge.system_metadata == system_metadata
         assert bridge.workers == [w.address for w in cluster.workers.values()]
-        assert isinstance(bridge.bridge_comm, DaskComm)
+        assert isinstance(bridge.bridge_comm, CommClient)
         assert not bridge._has_close_been_called
 
     def test__del__(self, env_setup):
@@ -85,7 +85,7 @@ class TestBridge:
         assert bridge.arrays_metadata == arrays_metadata
         assert bridge.system_metadata == system_metadata
         assert bridge.workers == [w.address for w in cluster.workers.values()]
-        assert isinstance(bridge.bridge_comm, DaskComm)
+        assert isinstance(bridge.bridge_comm, CommClient)
         assert not bridge._has_close_been_called
         bridge.__del__()
         assert bridge._has_close_been_called
@@ -158,7 +158,6 @@ class TestBridge:
     def test_send_id_1(self, env_setup):
         client, cluster = env_setup
         bridge0, _, _ = self.get_new_bridge(client, id=0)
-        time.sleep(.5)
         bridge1, _, _ = self.get_new_bridge(client, id=1)
 
         deisa = Thread(target=Deisa, kwargs={'get_connection_info': lambda: client})

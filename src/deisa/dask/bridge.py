@@ -26,7 +26,9 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 # =============================================================================
+import asyncio
 import logging
+import time
 import uuid
 from numbers import Number
 from typing import Any, Iterator, List, Optional
@@ -39,7 +41,7 @@ from distributed.protocol import to_serialize
 from distributed.utils_comm import scatter_to_workers
 from tlz import valmap
 
-from deisa.dask.communicator import setup_comm, CommClient
+from deisa.dask.communicator import setup_comm, resolve_comm
 from deisa.dask.deisa import VARIABLE_PREFIX, CLIENT_KEY
 from deisa.dask.handshake import Handshake
 
@@ -92,34 +94,34 @@ class Bridge(IBridge):
             self.client: Client = self.system_metadata['connection']
             # get all workers from scheduler
             self.workers = self.client.scheduler_info(n_workers=-1)["workers"]
-
-            # self.bridge_comm: ICommunicator = resolve_comm(comm, use_mpi_if_available=True,
-            #                                                client=self.client,
-            #                                                size=self.system_metadata['nb_bridges'],
-            #                                                *args, **kwargs)
-
             # add rpc handlers to scheduler to handle collective ops
-            self.client.run_on_scheduler(setup_comm, size=2)
+            # TODO: move this somewhere else ? Also, this is only needed if CommClient is used.
+            self.client.run_on_scheduler(setup_comm, size=self.system_metadata['nb_bridges'])
             # Use existing rpc connection to the scheduler. Also, use existing client event loop.
-            self.bridge_comm = CommClient(self.client.scheduler, client=self.client)
+            self.bridge_comm: ICommunicator = resolve_comm(comm, use_mpi_if_available=True,
+                                                           comm_state_rpc=self.client.scheduler,
+                                                           client=self.client,
+                                                           size=self.system_metadata['nb_bridges'],
+                                                           *args, **kwargs)
         else:
-            # other bridges use a direct rpc to send data to workers
-            self.bridge_comm = CommClient(rpc(self.system_metadata['connection'].scheduler.addr))
-
-        # wait for all bridges
-        ids = self.bridge_comm.gather(self.id, root=0)
-        if ids:
-            # rank 0
-            assert len(ids) == self.bridge_comm.Get_size(), "gathered id should be of length comm size."
-
-            # all bridges are ready, tell handshake actor
-            self.handshake = Handshake(self.client)
-            self.handshake.all_bridges_ready(arrays_metadata=self.arrays_metadata, **kwargs)
-
-        logger.debug(f"================================ id={self.id}")
+            self.bridge_comm: ICommunicator = resolve_comm(comm, use_mpi_if_available=True,
+                                                           comm_state_rpc=rpc(
+                                                               self.system_metadata['connection'].scheduler.addr),
+                                                           client=self.client,
+                                                           size=self.system_metadata['nb_bridges'],
+                                                           *args, **kwargs)
+            time.sleep(1)  # wait for setup_comm to run on scheduler
 
         # retrieve workers from rank 0 and bcast
+        logger.debug(f"[{self.id}] Bridge __init__(): pre-bcast")
         self.workers = self.bridge_comm.bcast(self.workers, root=0)
+        logger.debug(f"[{self.id}] Bridge __init__(): post-bcast. workers={self.workers}")
+
+        if self.id == 0:
+            # all bridges are ready, tell handshake actor
+            assert self.client is not None, "client cannot be None for Bridge id 0."
+            self.handshake = Handshake(self.client)
+            self.handshake.all_bridges_ready(arrays_metadata=self.arrays_metadata, **kwargs)
 
         logger.debug(f"[{self.id}] Bridge __init__() with:\n"
                      f"comm={self.bridge_comm}\n"
@@ -137,6 +139,7 @@ class Bridge(IBridge):
             self._has_close_been_called = True
             ids = self.bridge_comm.gather(self.id, root=0)
             if ids:
+                assert self.handshake
                 self.handshake.set_bridges_done()
 
     def send(self, array_name: str, data: np.ndarray, iteration: int, chunked: bool = True, *args, **kwargs):
@@ -156,8 +159,7 @@ class Bridge(IBridge):
         :type chunked: bool
         :return: None
         """
-
-        assert self.client.status == 'running', "Client is not connected to a scheduler. Please check your connection."
+        logger.debug(f"[{self.id}] send() array_name={array_name}, data.shape={data.shape}, iteration={iteration}")
 
         rank = self.bridge_comm.Get_rank()
         workers = self.workers
@@ -172,13 +174,10 @@ class Bridge(IBridge):
 
             # bcast
             logger.debug(f"[{self.id}] send() pre-bcast workers={workers}")
-            workers = self.bridge_comm.bcast(workers, root=0)
+            self.workers = self.bridge_comm.bcast(workers, root=0)
             logger.debug(f"[{self.id}] send() post-bcast workers={workers}")
 
-            # reformat workers to only keep addresses
-            self.workers = list(workers.keys())
-
-        if 'filter_workers' in kwargs:
+        if 'filter_workers' in kwargs and kwargs['filter_workers']:
             workers = kwargs['filter_workers'](workers)
             # check return type
             if not isinstance(workers, list):
@@ -188,6 +187,9 @@ class Bridge(IBridge):
             for w in workers:
                 if not isinstance(w, str):
                     raise TypeError(f"worker_filter must return a list of strings, got {type(w)}")
+        else:
+            assert isinstance(workers, dict), f"workers must be a dict, got {type(workers)}"
+            workers = list(workers.keys())
 
         # Send data to worker
         res = self._better_scatter(data, workers=workers, hash=False)  # send data to workers
@@ -195,13 +197,15 @@ class Bridge(IBridge):
         # Barrier. Wait for all bridges.
         to_send = {
             'future-info': res,
-            'placement': self.bridge_comm.Get_coords(rank) if hasattr(self.bridge_comm, 'Get_coords') else self.id
+            # 'placement': self.bridge_comm.Get_coords(rank) if hasattr(self.bridge_comm, 'Get_coords') else self.id
+            'placement': self.id  # TODO
         }
         logger.debug(f"[{self.id}] send() gather: to_send={to_send}")
         gathered_data = self.bridge_comm.gather(to_send, root=0)
         logger.debug(f"[{self.id}] send() gathered_data={gathered_data}")
 
         if gathered_data is not None:
+            assert self.client is not None, "client cannot be None for Bridge id 0."
             # rank 0 (root=0 in comm.gather)
             # aggregate who has what
             who_has = {}
@@ -216,6 +220,7 @@ class Bridge(IBridge):
             self.client.sync(self.client.scheduler.update_data, who_has=who_has, nbytes=nbytes, client=self.client.id)
 
             # mimic mechanism from Queue. Keep a reference on keys until reception in topic handler.
+            # TODO: id=0 can use a queue
             self.client._send_to_scheduler({"op": "client-desires-keys", "keys": keys, "client": CLIENT_KEY})
 
             to_send = {
@@ -255,14 +260,19 @@ class Bridge(IBridge):
                 return default
 
     def _better_scatter(self, data: np.ndarray, workers: List[str] = None, hash=False):
+        logger.debug(f"[{self.id}] scatter to {workers}")
+
         if workers is None:
             workers = self.workers
 
-        return self.client.sync(
-            self.__scatter,
-            data,
-            workers=workers,
-            hash=hash)
+        if self.client:
+            return self.client.sync(
+                self.__scatter,
+                data,
+                workers=workers,
+                hash=hash)
+        else:
+            return asyncio.run(self.__scatter(data, workers=workers, hash=hash))
 
     async def __scatter(self, data, workers=None, hash=False):
         if isinstance(workers, (str, Number)):
@@ -291,10 +301,7 @@ class Bridge(IBridge):
 
         data2 = valmap(to_serialize, data)
 
-        if self.id == 0:
-            _, who_has, nbytes = await scatter_to_workers(workers, data2, self.client.rpc)
-        else:
-            _, who_has, nbytes = await scatter_to_workers(workers, data2, self.rpc)
+        _, who_has, nbytes = await scatter_to_workers(workers, data2)
 
         out = {
             k: {

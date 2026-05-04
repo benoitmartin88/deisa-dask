@@ -108,8 +108,7 @@ class Deisa(IDeisa):
         #         'size': [100, 100]
         #         'subsize': [50, 50]
         #     }
-
-        if name not in self.arrays_metadata:
+        if not self.arrays_metadata or name not in self.arrays_metadata:
             raise ValueError(f"Array '{name}' is not known.")
 
         start = time.time()
