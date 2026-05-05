@@ -29,10 +29,9 @@ def mpi_gather_test():
 
 def dask_comm_main(scheduler_address: str, comm_size: int):
     import os
-    import time
     from deisa.dask import get_connection_info
     from deisa.dask.communicator import setup_comm
-    from distributed import rpc
+    from distributed import Event, rpc
 
     rank = os.environ.get("OMPI_COMM_WORLD_RANK", None)
     assert rank, "rank cannot be None"
@@ -43,8 +42,9 @@ def dask_comm_main(scheduler_address: str, comm_size: int):
 
     if rank == 0:
         client.run_on_scheduler(setup_comm, size=comm_size)
+        Event("DEISA_TEST").set()
     else:
-        time.sleep(.5)
+        Event("DEISA_TEST").wait()
 
     bridge_comm = CommClient(client=client,
                              comm_state_rpc=client.scheduler if rank == 0 else rpc(scheduler_address))
