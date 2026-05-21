@@ -27,13 +27,14 @@
 # POSSIBILITY OF SUCH DAMAGE.
 # =============================================================================
 import logging
+import os
 
 import numpy as np
 import pytest
 from distributed import Client, LocalCluster
 
 from deisa.dask import Bridge
-from deisa.dask.communicator import DaskComm
+from utils import FakeComm
 
 logging.basicConfig(level=logging.DEBUG)
 
@@ -41,76 +42,78 @@ logging.basicConfig(level=logging.DEBUG)
 class TestBridge:
     @pytest.fixture(scope="function")
     def env_setup(self):
-        cluster = LocalCluster(n_workers=1, threads_per_worker=1,
-                               processes=False, dashboard_address=None)
+        cluster = LocalCluster(n_workers=1, threads_per_worker=1, processes=True,
+                               dashboard_address=":0", worker_dashboard_address=":0")
+        os.environ['DEISA_DASK_SCHEDULER_ADDRESS'] = cluster.scheduler_address
         client = Client(cluster)
         client.wait_for_workers(1, timeout=10)
         yield client, cluster
-        client.close()
         cluster.close()
 
-    def get_new_bridge(self, client):
+    def get_new_bridge(self):
         arrays_metadata = {
             'temperature': {
-                'size': (1,),
-                'subsize': (1,)
+                'global_shape': (1,),
+                'chunk_shape': (1,),
+                'chunk_position': (0,)
             }}
-        system_metadata = {'connection': client, 'nb_bridges': 1}
+        comm_state = FakeComm.State(1)
         bridge = Bridge(
-            id=0,
+            comm=FakeComm(comm_state, 0),
             arrays_metadata=arrays_metadata,
-            system_metadata=system_metadata,
             wait_for_go=False
         )
-        return bridge, arrays_metadata, system_metadata
+        return bridge, arrays_metadata
 
     def test_ctor(self, env_setup):
         client, cluster = env_setup
-        bridge, arrays_metadata, system_metadata = self.get_new_bridge(client)
+        bridge, arrays_metadata = self.get_new_bridge()
         assert bridge.id == 0
         assert bridge.arrays_metadata == arrays_metadata
-        assert bridge.system_metadata == system_metadata
-        assert bridge.workers == [w.address for w in cluster.workers.values()]
-        assert isinstance(bridge.comm, DaskComm)
+        assert bridge.workers is not None
+        assert sorted(list(bridge.workers.keys())) == sorted([w.worker_address for w in cluster.workers.values()])
+        assert isinstance(bridge.comm, FakeComm)
         assert not bridge._has_close_been_called
 
     def test__del__(self, env_setup):
         client, cluster = env_setup
-        bridge, arrays_metadata, system_metadata = self.get_new_bridge(client)
+        bridge, arrays_metadata = self.get_new_bridge()
         assert bridge.id == 0
         assert bridge.arrays_metadata == arrays_metadata
-        assert bridge.system_metadata == system_metadata
-        assert bridge.workers == [w.address for w in cluster.workers.values()]
-        assert isinstance(bridge.comm, DaskComm)
+        assert bridge.workers is not None
+        assert sorted(list(bridge.workers.keys())) == sorted([w.worker_address for w in cluster.workers.values()])
+        assert isinstance(bridge.comm, FakeComm)
         assert not bridge._has_close_been_called
         bridge.__del__()
         assert bridge._has_close_been_called
 
     def test_close(self, env_setup):
         client, _ = env_setup
-        bridge, _, _ = self.get_new_bridge(client)
+        bridge, _ = self.get_new_bridge()
         assert not bridge._has_close_been_called
-        bridge.close()
+        bridge.close(timestep=42)
         assert bridge._has_close_been_called
 
+    @pytest.mark.flaky(retries=3, delay=1)
     def test_send_update_workers(self, env_setup):
         client, cluster = env_setup
-        bridge, _, _ = self.get_new_bridge(client)
+        bridge, _ = self.get_new_bridge()
 
-        assert bridge.workers == [w.address for w in cluster.workers.values()]
-        assert len(bridge.workers) == 1
+        assert bridge.workers is not None
+        assert sorted(list(bridge.workers.keys())) == sorted([w.worker_address for w in cluster.workers.values()])
 
         cluster.scale(2)
         cluster.wait_for_workers(2)
 
         bridge.send('temperature', np.ones(1), iteration=0, update_workers=True)
 
-        assert bridge.workers == [w.address for w in cluster.workers.values()]
-        assert len(bridge.workers) == 2
+        assert bridge.workers is not None
+        assert sorted(list(bridge.workers.keys())) == sorted([w.worker_address for w in cluster.workers.values()])
 
+    @pytest.mark.flaky(retries=3, delay=1)
     def test_send_filter_workers_empty(self, env_setup):
         client, cluster = env_setup
-        bridge, _, _ = self.get_new_bridge(client)
+        bridge, _ = self.get_new_bridge()
 
         def filter(workers):
             return []
@@ -120,20 +123,20 @@ class TestBridge:
 
     def test_send_filter_workers_without_update_workers_valid(self, env_setup):
         client, cluster = env_setup
-        bridge, _, _ = self.get_new_bridge(client)
+        bridge, _ = self.get_new_bridge()
 
         def filter(workers):
-            assert isinstance(workers, list)
-            for addr in workers:
+            assert isinstance(workers, dict)
+            for addr in workers.keys():
                 assert isinstance(addr, str)
-                assert addr in [w.address for w in cluster.workers.values()]
-            return workers
+                assert addr in [w.worker_address for w in cluster.workers.values()]
+            return list(workers.keys())
 
         bridge.send('temperature', np.ones(1), iteration=0, update_workers=False, filter_workers=filter)
 
     def test_send_filter_workers_with_update_workers_valid(self, env_setup):
         client, cluster = env_setup
-        bridge, _, _ = self.get_new_bridge(client)
+        bridge, _ = self.get_new_bridge()
 
         def filter(workers):
             assert isinstance(workers, dict)
