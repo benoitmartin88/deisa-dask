@@ -98,7 +98,7 @@ class TestUsingDaskCluster:
         yield client, cluster
         # teardown
 
-        time.sleep(2)   # TODO: find a better way to wait for all tasks to be finished
+        time.sleep(5)   # TODO: find a better way to wait for all tasks to be finished
 
         client.close()
         cluster.close()
@@ -345,6 +345,7 @@ class TestUsingDaskCluster:
             assert state['map_block'] == i * state["temperature"][-1].npartitions, "map_block function was not called"
 
     @pytest.mark.flaky(retries=5, delay=1)
+    @pytest.mark.timeout(30)
     @pytest.mark.parametrize('temperature_global_grid_size', [(8, 8)])
     @pytest.mark.parametrize('temperature_window_size', [None, 1, 3])
     @pytest.mark.parametrize('pressure_global_grid_size', [(8, 8)])
