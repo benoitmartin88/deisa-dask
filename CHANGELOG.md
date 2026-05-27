@@ -16,6 +16,12 @@ Types of changes:
 
 ## [Unreleased]
 
+## [0.4.1]
+
+### Removed
+
+- dependency on `uuid`
+
 ## [0.4.0]
 
 ### Added
