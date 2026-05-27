@@ -71,7 +71,6 @@ setup(name='deisa-dask',
           'dask',
           'distributed',
           "toolz",  # version constraint from distributed
-          "uuid"
       ],
 
       extras_require={
