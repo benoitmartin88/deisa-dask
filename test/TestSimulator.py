@@ -28,30 +28,16 @@
 # =============================================================================
 import asyncio
 import logging
-from typing import Tuple
+import sys
+from typing import Tuple, List
 
 import numpy as np
-from deisa.core import ICommunicator
 from distributed import Client
 
 from deisa.dask import Bridge
-from deisa.dask.communicator import DaskComm
+from utils import FakeComm, async_close_bridges
 
 logger = logging.getLogger(__name__)
-
-
-class FakeComm(ICommunicator):
-    def __init__(self, size):
-        self.size = size
-        self._buffer = []
-
-    def gather(self, value, root=0):
-        self._buffer.append(value)
-        if len(self._buffer) == self.size:
-            result = self._buffer.copy()
-            self._buffer.clear()
-            return result
-        return None
 
 
 class TestSimulation:
@@ -62,18 +48,24 @@ class TestSimulation:
         self.arrays_metadata = arrays_metadata
         self.mpi_parallelism = mpi_parallelism
         nb_mpi_ranks = mpi_parallelism[0] * mpi_parallelism[1]
-        self.bridges: list[Bridge] = [
-            Bridge(id=rank,
+        comm_state = FakeComm.State(nb_mpi_ranks)
+        self.bridges: List[Bridge] = [
+            Bridge(comm=FakeComm(state=comm_state, rank=rank),
                    arrays_metadata=arrays_metadata,
-                   system_metadata={'connection': client, 'nb_bridges': nb_mpi_ranks},
-                   comm=DaskComm(self.client, nb_mpi_ranks),
                    *args, **kwargs)
             for rank in range(nb_mpi_ranks)]
 
+    def __del__(self):
+        try:
+            async_close_bridges(self.bridges, timestep=sys.maxsize)
+        except Exception as e:
+            logger.error(f"Error while closing bridges: {e}")
+
     def __gen_data(self, array_name: str, noise_level: int = 0) -> np.ndarray:
         # Create coordinate grid
-        x = np.linspace(-1, 1, self.arrays_metadata[array_name]['size'][0])
-        y = np.linspace(-1, 1, self.arrays_metadata[array_name]['size'][1])
+        shape = self.arrays_metadata[array_name]['global_shape']
+        x = np.linspace(-1, 1, shape[0])
+        y = np.linspace(-1, 1, shape[1])
         X, Y = np.meshgrid(x, y, indexing='ij')
 
         # Generate 2D Gaussian (bell curve)
@@ -116,21 +108,15 @@ class TestSimulation:
 
             assert len(chunks) == len(self.bridges), "There should be as many chunks as bridges."
 
-            loop = asyncio.get_event_loop()
-
             async def _bridge_send():
                 await asyncio.gather(*[asyncio.to_thread(bridge.send, array_name, chunks[i], iteration,
                                                          update_workers=update_workers)
                                        for i, bridge in enumerate(self.bridges)])
 
-            loop.run_until_complete(_bridge_send())
+            asyncio.run(_bridge_send())
 
         assert len(global_datas) == len(array_names)
         if len(global_datas) == 1:
             return global_datas[0]
         else:
             return tuple(global_datas)
-
-    def close_bridges(self):
-        for bridge in self.bridges:
-            bridge.close()

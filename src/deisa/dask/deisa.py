@@ -32,23 +32,20 @@ import collections
 import logging
 import threading
 import time
-from typing import Callable, Union, Tuple, List, Final, Literal, Any, Dict, Set, Collection
+import weakref
+from typing import Callable, Union, Tuple, List, Literal, Any, Dict, Set, Collection
 
 import dask
 import dask.array as da
 import numpy as np
-from dask.array import Array
-from deisa.core.interface import IDeisa, SupportsSlidingWindow
-from distributed import Client, Future, Queue, Variable
+from deisa.core import CallbackArgs, Window
+from deisa.core.interface import IDeisa
+from distributed import Client, Future, Queue, Event
 
+from deisa.dask.constants import KEY_PREFIX, CALLBACK_PREFIX, CLIENT_KEY, FEEDBACK_QUEUE_PREFIX, \
+    DEFAULT_SLIDING_WINDOW_SIZE
 from deisa.dask.handshake import Handshake
-from deisa.dask.types import DeisaArray
-
-LOCK_PREFIX: Final[str] = "deisa_lock_"
-VARIABLE_PREFIX: Final[str] = "deisa_variable_"
-CALLBACK_PREFIX: Final[str] = "deisa_cb_"
-DEFAULT_SLIDING_WINDOW_SIZE: int = 1
-CLIENT_KEY: Final[str] = "deisa"
+from deisa.dask.utils import get_client, build_deisa_array
 
 logger = logging.getLogger(__name__)
 
@@ -57,22 +54,29 @@ class Deisa(IDeisa):
     Callback_args = Union[str, Tuple[str], Tuple[str, int]]  # array_name, window_size
     Callback_id = str
 
-    def __init__(self, get_connection_info: Callable[[], Client], *args, **kwargs):
+    def __init__(self, feedback_queue_size: int = 1024, *args, **kwargs) -> None:
         """
-        Initializes the distributed processing environment and configures workers using
-        a Dask scheduler. This class handles setting up a Dask client and ensures the
-        specified number of workers are available for distributed computation tasks.
+        Initializes a class instance, configuring the client and setting up the necessary
+        infrastructure for interactions. This includes setting up the necessary feedback
+        queue length, performing handshake operations with the client, and initializing
+        various metadata structures.
 
-        :param get_connection_info: A function that returns a connected Dask Client.
-        :type get_connection_info: Callable
+        :param feedback_queue_size: The maximum size of the feedback queue. Defaults to 1024.
+        :type feedback_queue_size: int
+        :param args: Additional positional arguments passed to the initializer.
+        :type args: tuple
+        :param kwargs: Additional keyword arguments passed to the initializer.
+        :type kwargs: dict
         """
         # dask.config.set({"distributed.deploy.lost-worker-timeout": 60, "distributed.workers.memory.spill":0.97, "distributed.workers.memory.target":0.95, "distributed.workers.memory.terminate":0.99 })
 
-        super().__init__(get_connection_info, *args, **kwargs)
-        self.client: Client = get_connection_info()
+        super().__init__(feedback_queue_size, *args, **kwargs)
+        self.client: Client = get_client(timeout=kwargs.get("timeout", 10), name="deisa")
+        self.feedback_queue_size = feedback_queue_size
 
         # blocking until all bridges are ready
-        self.handshake = Handshake('deisa', self.client, **kwargs)
+        self.handshake = Handshake(self.client)
+        self.handshake.deisa_ready(feedback_queue_size=feedback_queue_size, **kwargs)
 
         self.mpi_comm_size = self.handshake.get_nb_bridges()
         self.arrays_metadata = self.handshake.get_arrays_metadata()
@@ -84,155 +88,111 @@ class Deisa(IDeisa):
         self._callbacks_by_array: Dict[str, Set[Deisa.Callback_id]] = {}
         self._topic_handlers: Dict[str, Callable] = {}
         self._callback_seq = 0  # unique counter
-        self._received_futures: Set[str] = set()
+        self._tasks = set()
 
     def __del__(self):
-        self.close()
+        # delete Futures
+        for cb in self._callbacks.values():
+            for a in cb['state'].values():
+                a['window'].clear()
 
-    def close(self, wait_for_bridges=True):
-        logger.info(f"Closing deisa. wait_for_bridges={wait_for_bridges}")
-        if wait_for_bridges:
-            self.__wait_for_bridges()
-
-    def get_array(self, name: str, iteration=None, timeout=None) -> tuple[Array, int]:
-        """Retrieve a Dask array for a given array name."""
-
-        # arrays_metadata will look something like this:
-        # arrays_metadata = {
-        #     'global_t': {
-        #         'size': [20, 20]
-        #         'subsize': [10, 10]
-        #     }
-        #     'global_p': {
-        #         'size': [100, 100]
-        #         'subsize': [50, 50]
-        #     }
-
-        if name not in self.arrays_metadata:
-            raise ValueError(f"Array '{name}' is not known.")
-
-        start = time.time()
-
-        while True:
-            events = self.client.get_events(name)
-
-            if events:
-                # events: List[(ts, payload)]
-                payloads = [e[1] for e in events]
-
-                # Filter by iteration if requested
-                if iteration is not None:
-                    payloads = [p for p in payloads if p["iteration"] == iteration]
-
-                if payloads:
-                    # Take latest iteration if not specified
-                    payload = max(payloads, key=lambda p: p["iteration"])
-                    iteration = payload["iteration"]
-                    parts = payload["futures"]
-                    keys = [p["future"] for p in parts]
-
-                    self.__update_futures_ownership(keys)
-                    self._received_futures.update(keys)
-
-                    # reconstruct array
-                    parts = sorted(parts, key=lambda p: p["placement"])
-
-                    darr_chunks = [
-                        da.from_delayed(
-                            dask.delayed(Future(p["future"], client=self.client)),
-                            shape=p["shape"],
-                            dtype=p["dtype"],
-                        )
-                        for p in parts
-                    ]
-
-                    darr = self.__tile_dask_blocks(
-                        darr_chunks,
-                        self.arrays_metadata[name]["size"]
-                    )
-
-                    logger.debug(f"[ITER {iteration}] {name} shape={darr.shape}")
-                    return DeisaArray(dask=darr, t=iteration)
-
-            # timeout handling
-            if timeout is not None and (time.time() - start) > timeout:
-                raise TimeoutError(f"Timeout waiting for array '{name}' iteration={iteration}")
-
-            time.sleep(0.01)  # avoid busy spin
+        del self._callbacks
+        self.client.close()
 
     @staticmethod
-    def __default_exception_handler(callback_id: Callback_id, e):
-        logger.error(f"Exception thrown for callback id {callback_id}: {e}")
+    def __default_exception_handler(exception: BaseException):
+        logger.error(f"Exception thrown for callback id: {exception}")
 
-    def register_sliding_window_callback(self,
-                                         callback: SupportsSlidingWindow.Callback,
-                                         array_name: str, window_size: int = DEFAULT_SLIDING_WINDOW_SIZE,
-                                         exception_handler: SupportsSlidingWindow.ExceptionHandler = __default_exception_handler) -> Callback_id:
+    def register(self, *callback_args: CallbackArgs,
+                 exception_handler: IDeisa.ExceptionHandler = __default_exception_handler,
+                 when: Literal['AND', 'OR'] = 'AND') -> Callable:
         """
-        Register a sliding-window callback for a single array.
-        """
-        parsed = [(array_name, window_size)]
-        return self._register_sliding_window_callbacks_impl(
-            callback,
-            parsed,
-            exception_handler=exception_handler,
-            when='AND')
+        Registers a callback function with specific arguments, exception handling, and conditional execution criteria.
 
-    def register_sliding_window_callbacks(self,
-                                          callback: SupportsSlidingWindow.Callback,
-                                          *callback_args: Callback_args,
-                                          exception_handler: SupportsSlidingWindow.ExceptionHandler = __default_exception_handler,
-                                          when: Literal['AND', 'OR'] = 'AND') -> Callback_id:
-        """
-        Register a sliding-window callback for one or more arrays.
+        This function acts as a decorator that allows you to register a callback with
+        parameters provided through ``callback_args``. It also handles exceptions using the
+        ``exception_handler`` and defines the execution rules with ``when`` parameter.
 
         Supports:
-          - "array"
-          - ("array", window_size)
-          - mixed forms
-        """
-        if not callback_args:
-            raise TypeError(
-                "register_sliding_window_callbacks requires at least one array name "
-                "or (name, window_size) tuple"
-            )
+        Default window size is 1.
+        @deisa.register("arr1")                             # default window size
+        @deisa.register("arr1", "arr2")                     # two arrays, default window size
+        @deisa.register(Window("arr1"))                     # default window size
+        @deisa.register(Window("arr1", 2))                  # window size 2
+        @deisa.register(Window("arr1", 2), Window("arr2", 5))   # window size 2 for arr1 and 5 for arr2
+        @deisa.register(Window("arr1", 2), Window("arr2", 5), "arr3") # window size 2 for arr1 and 5 for arr2, default window size for arr3
 
-        parsed: List[Tuple[str, int]] = []
+        :param callback_args: Variable-length arguments representing callback-specific parameters.
+        :param exception_handler: Optional exception handler to manage errors during callback execution.
+            Defaults to ``__default_exception_handler``.
+        :param when: Specifies the conditional logic for triggering the callback. Can be 'AND' or 'OR'.
+            Defaults to 'AND'.
+        :return: A callable that wraps the provided callback with the configured parameters and logic.
+        :rtype: Callable
+        """
+
+        def decorator(callback: IDeisa.Callback) -> IDeisa.Callback:
+            return self.register_callback(callback, *callback_args,
+                                          exception_handler=exception_handler,
+                                          when=when)
+
+        return decorator
+
+    def register_callback(self, callback: IDeisa.Callback, *callback_args: CallbackArgs,
+                          exception_handler: IDeisa.ExceptionHandler = __default_exception_handler,
+                          when: Literal['AND', 'OR'] = 'AND') -> Callable:
+        """
+        Registers a callback function with specific arguments, exception handling, and conditional execution criteria.
+
+        This function allows you to register a callback with parameters provided through
+        ``callback_args``. It also handles exceptions using the ``exception_handler``
+        and defines the execution rules with ``when`` parameter.
+
+        Supports:
+        Default window size is 1.
+        @deisa.register("arr1")                             # default window size
+        @deisa.register("arr1", "arr2")                     # two arrays, default window size
+        @deisa.register(Window("arr1"))                     # default window size
+        @deisa.register(Window("arr1", 2))                  # window size 2
+        @deisa.register(Window("arr1", 2), Window("arr2", 5))   # window size 2 for arr1 and 5 for arr2
+        @deisa.register(Window("arr1", 2), Window("arr2", 5), "arr3") # window size 2 for arr1 and 5 for arr2, default window size for arr3
+
+        :param callback: Callback function to register.
+        :param callback_args: Variable-length arguments representing callback-specific parameters.
+        :param exception_handler: Optional exception handler to manage errors during callback execution.
+            Defaults to ``__default_exception_handler``.
+        :param when: Specifies the conditional logic for triggering the callback. Can be 'AND' or 'OR'.
+            Defaults to 'AND'.
+        :return: A callable that wraps the provided callback with the configured parameters and logic.
+        :rtype: Callable
+        """
+        logger.debug(f"register_callback: callback={callback}, callback_args={callback_args}")
+        if not callback_args:
+            raise TypeError("register_callback requires at least one array name or a list of Window(name, window_size)")
+
+        parsed: List[Window] = []
 
         for arg in callback_args:
             if isinstance(arg, str):
-                parsed.append((arg, DEFAULT_SLIDING_WINDOW_SIZE))
-            elif isinstance(arg, tuple):
-                if len(arg) == 1:
-                    parsed.append((arg[0], DEFAULT_SLIDING_WINDOW_SIZE))
-                elif len(arg) == 2:
-                    name, ws = arg
-                    if not isinstance(name, str) or not isinstance(ws, int):
-                        raise TypeError("tuple must be (str, int)")
-                    parsed.append((name, ws))
-                else:
-                    raise TypeError("tuple must be (str,) or (str, int)")
+                parsed.append(Window(arg, size=DEFAULT_SLIDING_WINDOW_SIZE))
+            elif isinstance(arg, Window):
+                parsed.append(arg)
             else:
                 raise TypeError("callback_args must be str or tuple")
 
-        return self._register_sliding_window_callbacks_impl(
+        callback_id = self._register_callback_impl(
             callback,
             parsed,
             exception_handler=exception_handler,
             when=when)
+        callback.callback_id = callback_id
+        return callback
 
-    def _register_sliding_window_callbacks_impl(self,
-                                                callback: SupportsSlidingWindow.Callback,
-                                                parsed: List[Tuple[str, int]],
-                                                *,
-                                                exception_handler: SupportsSlidingWindow.ExceptionHandler,
-                                                when: Literal['AND', 'OR']) -> Callback_id:
-        """
-        Supports:
-          - (callback, "array_name", window_size=K)
-          - (callback, ("name1", k1), ("name2", k2), ..., when='AND')
-          - mixed: (callback, "a", ("b", 3)) -> "a" gets default window_size
-        """
+    def _register_callback_impl(self,
+                                callback: IDeisa.Callback,
+                                parsed: List[Window],
+                                exception_handler: IDeisa.ExceptionHandler,
+                                when: Literal['AND', 'OR']) -> Callback_id:
 
         if when not in ('AND', 'OR'):
             raise ValueError("when must be 'AND' or 'OR'")
@@ -244,7 +204,7 @@ class Deisa(IDeisa):
         array_names = self.__get_array_names(*parsed)
         callback_id = self.__next_callback_id()
 
-        logger.debug(f"_register_sliding_window_callbacks_impl: register callback_id={callback_id}")
+        logger.debug(f"_register_callback_impl: register callback_id={callback_id}")
 
         # per-callback state
         callback_state = {
@@ -271,12 +231,14 @@ class Deisa(IDeisa):
                 handler = self._make_topic_handler(array_name)
                 self._topic_handlers[array_name] = handler
 
-                logger.debug(f"_register_sliding_window_callbacks_impl: subscribe_topic() {array_name}")
+                logger.debug(f"_register_callback_impl: subscribe_topic() {array_name}")
                 self.client.subscribe_topic(array_name, handler)
 
         return callback_id
 
-    def unregister_sliding_window_callback(self, callback_id: Callback_id) -> None:
+    def unregister_callback(self, callback_id: Callback_id) -> None:
+        # also accept a decorated callback function, which stores its id in .callback_id
+        callback_id = getattr(callback_id, 'callback_id', callback_id)
         cb_data = self._callbacks.pop(callback_id, None)
         if cb_data is None:
             return
@@ -288,25 +250,84 @@ class Deisa(IDeisa):
                 if not s:
                     del self._callbacks_by_array[array_name]
 
-    def set(self, key: str, data: Union[Future, object], chunked=False):
-        if chunked:
-            raise NotImplementedError()  # TODO
-        else:
-            var = Variable(f'{VARIABLE_PREFIX}{key}', client=self.client)
-            if self.client.asynchronous:
-                self.client.loop.add_callback(var.set, data)
-            else:
-                var.set(data)
+    def set(self, key: str, value: Any, timestep: int) -> None:
+        """
+        Sets a value in a queue for a given key, associating it with a specific timestep. This action is
+        intended to store feedback or other time-specific data for the provided key.
 
-    def delete(self, key: str) -> None:
-        var = Variable(f'{VARIABLE_PREFIX}{key}', client=self.client)
-        if self.client.asynchronous:
-            self.client.loop.add_callback(var.delete)
-        else:
-            var.delete()
+        :param key: The identifier for which the value is to be set.
+        :type key: str
+        :param value: The value to be stored, associated with the key and timestep.
+        :type value: Any
+        :param timestep: The timestamp that corresponds to when the value is set.
+        :type timestep: int
+        :return: None
+        """
+        logger.debug(f"set() key={key}, value={value}, timestep={timestep}")
+
+        q = Queue(f'{FEEDBACK_QUEUE_PREFIX}{key}', client=self.client, maxsize=self.feedback_queue_size)
+
+        # TODO: check for consistency
+        # if q.qsize() > 0:
+        #     # check for consistency
+        #     t, _ = q.get()
+        #     if timestep < t:
+        #         raise ValueError(f"timestep {timestep} is smaller than previous timestep {t}")
+        #     elif timestep == t:
+        #         raise ValueError(f"timestep {timestep} has already been set")
+
+        value = (timestep, value)
+        q.put(value)
+
+    def execute_callbacks(self) -> None:
+        """
+        Executes a series of callbacks and waits for necessary processes to finish.
+
+        This method handles the execution of callbacks related to bridges and their
+        completion while also ensuring the orchestration of subsequent tasks. It is
+        responsible for unblocking bridges and waiting for dependencies to signal
+        completion.
+
+        :param self: The instance of the class invoking this method.
+
+        :return: None
+        """
+        logger.info("execute_callbacks()")
+
+        logger.info("Bridges are ready, unblock bridges")
+        Event("deisa_wait", client=self.client).set()
+
+        logger.info("execute_callbacks() waiting for bridges")
+        self.handshake.wait_for_bridges_to_finish()
+
+        # wait for analysis to be finish
+        def _check_deisa_tasks(dask_scheduler):
+            """
+            Analyzes the tasks on the Dask scheduler to determine the number
+            of tasks that are strings that do not start with the deisa task prefix.
+            """
+            tasks = [task for task in dask_scheduler.tasks.keys()
+                     if isinstance(task, str)
+                     # Note: This may be an issue if the Dask scheduler is used by multiple users
+                     if not task.startswith(KEY_PREFIX)]
+            return len(tasks)
+
+        while (nb_running_tasks := self.client.run_on_scheduler(_check_deisa_tasks)) > 0:
+            logger.info(f"execute_callbacks() waiting for {nb_running_tasks} tasks to finish")
+            time.sleep(1)
+
+        logger.info("execute_callbacks() done")
 
     def _make_topic_handler(self, array_name):
+        # use a weak reference to avoid circular references.
+        weak_self = weakref.ref(self)
+
         async def topic_handler(event):
+            _weak_self = weak_self()
+            if _weak_self is None:
+                logger.error(f"topic_handler: weak_self is None, array_name={array_name}")
+                raise RuntimeError("weak_self is None")
+
             try:
                 _, payload = event
 
@@ -316,22 +337,22 @@ class Deisa(IDeisa):
                 futures = payload["futures"]
                 keys = [p["future"] for p in futures]
 
-                self.__update_futures_ownership(keys)
-                self._received_futures.update(keys)
+                _weak_self.__update_futures_ownership(keys)
 
                 parts = sorted(futures, key=lambda p: p['placement'])
 
                 darr_chunks = [
                     da.from_delayed(
-                        dask.delayed(Future(p["future"], client=self.client)),
+                        dask.delayed(Future(p["future"], client=_weak_self.client)),
                         shape=p["shape"], dtype=p["dtype"],
                     ) for p in parts]
 
-                darr = self.__tile_dask_blocks(darr_chunks, self.arrays_metadata[array_name]["size"])
+                darr = _weak_self.__tile_dask_blocks(darr_chunks,
+                                                     _weak_self.arrays_metadata[array_name]["global_shape"])
 
                 # dispatch to interested callbacks
-                for callback_id in list(self._callbacks_by_array.get(array_name, [])):
-                    cb_data = self._callbacks.get(callback_id)
+                for callback_id in list(_weak_self._callbacks_by_array.get(array_name, [])):
+                    cb_data = _weak_self._callbacks.get(callback_id)
                     if cb_data is None:
                         continue
 
@@ -339,9 +360,9 @@ class Deisa(IDeisa):
                         continue
 
                     try:
-                        self._process_callback(callback_id, cb_data, array_name, darr, iteration)
+                        _weak_self._process_callback(callback_id, cb_data, array_name, darr, iteration)
                     except Exception as e:
-                        self._handle_callback_exception(callback_id, cb_data, e)
+                        _weak_self._handle_callback_exception(callback_id, cb_data, e)
 
             except Exception as e:
                 logger.error(f"topic_handler: topic handler error array_name={array_name}, e={e}")
@@ -353,7 +374,7 @@ class Deisa(IDeisa):
 
         # update sliding window
         d = state[array_name]
-        d["window"].append(DeisaArray(dask=darr, t=iteration))
+        d["window"].append(build_deisa_array(darr, iteration))
         d["changed"] = True
 
         ordered_array_names = cb_data["array_names"]
@@ -363,14 +384,20 @@ class Deisa(IDeisa):
         def _call_callback():
             async def _run():
                 try:
-                    await asyncio.to_thread(
-                        cb_data["callback"],
-                        *windows
-                    )
+                    await asyncio.to_thread(cb_data["callback"], *windows)
                 except Exception as ex:
                     self._handle_callback_exception(callback_id, cb_data, ex)
 
-            asyncio.create_task(_run())
+            def _free_window(_):
+                # The next call to append will remove the 1st element. Might as well remove it now to free memory earlier.
+                dq = d["window"]
+                if len(dq) == dq.maxlen:
+                    dq.popleft()
+
+            task = asyncio.create_task(_run())
+            task.add_done_callback(self._tasks.discard)
+            task.add_done_callback(_free_window)
+            self._tasks.add(task)
 
         if cb_data["when"] == "OR":
             _call_callback()
@@ -387,10 +414,10 @@ class Deisa(IDeisa):
         try:
             handler = cb_data["exception_handler"]
             if handler:
-                handler(callback_id, ex)
+                handler(ex)
         except BaseException:
             logger.info(f"Exception in exception handler. Unregistering callback_id={callback_id}")
-            self.unregister_sliding_window_callback(callback_id)
+            self.unregister_callback(callback_id)
 
     def __update_futures_ownership(self, futures: Collection[Future]):
         # tell scheduler that my client is using these futures
@@ -401,13 +428,6 @@ class Deisa(IDeisa):
     def __next_callback_id(self):
         self._callback_seq += 1
         return f"{CALLBACK_PREFIX}{self._callback_seq}"
-
-    def __wait_for_bridges(self):
-        """
-        Wait for all bridges to finish.
-        Note: blocking call.
-        """
-        self.handshake.wait_for_bridges()
 
     @staticmethod
     async def __get_all_chunks(q: Queue, mpi_comm_size: int, timeout=None) -> list[tuple[dict, Future]]:

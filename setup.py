@@ -29,11 +29,13 @@
 
 from setuptools import setup, find_namespace_packages
 
+
 def read_version():
     ns = {}
     with open("src/deisa/dask/__version__.py") as f:
         exec(f.read(), ns)
     return ns["__version__"]
+
 
 def readme():
     with open('README.md', 'r') as f:
@@ -65,16 +67,16 @@ setup(name='deisa-dask',
       packages=find_namespace_packages(where='src', include=['deisa.dask']),
 
       install_requires=[
-          "deisa-core>=0.4.0",
-          'dask',
+          "deisa-core>=0.5.0",
+          'dask>=2024.9.0',
           'distributed',
-          "toolz", # version constraint from distributed
-          "uuid"
+          "toolz",  # version constraint from distributed
       ],
 
       extras_require={
           "test": [
               "pytest",
+              "pytest-retry",
               "pytest-timeout",
               "pytest-xdist",
               "numpy",
