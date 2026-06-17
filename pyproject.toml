@@ -4,7 +4,7 @@ line-length = 120
 target-version = "py310"
 
 [tool.ruff.lint]
-select = ["E", "F", "I"]
+select = ["E", "F", "I", "B", "UP"]
 
 [tool.ruff.format]
 docstring-code-format = true
