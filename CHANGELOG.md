@@ -14,12 +14,12 @@ Types of changes:
 - `Fixed` for any bug fixes.
 - `Security` in case of vulnerabilities.
 
-
 ## [Unreleased]
 
 ### Added 
 
 - codemeta.json
+- Replace the setup.py by a pyproject.toml
 
 ## [0.5.0]
 
