@@ -36,7 +36,7 @@ from typing import Any, Iterator, List, Dict, Optional, Union, Deque
 
 import numpy as np
 from dask.tokenize import tokenize
-from deisa.core import validate_arrays_metadata, IBridge, ICommunicator
+from deisa.core import IBridge, ICommunicator
 from distributed import Queue, Client
 from distributed.protocol import to_serialize
 from distributed.utils_comm import scatter_to_workers
@@ -87,7 +87,9 @@ class Bridge(IBridge):
         super().__init__(comm, arrays_metadata, *args, **kwargs)
         self.comm: ICommunicator = comm
         self.id = self.comm.Get_rank()
-        self.arrays_metadata = validate_arrays_metadata(arrays_metadata)
+        # TODO: re-enable validator after deisa-core supports chunk_position=None
+        # self.arrays_metadata = validate_arrays_metadata(arrays_metadata)
+        self.arrays_metadata = arrays_metadata
         self._feedback_queues = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
         self._has_close_been_called = False
         self.workers = None
