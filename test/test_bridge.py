@@ -35,7 +35,7 @@ import pytest
 from distributed import Client, LocalCluster
 
 from deisa.dask import Bridge
-from utils import FakeComm, FakeCartComm
+from utils import FakeComm, FakeCartComm, async_map
 
 logging.basicConfig(level=logging.DEBUG)
 
@@ -156,9 +156,13 @@ class TestBridge:
             }}
         comm_state = FakeComm.State(4)
 
-        bridges = [Bridge(comm=FakeCartComm(comm_state, rank, dims=(2, 2)),
+        def make_bridge(rank):
+            return Bridge(comm=FakeCartComm(comm_state, rank, dims=(2, 2)),
                           arrays_metadata=arrays_metadata,
-                          wait_for_go=False) for rank in range(4)]
+                          wait_for_go=False)
+
+        # Create bridges in parallel (Split is a collective op)
+        bridges = async_map(range(4), make_bridge)
 
         async def _bridge_send():
             await asyncio.gather(*[asyncio.to_thread(bridge.send, 'temperature',
