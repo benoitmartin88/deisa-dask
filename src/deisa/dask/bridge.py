@@ -60,10 +60,10 @@ class Bridge(IBridge):
         Initializes an instance of the class, setting up communication, metadata validation,
         client connection (for id=0), workers initialization, and handshake configuration for the bridge.
 
-        :param comm: An ICommunicator facilitating communication between processes.
+        - ``:param comm:`` An ICommunicator facilitating communication between processes.
             Must provide Get_rank(), Get_size(), gather(), bcast(), barrier(),
             Split(color, key), and Free() — the same API as an MPI communicator.
-        :param arrays_metadata: Dictionary containing metadata for arrays.
+        - ``:param arrays_metadata:`` Dictionary containing metadata for arrays.
             eg:
 
             arrays_metadata = {
@@ -79,9 +79,9 @@ class Bridge(IBridge):
                     }
             }
 
-        :type arrays_metadata: Dict[str, Dict]
-        :param args: Additional positional arguments for the initialization.
-        :param kwargs: Additional keyword arguments for the initialization. Can include
+        - ``:type arrays_metadata:`` Dict[str, Dict]
+        - ``:param args:`` Additional positional arguments for the initialization.
+        - ``:param kwargs:`` Additional keyword arguments for the initialization. Can include
             configuration parameters like timeout used during client setup.
         """
         super().__init__(comm, arrays_metadata, *args, **kwargs)
@@ -120,7 +120,8 @@ class Bridge(IBridge):
                                              arrays_metadata=self.arrays_metadata, **kwargs)
 
     def _setup_array_comms(self):
-        """Auto-discover array participation and create per-array sub-communicators.
+        """
+        Auto-discover array participation and create per-array sub-communicators.
 
         Uses comm.Split() to create a sub-communicator for each array.
         The color is derived from a consistent hash of the array name so that
@@ -148,11 +149,19 @@ class Bridge(IBridge):
             )
 
     def __del__(self):
-        """Clean up resources before destruction."""
+        """
+        Clean up resources before destruction.
+        """
         self.close(timestep=sys.maxsize)
 
     def close(self, timestep: int) -> None:
-        """Close the bridge: synchronize bridges, free sub-comms, shut down client."""
+        """
+        Close the bridge: synchronize bridges, free sub-comms, shut down client.
+
+        - ``:param timestep:`` The current timestep associated with the closure action.
+        - ``:type timestep:`` int
+        - ``:return:`` None
+        """
         logger.info(f"[{self.id}] Bridge close()")
         try:
             if not self._has_close_been_called:
@@ -174,7 +183,8 @@ class Bridge(IBridge):
             logger.error(f"[{self.id}] Cloud not cleanly close bridge. exception={e}")
 
     def send(self, array_name: str, chunk: np.ndarray, timestep: int, *args, **kwargs):
-        """Distribute a data chunk to a Dask worker via scatter + gather.
+        """
+        Distribute a data chunk to a Dask worker via scatter + gather.
 
         Scatters the chunk to the next worker (round-robin), then gathers all
         chunks across bridges to rank 0, which updates the Dask scheduler.
@@ -182,9 +192,13 @@ class Bridge(IBridge):
         For single-bridge arrays (sub_comm_size == 1), skips the gather entirely
         and updates the scheduler directly.
 
-        Supported kwargs:
-            update_workers (bool): refresh the worker list from the scheduler.
-            filter_workers (callable): filter available workers before sending.
+        - ``:param array_name:`` The name of the data array being sent as a string.
+        - ``:param chunk:`` A numpy ndarray containing the data chunk to be sent to the workers.
+        - ``:param timestep:`` The current timestep associated to the sent data chunk.
+        - ``:param args:`` Additional positional arguments if required by the method implementation.
+        - ``:param kwargs:`` Additional keyword arguments for optional configurations.
+            Supported kwargs: update_workers (bool), filter_workers (callable).
+        - ``:return:`` None
         """
         logger.debug(f"[{self.id}] send() array_name={array_name}, data.shape={chunk.shape}, iteration={timestep}")
 
@@ -293,10 +307,16 @@ class Bridge(IBridge):
         # TODO: what to do if error ?
 
     def _direct_send(self, array_name: str, res: dict, chunk: np.ndarray, timestep: int):
-        """Handle single-bridge array send without collective.
+        """
+        Handle single-bridge array send without collective.
 
         For arrays that exist on only one bridge, we skip the gather() entirely
         and directly update the Dask scheduler.
+
+        - ``:param array_name:`` The name of the data array being sent.
+        - ``:param res:`` The scatter result dict containing future, who_has, and nbytes.
+        - ``:param chunk:`` The numpy ndarray data chunk.
+        - ``:param timestep:`` The current timestep.
         """
         assert self.client is not None, "client cannot be None for single-bridge send."
 
