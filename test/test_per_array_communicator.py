@@ -243,9 +243,9 @@ class TestPerArrayCommunicator:
     def test_multi_bridge_mixed_participation(self, env_setup):
         """Two bridges, two arrays: one distributed on both, one on a subset.
 
-        - temperature: both bridges have chunk_position → sub-comm size 2 → gather
-        - pressure: only bridge 0 has chunk_position, bridge 1 has None →
-          bridge 0 fast-path (sub-comm size 1), bridge 1 skips (_COMM_NULL)
+        - temperature: both bridges declare it → sub-comm size 2 → gather
+        - pressure: only bridge 0 declares it → bridge 0 fast-path (sub-comm size 1),
+          bridge 1 is absent and sits out (_COMM_NULL for Split, never sends)
         """
         client, cluster = env_setup
 
@@ -263,16 +263,12 @@ class TestPerArrayCommunicator:
             },
         }
         # Bridge 1 metadata: participates only in temperature
+        # Pressure is absent — this bridge does not send it
         arrays_metadata_1 = {
             'temperature': {
                 'global_shape': (8,),
                 'chunk_shape': (4,),
                 'chunk_position': (1,),
-            },
-            'pressure': {
-                'global_shape': (8,),
-                'chunk_shape': (4,),
-                'chunk_position': None,  # does NOT participate
             },
         }
         comm_state = FakeComm.State(2)
@@ -300,9 +296,8 @@ class TestPerArrayCommunicator:
         asyncio.run(_send_temperature())
 
         # Only bridge 0 sends pressure (fast-path, sub-comm size 1)
-        # Bridge 1 skips because chunk_position is None
+        # Bridge 1 never sends pressure (not in its declared metadata)
         bridge0.send('pressure', np.ones(4) * 10, timestep=0)
-        bridge1.send('pressure', np.ones(4) * 99, timestep=0)
 
         # Verify temperature: 2 futures (one from each bridge)
         event_temp = client.get_events('temperature')

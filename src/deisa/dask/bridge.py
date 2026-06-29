@@ -90,6 +90,7 @@ class Bridge(IBridge):
         # TODO: re-enable validator after deisa-core supports chunk_position=None
         # self.arrays_metadata = validate_arrays_metadata(arrays_metadata)
         self.arrays_metadata = arrays_metadata
+        self._my_arrays: set[str] = set(arrays_metadata.keys())  # arrays this bridge owns
         self._feedback_queues = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
         self._has_close_been_called = False
         self.workers = None
@@ -109,6 +110,10 @@ class Bridge(IBridge):
         self.workers = self.comm.bcast(self.workers, root=0)
         logger.debug(f"[{self.id}] Bridge __init__(): post-bcast. workers={self.workers}")
 
+        # Gather each bridge's partial metadata → global view
+        # Each bridge declares only the arrays it sends; merge into a single dict.
+        self._gather_global_metadata()
+
         # Auto-discover array participation and create sub-communicators
         self._setup_array_comms()
 
@@ -116,26 +121,66 @@ class Bridge(IBridge):
             # all bridges are ready, tell handshake actor
             assert self.client is not None, "client cannot be None for Bridge id 0."
             self.handshake = Handshake(self.client)
+            # Send merged metadata (from all bridges) to the handshake actor
+            metadata_for_handshake = getattr(self, '_handshake_metadata', self.arrays_metadata)
             self.handshake.all_bridges_ready(nb_bridge=self.comm.Get_size(),
-                                             arrays_metadata=self.arrays_metadata, **kwargs)
+                                             arrays_metadata=metadata_for_handshake, **kwargs)
+
+    def _gather_global_metadata(self):
+        """
+        Gather each bridge's partial arrays_metadata to discover the global
+        set of array names.
+
+        Each bridge declares only the arrays it actually sends. This method
+        collects all array names across all bridges so that every rank can
+        call Split() for every array (arrays not owned get color=_UNDEFINED).
+
+        The bridge's own arrays_metadata (with its chunk_position etc.) is
+        preserved for use in send(). Only a lightweight set of global array
+        names is stored in self._global_array_names.
+
+        Rank 0 also produces a merged metadata dict for the handshake actor
+        (so the Deisa analytics side has the full picture). For arrays that
+        exist on multiple bridges with different chunk_positions, we store a
+        list of per-bridge metadata under a special key.
+        """
+        all_metadata = self.comm.gather(self.arrays_metadata, root=0)
+
+        if self.id == 0:
+            # Build global set of array names
+            global_names = set()
+            for partial in all_metadata:
+                global_names.update(partial.keys())
+            # Build merged metadata for handshake/Deisa:
+            # For each array, collect metadata from all bridges that own it
+            merged = {}
+            for array_name in global_names:
+                # Find first bridge that declared this array → use its base metadata
+                for partial in all_metadata:
+                    if array_name in partial:
+                        merged[array_name] = partial[array_name]
+                        break
+            self._handshake_metadata = merged
+        else:
+            global_names = None
+
+        # Broadcast the global set of array names to all bridges
+        global_names = self.comm.bcast(global_names, root=0)
+        self._global_array_names = global_names
 
     def _setup_array_comms(self):
         """
-        Auto-discover array participation and create per-array sub-communicators.
+        Create per-array sub-communicators using comm.Split().
 
-        Uses comm.Split() to create a sub-communicator for each array.
-        The color is derived from a consistent hash of the array name so that
-        all participating ranks get the same color. Ranks that don't participate
-        in an array (chunk_position is None) use _UNDEFINED and get
-        _COMM_NULL.
+        The global array list (from _gather_global_metadata) is known to all
+        bridges, so every rank can call Split() for every array. Bridges that
+        don't own a given array use color=_UNDEFINED and receive _COMM_NULL.
+
+        The color is derived from a consistent hash of the array name so
+        that all participating ranks get the same sub-communicator group.
         """
-        for array_name, meta in self.arrays_metadata.items():
-            chunk_position = meta.get('chunk_position')
-            participates = chunk_position is not None
-
-            # All ranks must call Split() — even non-participants
-            if participates:
-                # Use a consistent hash so all participating ranks get the same color
+        for array_name in self._global_array_names:
+            if array_name in self._my_arrays:
                 color = hash(array_name) % (2**31)
             else:
                 color = _UNDEFINED
@@ -144,7 +189,7 @@ class Bridge(IBridge):
             self._array_comms[array_name] = sub_comm
             logger.debug(
                 f"[{self.id}] _setup_array_comms: array={array_name}, "
-                f"participates={participates}, sub_comm_size="
+                f"participates={array_name in self._my_arrays}, sub_comm_size="
                 f"{sub_comm.Get_size() if sub_comm is not _COMM_NULL else 'NULL'}"
             )
 
