@@ -292,7 +292,7 @@ class Bridge(IBridge):
         assert len(workers) == 1, "worker list should be of length 1."
 
         # Send data to worker
-        res = self._better_scatter(chunk, workers=workers, hash=False)  # send data to workers
+        res = self.scatter_to_workers(chunk, workers=workers, hash=False)  # send data to workers
 
         # Get per-array metadata
         meta = self.arrays_metadata[array_name]
@@ -438,7 +438,7 @@ class Bridge(IBridge):
 
         return default
 
-    def _better_scatter(self, data: np.ndarray, workers: List[str] = None, hash=False):
+    def scatter_to_workers(self, data: np.ndarray, workers: List[str] = None, hash=False):
         logger.debug(f"[{self.id}] scatter to {workers}")
 
         if workers is None:
