@@ -444,14 +444,12 @@ class Bridge(IBridge):
         if workers is None:
             workers = self.workers
 
-        if self.client:
-            return self.client.sync(
-                self.__scatter,
-                data,
-                workers=workers,
-                hash=hash)
-        else:
-            return asyncio.run(self.__scatter(data, workers=workers, hash=hash))
+        client = self.client if self.client else get_client(name="bridge")
+        return client.sync(
+            self.__scatter,
+            data,
+            workers=workers,
+            hash=hash)
 
     async def __scatter(self, data, workers=None, hash=False):
         if isinstance(workers, (str, Number)):
