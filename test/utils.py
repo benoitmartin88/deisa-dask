@@ -239,72 +239,53 @@ class FakeComm(ICommunicator):
                 state.condition.wait_for(lambda: state.barrier_generation != generation)
 
     def Split(self, color: int, key: int = 0) -> 'FakeComm':
-        """Mimic MPI.Comm.Split() — creates a sub-communicator for the given color.
+            """Mimic MPI.Comm.Split() — creates a sub-communicator for the given color.
 
-        Tracks which ranks share a color so that Get_size() on the sub-comm
-        returns the number of participating ranks. Ranks with color == -1
-        (MPI.UNDEFINED) get a COMM_NULL sub-comm.
+            Tracks which ranks share a color so that Get_size() on the sub-comm
+            returns the number of participating ranks. Ranks with color == -1
+            (MPI.UNDEFINED) get a COMM_NULL sub-comm.
 
-        Collectives on the sub-comm only synchronize with ranks of the same color.
-        """
-        state = self._state
+            Collectives on the sub-comm only synchronize with ranks in the same color.
+            """
+            state = self._state
 
-        # Register this rank's color (all ranks must participate, even with -1)
-        with state.condition:
-            if not hasattr(state, '_split_colors'):
-                state._split_colors = {}
-                state._split_sub_states = {}
-            state._split_colors[self._rank] = color
-            if len(state._split_colors) == state.size:
-                state.condition.notify_all()
-            else:
-                state.condition.wait_for(
-                    lambda: len(getattr(state, '_split_colors', {})) == state.size
-                )
-
-        # Non-participating ranks return COMM_NULL
-        if color == -1:
-            # Wait for the group to finish setup before returning
+            # Phase 1: All ranks register their color (barrier)
             with state.condition:
-                state._split_ready = getattr(state, '_split_ready', 0) + 1
-                if state._split_ready == state.size:
+                if not hasattr(state, '_split_colors'):
                     state._split_colors = {}
-                    state._split_ready = 0
+                state._split_colors[self._rank] = color
+                state._split_waiting = getattr(state, '_split_waiting', 0) + 1
+                if state._split_waiting == state.size:
+                    # All ranks registered — compute groups and reset
+                    groups = {}
+                    for r, c in state._split_colors.items():
+                        if c >= 0:
+                            groups.setdefault(c, []).append(r)
+                    state._split_groups = groups
+                    state._split_waiting = 0
+                    state._split_colors = {}
                     state.condition.notify_all()
                 else:
-                    state.condition.wait_for(
-                        lambda: len(getattr(state, '_split_colors', {})) == 0
-                    )
-            return _NullComm()
+                    state.condition.wait_for(lambda: state._split_waiting == 0)
 
-        # Determine this rank's sub-group
-        group_ranks = sorted(r for r, c in state._split_colors.items() if c == color)
-        sub_size = len(group_ranks)
-        sub_rank = group_ranks.index(self._rank)
+            # Phase 2: Return appropriate communicator (safe to access _split_groups now)
+            if color < 0:
+                return _NullComm()
 
-        # Create a shared sub-comm state (only the first rank creates it,
-        # then all ranks retrieve the same object)
-        with state.condition:
-            if color not in state._split_sub_states:
-                state._split_sub_states[color] = _SubCommState(state, group_ranks)
-            sub_state = state._split_sub_states[color]
+            group_ranks = state._split_groups[color]
+            sub_size = len(group_ranks)
+            sub_rank = group_ranks.index(self._rank)
 
-        sub = _SubComm(parent_comm=self, sub_state=sub_state, color=color,
-                       sub_rank=sub_rank, sub_size=sub_size)
+            # Create or retrieve the sub-comm state for this color
+            with state.condition:
+                if not hasattr(state, '_split_sub_states'):
+                    state._split_sub_states = {}
+                if color not in state._split_sub_states:
+                    state._split_sub_states[color] = _SubCommState(state, group_ranks)
+                sub_state = state._split_sub_states[color]
 
-        # Wait for all ranks to create their sub-comms, then reset
-        with state.condition:
-            state._split_ready = getattr(state, '_split_ready', 0) + 1
-            if state._split_ready == state.size:
-                state._split_colors = {}
-                state._split_ready = 0
-                state.condition.notify_all()
-            else:
-                state.condition.wait_for(
-                    lambda: len(getattr(state, '_split_colors', {})) == 0
-                )
-
-        return sub
+            return _SubComm(parent_comm=self, sub_state=sub_state, color=color,
+                            sub_rank=sub_rank, sub_size=sub_size)
 
     def Free(self):
         """No-op for FakeComm."""
