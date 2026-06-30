@@ -381,6 +381,89 @@ class TestMultiBridge:
 
         _close_all(bridges)
 
+    def test_non_owner_cannot_send_unknown_array(self, env_setup):
+        """A bridge that doesn't declare an array raises ValueError for send().
+
+        Issue #109: each bridge only sends arrays it declared. Sending an
+        undeclared array must fail fast with ValueError.
+        """
+        env_setup  # use fixture
+
+        arrays_metadata_0 = {
+            "shared": {"global_shape": (8,), "chunk_shape": (4,), "chunk_position": (0,)},
+            "solo": {"global_shape": (8,), "chunk_shape": (8,), "chunk_position": (0,)},
+        }
+        arrays_metadata_1 = {
+            "shared": {"global_shape": (8,), "chunk_shape": (4,), "chunk_position": (1,)},
+        }
+
+        comm_state = FakeComm.State(2)
+
+        def make_bridge(rank, meta):
+            return Bridge(comm=FakeComm(comm_state, rank), arrays_metadata=meta, wait_for_go=False)
+
+        bridge0, bridge1 = async_map(
+            [(0, arrays_metadata_0), (1, arrays_metadata_1)],
+            lambda args: make_bridge(*args),
+        )
+
+        # Bridge 1 should have a _NullComm (size 0) for 'solo' in sub-comms
+        assert bridge1._array_comms["solo"].Get_size() == 0
+
+        # Bridge 1 cannot send 'solo' — never declared it
+        with pytest.raises(ValueError, match="unknown"):
+            bridge1.send("solo", np.ones(8), timestep=0)
+
+        # Normal shared array still works
+        async def _send():
+            await asyncio.gather(
+                asyncio.to_thread(bridge0.send, "shared", np.ones(4), timestep=0),
+                asyncio.to_thread(bridge1.send, "shared", np.ones(4) * 2, timestep=0),
+            )
+        asyncio.run(_send())
+
+        _close_all([bridge0, bridge1])
+
+    def test_global_array_names_propagated(self, env_setup):
+        """After _gather_global_metadata + bcast, every bridge knows all arrays.
+
+        Issue #109: even if a bridge doesn't declare an array, it must know
+        about it globally so it can create the correct sub-communicator (with
+        color=_UNDEFINED → _COMM_NULL).
+        """
+        env_setup  # use fixture
+
+        arrays_metadata_0 = {
+            "alpha": {"global_shape": (8,), "chunk_shape": (8,), "chunk_position": (0,)},
+            "beta": {"global_shape": (8,), "chunk_shape": (4,), "chunk_position": (0,)},
+        }
+        arrays_metadata_1 = {
+            "beta": {"global_shape": (8,), "chunk_shape": (4,), "chunk_position": (1,)},
+        }
+
+        comm_state = FakeComm.State(2)
+
+        def make_bridge(rank, meta):
+            return Bridge(comm=FakeComm(comm_state, rank), arrays_metadata=meta, wait_for_go=False)
+
+        bridge0, bridge1 = async_map(
+            [(0, arrays_metadata_0), (1, arrays_metadata_1)],
+            lambda args: make_bridge(*args),
+        )
+
+        # Bridge 1 didn't declare 'alpha' but should know about it globally
+        assert "alpha" in bridge1._global_array_names
+        assert "beta" in bridge1._global_array_names
+        assert "alpha" in bridge0._global_array_names
+        assert "beta" in bridge0._global_array_names
+
+        # Bridge 1's sub-comm for 'alpha' is _COMM_NULL (size 0)
+        assert bridge1._array_comms["alpha"].Get_size() == 0
+        # Bridge 1's sub-comm for 'beta' is real (size 2)
+        assert bridge1._array_comms["beta"].Get_size() == 2
+
+        _close_all([bridge0, bridge1])
+
     def test_sub_comm_isolation(self, env_setup):
         """Sub-communicators for different arrays are independent.
 

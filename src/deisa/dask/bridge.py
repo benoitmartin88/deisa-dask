@@ -195,7 +195,7 @@ class Bridge(IBridge):
             logger.debug(
                 f"[{self.id}] _setup_array_comms: array={array_name}, "
                 f"participates={array_name in self._my_arrays}, sub_comm_size="
-                f"{sub_comm.Get_size() if sub_comm is not _COMM_NULL else 'NULL'}"
+                f"{sub_comm.Get_size() if sub_comm is not None and sub_comm.Get_size() > 0 else 'NULL'}"
             )
 
     def __del__(self):
@@ -300,8 +300,8 @@ class Bridge(IBridge):
         # === Determine communicator from cached sub-comms (from comm.Split()) ===
         sub_comm = self._array_comms.get(array_name)
 
-        if sub_comm == _COMM_NULL:
-            # This rank doesn't participate in this array
+        if sub_comm is None or sub_comm.Get_size() == 0:
+            # This rank doesn't participate in this array (COMM_NULL from Split)
             logger.debug(f"[{self.id}] send() rank not in participating set for '{array_name}', skipping")
             return
 
