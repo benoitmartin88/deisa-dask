@@ -45,10 +45,11 @@ class TestBridge:
     def env_setup(self):
         cluster = LocalCluster(n_workers=1, threads_per_worker=1, processes=True,
                                dashboard_address=":0", worker_dashboard_address=":0")
-        os.environ['DEISA_DASK_SCHEDULER_ADDRESS'] = cluster.scheduler_address
+        os.environ["DEISA_DASK_SCHEDULER_ADDRESS"] = cluster.scheduler_address
         client = Client(cluster)
         client.wait_for_workers(1, timeout=10)
         yield client, cluster
+        client.close()
         cluster.close()
 
     def get_new_bridge(self):

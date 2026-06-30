@@ -157,7 +157,7 @@ class FakeComm(ICommunicator):
                     state.gather_count = 0
                     state.condition.notify_all()
                 else:
-                    state.condition.wait_for(lambda: state.gather_phase == 1)
+                    state.condition.wait_for(lambda: state.gather_phase >= 1)
 
                 # Phase 1 → 2: contribute data, build result
                 state.gather_data[self._rank] = data
@@ -420,7 +420,7 @@ class _SubComm(ICommunicator):
                 state.bcast_count = 0
                 state.condition.notify_all()
             else:
-                state.condition.wait_for(lambda: state.bcast_phase == 1)
+                state.condition.wait_for(lambda: state.bcast_phase >= 1)
 
             # Phase 1 → 2: root publishes, non-roots read
             if self._sub_rank == root:
@@ -428,7 +428,7 @@ class _SubComm(ICommunicator):
                 state.bcast_phase = 2
                 state.condition.notify_all()
             else:
-                state.condition.wait_for(lambda: state.bcast_phase == 2)
+                state.condition.wait_for(lambda: state.bcast_phase >= 2)
 
             result = state.bcast_value
 
