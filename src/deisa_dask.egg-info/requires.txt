@@ -1,0 +1,14 @@
+deisa-core>=0.5.0
+dask>=2024.9.0
+distributed
+toolz
+numpy
+
+[mpi]
+mpi4py
+
+[test]
+pytest
+pytest-retry
+pytest-timeout
+pytest-xdist

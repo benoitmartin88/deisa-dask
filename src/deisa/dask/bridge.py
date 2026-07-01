@@ -482,12 +482,7 @@ class Bridge(IBridge):
 
         assert isinstance(data, dict)
 
-        data2 = valmap(to_serialize, data)
-
-        _, who_has, nbytes = await self.scatter_to_workers(
-            workers,
-            data2,
-        )
+        _, who_has, nbytes = await self.scatter_to_workers(workers, data)
 
         out = {
             k: {

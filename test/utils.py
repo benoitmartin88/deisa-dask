@@ -221,6 +221,50 @@ class FakeComm(ICommunicator):
             else:
                 state.condition.wait_for(lambda: state.barrier_generation != generation)
 
+    def Split(self, color: int, key: int = 0):
+        """Create a sub-communicator for the given color (no-op for single-bridge, returns _NullComm for others).
+
+        For MPI-like semantics, ranks with same color form a group. Here we simplify:
+        - Single-bridge (size==1): always returns self (only participant)
+        - Multi-bridge: ranks with color=-1 (UNDEFINED) get _NullComm
+
+        This is a minimal implementation for testing. Production code uses MPI.
+        """
+        # For now, return _NullComm for color < 0, else self (simple version)
+        # Full implementation would create proper sub-communicators
+        if color < 0:
+            return _NullComm()
+        return FakeComm(self._state, self._rank)  # Simplified: return self for participating ranks
+
+    def Free(self):
+        """No-op for FakeComm."""
+        pass
+
+
+class _NullComm(ICommunicator):
+    """Represents MPI.COMM_NULL — a communicator that is not valid for use."""
+
+    def Get_rank(self) -> int:
+        raise RuntimeError("COMM_NULL has no rank")
+
+    def Get_size(self) -> int:
+        return 0
+
+    def gather(self, data: Any, root: int = 0) -> None:
+        return None
+
+    def bcast(self, obj: Any, root: int = 0) -> None:
+        return None
+
+    def barrier(self) -> None:
+        pass
+
+    def Split(self, color: int, key: int = 0) -> '_NullComm':
+        return self
+
+    def Free(self):
+        pass
+
 
 class FakeCartComm(FakeComm):
     def __init__(self, state: FakeComm.State, rank: int, dims: Sequence[int], periods: Optional[Sequence[bool]] = None):
