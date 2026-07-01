@@ -19,7 +19,6 @@ Types of changes:
 ### Added
 
 - documentation website
-- getting started example code
 
 ## [0.5.1]
 

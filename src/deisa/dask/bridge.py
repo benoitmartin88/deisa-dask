@@ -32,21 +32,26 @@ import sys
 import uuid
 from collections import deque, defaultdict
 from numbers import Number
+from itertools import cycle
 from typing import Any, Iterator, List, Dict, Optional, Union, Deque
 
 import numpy as np
 from dask.tokenize import tokenize
 from deisa.core import IBridge, ICommunicator
 from distributed import Queue, Client
+from distributed.worker import _global_workers
+from distributed.core import rpc
+from distributed.utils import All
 from distributed.protocol import to_serialize
-from distributed.utils_comm import scatter_to_workers
-from tlz import valmap
+from tlz import drop, groupby, merge, valmap
 
 from deisa.dask.constants import KEY_PREFIX, FEEDBACK_QUEUE_PREFIX, CLIENT_KEY
 from deisa.dask.handshake import Handshake
 from deisa.dask.utils import get_client
 
 logger = logging.getLogger(__name__)
+
+_round_robin_counter = [0]
 
 # Sentinel values for MPI.Comm.Split() — used until ICommunicator is updated
 # to expose these constants. These mirror mpi4py's MPI.UNDEFINED and MPI.COMM_NULL.
@@ -87,8 +92,6 @@ class Bridge(IBridge):
         super().__init__(comm, arrays_metadata, *args, **kwargs)
         self.comm: ICommunicator = comm
         self.id = self.comm.Get_rank()
-        # TODO: re-enable validator after deisa-core supports chunk_position=None
-        # self.arrays_metadata = validate_arrays_metadata(arrays_metadata)
         self.arrays_metadata = arrays_metadata
         self._my_arrays: set[str] = set(arrays_metadata.keys())  # arrays this bridge owns
         self._feedback_queues = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
@@ -97,6 +100,9 @@ class Bridge(IBridge):
         self.handshake = None
         self.client: Optional[Client] = None
         self._array_comms: Dict[str, Any] = {}  # array_name -> sub-comm (from comm.Split)
+
+        # Barrier: ensure all bridges have entered __init__ before proceeding to collectives
+        self.comm.barrier()
 
         if self.id == 0:
             # only id 0 has a real dask client
@@ -116,6 +122,9 @@ class Bridge(IBridge):
 
         # Auto-discover array participation and create sub-communicators
         self._setup_array_comms()
+
+        # Ensure all bridges have finished __init__ before any proceeds to handshake
+        self.comm.barrier()
 
         if self.id == 0:
             # all bridges are ready, tell handshake actor
@@ -170,6 +179,7 @@ class Bridge(IBridge):
             global_names = None
 
         # Broadcast the global set of array names to all bridges
+        self.comm.barrier()  # ensure all ranks reach bcast together
         global_names = self.comm.bcast(global_names, root=0)
         self._global_array_names = global_names
 
@@ -199,9 +209,7 @@ class Bridge(IBridge):
             )
 
     def __del__(self):
-        """
-        Clean up resources before destruction.
-        """
+        """Clean up resources before destruction."""
         self.close(timestep=sys.maxsize)
 
     def close(self, timestep: int) -> None:
@@ -220,7 +228,7 @@ class Bridge(IBridge):
                 self.comm.barrier()
                 # Free sub-communicators created via Split()
                 for array_name, sub_comm in self._array_comms.items():
-                    if sub_comm is not None and sub_comm != _COMM_NULL:
+                    if sub_comm.Get_size() > 0:
                         sub_comm.Free()
                         logger.debug(f"[{self.id}] Freed sub-communicator for array '{array_name}'")
                 self._array_comms.clear()
@@ -292,7 +300,7 @@ class Bridge(IBridge):
         assert len(workers) == 1, "worker list should be of length 1."
 
         # Send data to worker
-        res = self.scatter_to_workers(chunk, workers=workers, hash=False)  # send data to workers
+        res = self._better_scatter(chunk, workers=workers, hash=False)  # send data to workers
 
         # Get per-array metadata
         meta = self.arrays_metadata[array_name]
@@ -300,12 +308,12 @@ class Bridge(IBridge):
         # === Determine communicator from cached sub-comms (from comm.Split()) ===
         sub_comm = self._array_comms.get(array_name)
 
-        if sub_comm is None or sub_comm.Get_size() == 0:
+        if sub_comm.Get_size() == 0:
             # This rank doesn't participate in this array (COMM_NULL from Split)
             logger.debug(f"[{self.id}] send() rank not in participating set for '{array_name}', skipping")
             return
 
-        comm_to_use = sub_comm if sub_comm is not None else self.comm
+        comm_to_use = sub_comm if sub_comm.Get_size() > 0 else self.comm
         sub_comm_size = comm_to_use.Get_size()
 
         # === Single-bridge fast-path: no collective needed ===
@@ -320,7 +328,6 @@ class Bridge(IBridge):
         logger.debug(f"[{self.id}] send() gather: to_send={to_send}")
 
         gathered_data = comm_to_use.gather(to_send, root=0)
-
         logger.debug(f"[{self.id}] send() gathered_data={gathered_data}")
 
         if gathered_data is not None:
@@ -404,7 +411,7 @@ class Bridge(IBridge):
         - ``:param default:`` The default value to return if the specified timestep is not found.
         - ``:type default:`` Any
         - ``:return:`` The element associated with the specified timestep if found, the entire deque if no
-            timestep is specified, or the default value if the timestep is not found.  
+            timestep is specified, or the default value if the timestep is not found.
         - ``:rtype:`` Optional[Union[Deque, Any]]
         """
         logger.debug(f"[{self.id}] get() key={key}, timestep={timestep}, default={default}")
@@ -421,8 +428,7 @@ class Bridge(IBridge):
             d: deque = fb_state[key]['deque']
 
             if q.qsize() != 0:
-                # List[(int, Any), ...]
-                full_q = q.get(batch=True)  # get all elements. This pops elements from the Dask queue.
+                # List[(int, Any), ...]\n                full_q = q.get(batch=True)  # get all elements. This pops elements from the Dask queue.
                 for v in full_q: d.append(v)  # add all elements to deque
             logger.debug(f"[{self.id}] get() fb_state={fb_state}")
 
@@ -438,7 +444,7 @@ class Bridge(IBridge):
 
         return default
 
-    def scatter_to_workers(self, data: np.ndarray, workers: List[str] = None, hash=False):
+    def _better_scatter(self, data: np.ndarray, workers: List[str] = None, hash=False):
         logger.debug(f"[{self.id}] scatter to {workers}")
 
         if workers is None:
@@ -478,7 +484,10 @@ class Bridge(IBridge):
 
         data2 = valmap(to_serialize, data)
 
-        _, who_has, nbytes = await scatter_to_workers(workers, data2)
+        _, who_has, nbytes = await self.scatter_to_workers(
+            workers,
+            data2,
+        )
 
         out = {
             k: {
@@ -496,3 +505,75 @@ class Bridge(IBridge):
             assert len(out) == 1
             out = list(out.values())[0]
         return out
+
+    async def scatter_to_workers(self, workers, data):
+        """
+        Internal scatter implementation supporting in-process zero-copy.
+
+        - ``:param workers:`` List of worker addresses to scatter to.
+        - ``:param data:`` Dictionary mapping keys to serialized data values.
+        """
+        assert isinstance(data, dict)
+
+        local_worker_map = {w.address: w for w in _global_workers}
+
+        workers = sorted(workers)
+        names = list(data.keys())
+
+        worker_iter = drop(_round_robin_counter[0] % len(workers), cycle(workers))
+        _round_robin_counter[0] += len(data)
+
+        items = list(zip(worker_iter, names, data.values()))
+
+        who_has: dict = {}
+        nbytes: dict = {}
+
+        # In-process, zero-copy
+        local_items = [(w, k, v) for w, k, v in items if w in local_worker_map]
+        if local_items:
+            local_who_has = {}
+            local_nbytes = {}
+            for addr, key, val in local_items:
+                worker = local_worker_map[addr]
+                worker.update_data({key: val})
+                assert id(worker.data[key]) == id(val), \
+                    f"In-process scatter copied data: id(orig)={id(val)}"
+                size = int(val.nbytes) if hasattr(val, "nbytes") else sys.getsizeof(val)
+                who_has[key] = [addr]
+                nbytes[key] = size
+                local_who_has[key] = [addr]
+                local_nbytes[key] = size
+
+            if self.client:
+                await self.client.scheduler.update_data(
+                    who_has=local_who_has,
+                    nbytes=local_nbytes,
+                    client=self.client.id,
+                )
+
+        # Remote, serialize and RPC
+        remote_items = [(w, k, v) for w, k, v in items if w not in local_worker_map]
+        if remote_items:
+            d = {
+                worker: {key: value for _, key, value in v}
+                for worker, v in groupby(0, remote_items).items()
+            }
+            d_serialized = {
+                worker: valmap(to_serialize, chunk)
+                for worker, chunk in d.items()
+            }
+            rpcs = {addr: rpc(addr) for addr in d_serialized}
+            try:
+                out = await All([
+                    rpcs[address].update_data(data=v)
+                    for address, v in d_serialized.items()
+                ])
+            finally:
+                for r in rpcs.values():
+                    await r.close_rpc()
+
+            nbytes.update(merge(o["nbytes"] for o in out))
+            for k, v in groupby(1, remote_items).items():
+                who_has[k] = [w for w, _, _ in v]
+
+        return (names, who_has, nbytes)
