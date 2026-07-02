@@ -58,7 +58,7 @@ def mpi_bridge_main(scheduler_address: str, global_size: Tuple, parallelism: Tup
         'temperature': {
             'global_shape': global_size,
             'chunk_shape': tuple(g // p for g, p in zip(global_size, parallelism)),
-            'chunk_position': (0,) * len(global_size)  # TODO
+            'chunk_position': (0,) * len(global_size)
         }
     }
 
