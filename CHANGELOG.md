@@ -16,6 +16,8 @@ Types of changes:
 
 ## Unreleased
 
+## [0.6.0]
+
 ### Added
 
 - documentation website
