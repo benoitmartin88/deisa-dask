@@ -106,9 +106,9 @@ params:
   externalLinkDecoration: true
 
   banner:
-    key: 'announcement-v0.6.0'
+    key: 'announcement-v0.6.1'
     message: |
-      deisa-dask **v0.6.0** is here! 🎉 Discover [what's new]({{% relref "blog/0.6.0" %}})
+      deisa-dask **v0.6.1** is here! 🎉 Discover [what's new]({{% relref "blog/0.6.1" %}})
 
   navbar:
     displayTitle: true
