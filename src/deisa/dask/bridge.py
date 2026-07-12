@@ -135,6 +135,15 @@ class Bridge(IBridge):
             self.handshake.all_bridges_ready(nb_bridge=self.comm.Get_size(),
                                              arrays_metadata=metadata_for_handshake, **kwargs)
 
+            # Fetch task hints from HandshakeActor and broadcast to all bridges
+            task_hints = self.handshake.get_task_hints_dict()
+        else:
+            task_hints = {}
+
+        # Broadcast task hints to all bridges (rank 0 has them, others empty)
+        task_hints = self.comm.bcast(task_hints, root=0)
+        self._task_hints = task_hints
+
     def _gather_global_metadata(self):
         """
         Gather each bridge's partial arrays_metadata to discover the global
@@ -299,6 +308,9 @@ class Bridge(IBridge):
 
         assert len(workers) == 1, "worker list should be of length 1."
 
+        # === Execute local operations on chunk BEFORE scatter ===
+        partials = self._execute_operations_on_chunk(array_name, chunk)
+
         # Send data to worker
         res = self._better_scatter(chunk, workers=workers, hash=False)  # send data to workers
 
@@ -318,12 +330,13 @@ class Bridge(IBridge):
 
         # === Single-bridge fast-path: no collective needed ===
         if sub_comm_size == 1:
-            self._direct_send(array_name, res, chunk, timestep)
+            self._direct_send(array_name, res, chunk, timestep, partials)
             return
 
         to_send = {
             'future-info': res,
-            'chunk_position': meta['chunk_position']
+            'chunk_position': meta['chunk_position'],
+            'partials': partials
         }
         logger.debug(f"[{self.id}] send() gather: to_send={to_send}")
 
@@ -336,10 +349,13 @@ class Bridge(IBridge):
             who_has = {}
             nbytes = {}
             keys = []
+            all_partials = []
             for d in gathered_data:
                 who_has.update(d['future-info']['who_has'])
                 nbytes.update(d['future-info']['nbytes'])
                 keys.append(d['future-info']['future'])
+                if d.get('partials'):
+                    all_partials.append(d['partials'])
 
             # only update the scheduler with who has what and register the future once
             self.client.sync(self.client.scheduler.update_data, who_has=who_has, nbytes=nbytes)
@@ -347,6 +363,9 @@ class Bridge(IBridge):
             # mimic mechanism from Queue. Keep a reference on keys until reception in topic handler.
             # TODO: id=0 can use a queue
             self.client._send_to_scheduler({"op": "client-desires-keys", "keys": keys, "client": CLIENT_KEY})
+
+            # === Combine reduction partials on rank 0 ===
+            precomputed = self._combine_reduction_partials(all_partials)
 
             to_send = {
                 'array_name': array_name,
@@ -356,14 +375,15 @@ class Bridge(IBridge):
                     'shape': chunk.shape,
                     'dtype': str(chunk.dtype),
                     'chunk_position': d['chunk_position']
-                } for d in gathered_data]
+                } for d in gathered_data],
+                'precomputed': precomputed if precomputed else None
             }
             logger.debug(f"[{self.id}] send() log_event: array={array_name}, timestep={timestep}, n_futures={len(gathered_data)}")
             self.client.log_event(array_name, to_send)
 
         # TODO: what to do if error ?
 
-    def _direct_send(self, array_name: str, res: dict, chunk: np.ndarray, timestep: int):
+    def _direct_send(self, array_name: str, res: dict, chunk: np.ndarray, timestep: int, partials: Optional[Dict] = None):
         """
         Handle single-bridge array send without collective.
 
@@ -374,6 +394,8 @@ class Bridge(IBridge):
         - ``:param res:`` The scatter result dict containing future, who_has, and nbytes.
         - ``:param chunk:`` The numpy ndarray data chunk.
         - ``:param timestep:`` The current timestep.
+        - ``:param partials:`` Optional precomputed partial results.
+        - ``:return:`` None
         """
         assert self.client is not None, "client cannot be None for single-bridge send."
 
@@ -395,9 +417,83 @@ class Bridge(IBridge):
                 'shape': chunk.shape,
                 'dtype': str(chunk.dtype),
                 'chunk_position': self.arrays_metadata[array_name]['chunk_position']
-            }]
+            }],
+            'precomputed': partials if partials else None
         }
         self.client.log_event(array_name, to_send)
+
+    def _execute_operations_on_chunk(self, array_name: str, chunk: np.ndarray) -> Optional[Dict]:
+        """
+        Execute reducible operations on numpy chunk before scatter.
+        
+        Uses task hints stored during __init__ (broadcast from HandshakeActor)
+        and executes them on the local chunk.
+        
+        - ``:param array_name:`` The name of the array being sent.
+        - ``:param chunk:`` The numpy ndarray data chunk.
+        - ``:return:`` Dict of partial results or None.
+        """
+        hints = self._task_hints.get(array_name)
+        if not hints:
+            return None
+            
+        partials = {}
+        for hint in hints:
+            op = hint.get('op')
+            output_key = hint.get('output_key', f"{array_name}-{op}")
+            
+            if op == 'sum':
+                partials[output_key] = float(chunk.sum())
+            elif op == 'max':
+                partials[output_key] = float(chunk.max())
+            elif op == 'min':
+                partials[output_key] = float(chunk.min())
+            elif op == 'mean':
+                partials[f"{output_key}-sum"] = float(chunk.sum())
+                partials[f"{output_key}-count"] = int(chunk.size)
+                
+        return partials if partials else None
+
+    def _combine_reduction_partials(self, all_partials: List[Dict]) -> Optional[Dict]:
+        """
+        Combine partial reduction results from all bridges on rank 0.
+        
+        - ``:param all_partials:`` List of partial result dicts from each bridge.
+        - ``:return:`` Combined results dict or None.
+        """
+        if not all_partials:
+            return None
+            
+        combined: Dict[str, Any] = {}
+        
+        for key in set().union(*[p.keys() for p in all_partials if p]):
+            values = [p.get(key) for p in all_partials if p.get(key) is not None]
+            
+            # Detect mean keys (end with -sum or -count)
+            if key.endswith('-sum'):
+                base_key = key[:-4]  # remove '-sum'
+                count_key = f"{base_key}-count"
+                count_values = [p.get(count_key) for p in all_partials if p.get(count_key) is not None]
+                if values and count_values:
+                    combined[base_key] = float(sum(float(v) for v in values if v is not None)) / float(sum(float(v) for v in count_values if v is not None))
+            # Skip count keys (they're handled with their sum)
+            elif key.endswith('-count'):
+                continue
+            # Regular reduction keys
+            elif values:
+                if key == 'sum':
+                    combined[key] = float(sum(float(v) for v in values if v is not None))
+                elif key == 'max':
+                    combined[key] = max(float(v) for v in values if v is not None)
+                elif key == 'min':
+                    combined[key] = min(float(v) for v in values if v is not None)
+                else:
+                    try:
+                        combined[key] = float(sum(float(v) for v in values if v is not None))
+                    except (TypeError, ValueError):
+                        pass
+            
+        return combined if combined else None
 
     def get(self, key: str, timestep: Optional[int] = None, default: Any = None) -> Optional[Union[Deque, Any]]:
         """

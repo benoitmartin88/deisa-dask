@@ -29,7 +29,9 @@
 
 import asyncio
 import collections
+import inspect
 import logging
+import ast
 import threading
 import time
 import weakref
@@ -225,6 +227,11 @@ class Deisa(IDeisa):
         for array_name in array_names:
             self._callbacks_by_array.setdefault(array_name, set()).add(callback_id)
 
+            # Analyze callback for reducible operations and store hints
+            task_hints = self._analyze_callback_for_operations(callback, array_name)
+            if task_hints:
+                self.handshake.set_task_hints(array_name, task_hints)
+
             # create handler only once per topic
             if array_name not in self._topic_handlers:
                 handler = self._make_topic_handler(array_name)
@@ -342,6 +349,12 @@ class Deisa(IDeisa):
                 darr_chunks = [da.from_delayed(p["future"], shape=p["shape"], dtype=p["dtype"]) for p in parts]
                 darr = _weak_self.__tile_dask_blocks(darr_chunks,
                                                      _weak_self.arrays_metadata[array_name]["global_shape"])
+
+                # Attach precomputed values to dask array if available
+                precomputed = payload.get('precomputed')
+                if precomputed:
+                    logger.debug(f"topic_handler: attaching precomputed={precomputed} to dask array")
+                    darr.precomputed = precomputed
 
                 # tell the scheduler that the futures used by this dask array must not be collected by gc
                 _weak_self.client.persist(darr)
@@ -489,6 +502,62 @@ class Deisa(IDeisa):
 
         # Use da.block to combine blocks
         return da.block(nested)
+
+    def _analyze_callback_for_operations(self, callback: Callable, array_name: str) -> List[Dict]:
+        """
+        Analyze callback source code to extract reducible operations.
+        
+        Parses the callback AST to find method calls like arr.sum(), arr.max(), etc.
+        Returns a list of operation hints for bridge-side execution.
+        
+        - ``:param callback:`` The callback function to analyze.
+        - ``:param array_name:`` The array name this callback operates on.
+        - ``:return:`` List of operation hint dicts.
+        """
+        hints = []
+        
+        try:
+            source = inspect.getsource(callback)
+            tree = ast.parse(source)
+            
+            for node in ast.walk(tree):
+                # Look for method calls on the array (e.g., arr.sum())
+                if isinstance(node, ast.Call):
+                    self._extract_operation_from_call(node, array_name, hints)
+                    
+        except (OSError, TypeError) as e:
+            logger.debug(f"_analyze_callback_for_operations: Could not analyze callback: {e}")
+            
+        return hints
+
+    def _extract_operation_from_call(self, node: ast.Call, array_name: str, hints: List[Dict]) -> None:
+        """
+        Extract operation from AST Call node.
+        
+        - ``:param node:`` The AST Call node to analyze.
+        - ``:param array_name:`` The expected array name.
+        - ``:param hints:`` The list to append hints to.
+        """
+        # Check for method calls: arr.sum(), arr.max()
+        if isinstance(node.func, ast.Attribute):
+            method_name = node.func.attr
+            if self._is_reducible_operation(method_name):
+                output_key = f"{array_name}-{method_name}"
+                hints.append({
+                    'op': method_name,
+                    'output_key': output_key,
+                    'type': 'reduction'
+                })
+
+    def _is_reducible_operation(self, method_name: str) -> bool:
+        """
+        Check if method is a reducible operation.
+        
+        - ``:param method_name:`` The method name to check.
+        - ``:return:`` True if the operation is reducible.
+        """
+        reducible_ops = {'sum', 'max', 'min', 'mean', 'std', 'var', 'prod'}
+        return method_name in reducible_ops
 
     @staticmethod
     def __get_array_names(*callback_args: Callback_args) -> List[str]:
