@@ -100,6 +100,7 @@ class Bridge(IBridge):
         self.client: Optional[Client] = None
         self._array_comms: Dict[str, Any] = {}  # array_name -> sub-comm (from comm.Split)
         self._handshake_metadata = None
+        self._task_hints: Dict[str, List[Dict]] = {}  # array_name -> hints for local execution
 
         if self.id == 0:
             # only id 0 has a real dask client
@@ -199,6 +200,11 @@ class Bridge(IBridge):
             # create a new client for sub_comm id==0 if needed
             if not self.client and sub_comm is not _COMM_NULL and sub_comm.Get_rank() == 0:
                 self.client = get_client(timeout=10, name=f"bridge-{self.comm.Get_rank()}")
+                # Connect to existing handshake actor from analytics side (created by Deisa)
+                self.handshake = Handshake(self.client)
+
+            # Store empty hints initially - they will be fetched on first send()
+            self._task_hints[array_name] = []
 
             logger.debug(
                 f"[{self.id}] _setup_array_comms: "
@@ -307,6 +313,10 @@ class Bridge(IBridge):
         # Send data to worker
         res = self._better_scatter(chunk, workers=workers, hash=False)  # send data to workers
 
+        # Fetch task hints and execute operations on local numpy chunk
+        task_hints = self._get_task_hints(array_name)
+        partials = self._execute_operations_on_chunk(array_name, chunk, task_hints)
+
         # Determine communicator from cached sub-comms (from comm.Split())
         sub_comm = self._array_comms.get(array_name)
 
@@ -317,12 +327,13 @@ class Bridge(IBridge):
 
         # Single-bridge fast-path: no collective needed
         if sub_comm.Get_size() == 1:
-            self._direct_send(array_name, res, chunk, timestep)
+            self._direct_send(array_name, res, chunk, timestep, precomputed=None)
             return
 
         to_send = {
             'future-info': res,
-            'chunk_position': self.arrays_metadata[array_name]['chunk_position']
+            'chunk_position': self.arrays_metadata[array_name]['chunk_position'],
+            'precomputed': partials
         }
         logger.debug(f"[{self.id}] send() gather: to_send={to_send}")
 
@@ -336,10 +347,13 @@ class Bridge(IBridge):
             who_has = {}
             nbytes = {}
             keys = []
+            all_partials = []
             for d in gathered_data:
                 who_has.update(d['future-info']['who_has'])
                 nbytes.update(d['future-info']['nbytes'])
                 keys.append(d['future-info']['future'])
+                if 'precomputed' in d:
+                    all_partials.append(d['precomputed'])
 
             # only update the scheduler with who has what and register the future once
             self.client.sync(self.client.scheduler.update_data, who_has=who_has, nbytes=nbytes)
@@ -348,9 +362,13 @@ class Bridge(IBridge):
             # TODO: id=0 can use a queue
             self.client._send_to_scheduler({"op": "client-desires-keys", "keys": keys, "client": CLIENT_KEY})
 
+            # Combine partials on rank 0
+            combined_partials = self._combine_reduction_partials(all_partials) if all_partials else {}
+
             to_send = {
                 'array_name': array_name,
                 'iteration': timestep,
+                'precomputed': combined_partials if combined_partials else None,
                 'futures': [{
                     'future': d['future-info']['future'],
                     'shape': chunk.shape,
@@ -364,17 +382,18 @@ class Bridge(IBridge):
 
         # TODO: what to do if error ?
 
-    def _direct_send(self, array_name: str, res: dict, chunk: np.ndarray, timestep: int):
+    def _direct_send(self, array_name: str, res: dict, chunk: np.ndarray, timestep: int, precomputed: Optional[Dict] = None):
         """
         Handle single-bridge array send without collective.
 
         For arrays that exist on only one bridge, we skip the gather() entirely
         and directly update the Dask scheduler.
 
-        - ``:param array_name:`` The name of the data array being sent.
+        - ``:param array_name:`` The array name being sent.
         - ``:param res:`` The scatter result dict containing future, who_has, and nbytes.
         - ``:param chunk:`` The numpy ndarray data chunk.
         - ``:param timestep:`` The current timestep.
+        - ``:param precomputed:`` Optional precomputed values dict for single-bridge case.
         """
         assert self.client is not None, "client cannot be None for single-bridge send."
 
@@ -391,6 +410,7 @@ class Bridge(IBridge):
         to_send = {
             'array_name': array_name,
             'iteration': timestep,
+            'precomputed': precomputed,
             'futures': [{
                 'future': future_key,
                 'shape': chunk.shape,
@@ -506,3 +526,122 @@ class Bridge(IBridge):
             assert len(out) == 1
             out = list(out.values())[0]
         return out
+
+    def _get_task_hints(self, array_name: str) -> List[Dict]:
+        """
+        Retrieve stored task hints for an array.
+
+        Hints are fetched from HandshakeActor on sub_comm rank 0 and broadcast to all ranks.
+        If no hints are available, this method returns an empty list (no precomputation).
+
+        - ``:param array_name:`` The array name to get hints for.
+        - ``:return:`` List of operation hints with 'func_module', 'func_name', 'keywords', 'output_key'.
+        """
+        # Check cache first
+        if self._task_hints.get(array_name):
+            return self._task_hints[array_name]
+        
+        # If not cached, need to fetch (only sub_comm rank 0 has client)
+        sub_comm = self._array_comms.get(array_name)
+        hints = []
+        
+        if sub_comm is not None and sub_comm is not _COMM_NULL:
+            if sub_comm.Get_rank() == 0 and self.handshake is not None:
+                hints = self.handshake.get_task_hints(array_name)
+                # Broadcast to all ranks in sub_comm
+                sub_comm.bcast(hints, root=0)
+            else:
+                # Receive broadcast
+                hints = sub_comm.bcast(None, root=0)
+            
+            # Cache the hints
+            if hints:
+                self._task_hints[array_name] = hints
+        
+        return hints
+
+    def _execute_operations_on_chunk(self, array_name: str, chunk: np.ndarray, hints: List[Dict]) -> Dict:
+        """
+        Execute reduction operations locally on numpy chunk before scatter.
+
+        These operations produce partial results that will be combined on rank 0.
+        Uses dynamic function loading from the serialized task graph.
+
+        - ``:param array_name:`` The array name being processed.
+        - ``:param chunk:`` The numpy ndarray data chunk.
+        - ``:param hints:`` List of operation hints from task graph analysis.
+        - ``:return:`` Dict of partial results keyed by output_key.
+        """
+        import importlib
+        partials = {}
+        for hint in hints:
+            func_module = hint['func_module']
+            func_name = hint['func_name']
+            keywords = hint.get('keywords', {})
+            output_key = hint['output_key']
+
+            # Dynamically load the reduction function from its module
+            try:
+                module = importlib.import_module(func_module)
+                func = getattr(module, func_name)
+                
+                # Call the reduction function with the same keywords as in task graph
+                call_kwargs = {k: v for k, v in keywords.items() if k in ('dtype', 'keepdims')}
+                result = func(chunk, axis=None, **call_kwargs)
+                
+                # For mean/std/var, we need to store sufficient statistics
+                # to correctly combine partials (sum and count)
+                if func_name == 'mean':
+                    count = float(np.asarray(chunk).size)
+                    partials[f"{output_key}-sum"] = float(np.asarray(result).item() * count)
+                    partials[f"{output_key}-count"] = count
+                else:
+                    partials[output_key] = float(np.asarray(result).item())
+            except Exception as e:
+                logger.warning(f"[{self.id}] _execute_operations_on_chunk: could not execute {func_module}.{func_name}: {e}")
+
+        logger.debug(f"[{self.id}] _execute_operations_on_chunk: {partials}")
+        return partials
+
+    @staticmethod
+    def _combine_reduction_partials(all_partials: List[Dict]) -> Dict:
+        """
+        Combine partial results from all bridges.
+
+        Called on rank 0 only. Merges partials using associative operations.
+        For mean, computes sum/count → mean.
+
+        - ``:param all_partials:`` List of partial result dicts from all bridges.
+        - ``:return:`` Combined precomputed values dict.
+        """
+        combined = {}
+
+        for partials in all_partials:
+            for key, value in partials.items():
+                if key not in combined:
+                    combined[key] = []
+                combined[key].append(value)
+
+        # Compute final values - need to handle mean specially
+        # First pass: identify mean partials and process them
+        final_combined = {}
+        keys_to_skip = set()
+        
+        for key, values in combined.items():
+            if key.endswith('-sum'):
+                base_key = key[:-4]
+                count_key = f"{base_key}-count"
+                if count_key in combined:
+                    total_sum = sum(values)
+                    total_count = sum(combined[count_key])
+                    final_combined[base_key] = total_sum / total_count if total_count > 0 else 0
+                    keys_to_skip.add(key)
+                    keys_to_skip.add(count_key)
+
+        # Second pass: add non-mean values
+        for key, values in combined.items():
+            if key not in keys_to_skip:
+                final_combined[key] = sum(values)
+
+        logger.debug(f"_combine_reduction_partials: final={final_combined}")
+        return final_combined

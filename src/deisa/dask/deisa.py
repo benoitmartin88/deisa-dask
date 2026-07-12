@@ -37,13 +37,14 @@ from typing import Callable, Union, Tuple, List, Literal, Any, Dict, Set, Collec
 
 import dask.array as da
 import numpy as np
+from dask.delayed import delayed
 from deisa.core import CallbackArgs, Window
 from deisa.core.interface import IDeisa
 from distributed import Client, Future, Queue, Event
 
-from deisa.dask.constants import KEY_PREFIX, CALLBACK_PREFIX, CLIENT_KEY, FEEDBACK_QUEUE_PREFIX, \
-    DEFAULT_SLIDING_WINDOW_SIZE
+from deisa.dask.constants import KEY_PREFIX, CALLBACK_PREFIX, CLIENT_KEY, FEEDBACK_QUEUE_PREFIX, DEFAULT_SLIDING_WINDOW_SIZE
 from deisa.dask.handshake import Handshake
+from deisa.dask.tracked_array import make_tracked_deisa_stub
 from deisa.dask.utils import get_client, build_deisa_array
 
 logger = logging.getLogger(__name__)
@@ -104,7 +105,8 @@ class Deisa(IDeisa):
 
     def register(self, *callback_args: CallbackArgs,
                  exception_handler: IDeisa.ExceptionHandler = __default_exception_handler,
-                 when: Literal['AND', 'OR'] = 'AND') -> Callable:
+                 when: Literal['AND', 'OR'] = 'AND',
+                 precompute: bool = False) -> Callable:
         """
         Registers a callback function with specific arguments, exception handling, and conditional execution criteria.
 
@@ -121,11 +123,17 @@ class Deisa(IDeisa):
         ``@deisa.register(Window("arr1", 2), Window("arr2", 5))``   # window size 2 for arr1 and 5 for arr2
         ``@deisa.register(Window("arr1", 2), Window("arr2", 5), "arr3")``  # window size 2 for arr1 and 5 for arr2, default window size for arr3
 
+        When ``precompute=True``, the callback is analyzed to extract dask reduction operations
+        (sum, mean, std, var, max, min, prod) which are executed locally on each bridge before
+        scatter to reduce network transfer.
+
         - ``:param callback_args:`` Variable-length arguments representing callback-specific parameters.
         - ``:param exception_handler:`` Optional exception handler to manage errors during callback execution.
              Defaults to ``__default_exception_handler``.
         - ``:param when:`` Specifies the conditional logic for triggering the callback. Can be 'AND' or 'OR'.
              Defaults to 'AND'.
+        - ``:param precompute:`` If True, analyze callback for dask reductions and execute on bridge.
+             Defaults to False.
         - ``:return:`` A callable that wraps the provided callback with the configured parameters and logic.
         - ``:rtype:`` Callable
         """
@@ -133,13 +141,15 @@ class Deisa(IDeisa):
         def decorator(callback: IDeisa.Callback) -> IDeisa.Callback:
             return self.register_callback(callback, *callback_args,
                                           exception_handler=exception_handler,
-                                          when=when)
+                                          when=when,
+                                          precompute=precompute)
 
         return decorator
 
     def register_callback(self, callback: IDeisa.Callback, *callback_args: CallbackArgs,
-                          exception_handler: IDeisa.ExceptionHandler = __default_exception_handler,
-                          when: Literal['AND', 'OR'] = 'AND') -> Callable:
+                              exception_handler: IDeisa.ExceptionHandler = __default_exception_handler,
+                              when: Literal['AND', 'OR'] = 'AND',
+                              precompute: bool = False) -> Callable:
         """
         Registers a callback function with specific arguments, exception handling, and conditional execution criteria.
 
@@ -161,7 +171,9 @@ class Deisa(IDeisa):
         - ``:param exception_handler:``  Optional exception handler to manage errors during callback execution.
              Defaults to ``__default_exception_handler``.
         - ``:param when:``  Specifies the conditional logic for triggering the callback. Can be 'AND' or 'OR'.
-            Defaults to 'AND'.
+             Defaults to 'AND'.
+        - ``:param precompute:`` If True, analyze callback for dask reductions and execute on bridge.
+             Defaults to False.
         - ``:return:``  A callable that wraps the provided callback with the configured parameters and logic.
         """
         logger.debug(f"register_callback: callback={callback}, callback_args={callback_args}")
@@ -182,7 +194,8 @@ class Deisa(IDeisa):
             callback,
             parsed,
             exception_handler=exception_handler,
-            when=when)
+            when=when,
+            precompute=precompute)
         callback.callback_id = callback_id
         return callback
 
@@ -190,7 +203,8 @@ class Deisa(IDeisa):
                                 callback: IDeisa.Callback,
                                 parsed: List[Window],
                                 exception_handler: IDeisa.ExceptionHandler,
-                                when: Literal['AND', 'OR']) -> Callback_id:
+                                when: Literal['AND', 'OR'],
+                                precompute: bool = False) -> Callback_id:
 
         if when not in ('AND', 'OR'):
             raise ValueError("when must be 'AND' or 'OR'")
@@ -223,6 +237,12 @@ class Deisa(IDeisa):
 
         for array_name in array_names:
             self._callbacks_by_array.setdefault(array_name, set()).add(callback_id)
+
+            # Analyze callback for reducible operations and store hints (only if precompute=True)
+            if precompute:
+                task_hints = self._analyze_callback_for_operations(callback, array_name)
+                if task_hints:
+                    self.handshake.set_task_hints(array_name, task_hints)
 
             # create handler only once per topic
             if array_name not in self._topic_handlers:
@@ -340,6 +360,12 @@ class Deisa(IDeisa):
                 darr_chunks = [da.from_delayed(p["future"], shape=p["shape"], dtype=p["dtype"]) for p in parts]
                 darr = _weak_self.__tile_dask_blocks(darr_chunks,
                                                      _weak_self.arrays_metadata[array_name]["global_shape"])
+
+                # Attach precomputed values to dask array if available
+                precomputed = payload.get('precomputed')
+                if precomputed:
+                    logger.debug(f"topic_handler: attaching precomputed={precomputed} to dask array")
+                    darr.precomputed = precomputed
 
                 # tell the scheduler that the futures used by this dask array must not be collected by gc
                 _weak_self.client.persist(darr)
@@ -488,8 +514,65 @@ class Deisa(IDeisa):
         # Use da.block to combine blocks
         return da.block(nested)
 
+    def _analyze_callback_for_operations(self, callback: Callable, array_name: str) -> List[Dict]:
+        """
+        Analyze callback for reduction operations by executing on dask array stub.
+
+        Uses a real dask array stub to build the task graph, then extracts operations
+        from the graph. Works for both lazy callbacks (returning dask arrays) and void
+        callbacks (calling reductions and ignoring results).
+
+        - ``:param callback:`` The callback function to analyze.
+        - ``:param array_name:`` The array name this callback operates on.
+        - ``:return:`` List of operation hint dicts.
+        """
+        hints = []
+
+        stub, extract_hints = make_tracked_deisa_stub(array_name)
+
+        try:
+            result = callback(stub)
+            hints = extract_hints(result)
+        except Exception as e:
+            logger.debug(f"_analyze_callback_for_operations: Analysis failed: {e}")
+
+        return hints
+
+    def precompute_operations(self, array_name: str, operations: List[str], **kwargs) -> None:
+        """
+        Explicitly register reduction operations for precomputation on bridge side.
+
+        Use this when the callback does not return a dask array but still performs
+        reduction operations that can be computed locally on each bridge.
+
+        Example:
+            deisa.precompute_operations('temperature', ['sum', 'mean'])
+
+        - ``:param array_name:`` The array name to register operations for.
+        - ``:param operations:`` List of numpy reduction functions: 'sum', 'mean', 'std', 'var', 'max', 'min', 'prod'.
+        - ``:param kwargs:`` Additional kwargs passed to numpy functions (e.g., axis, keepdims).
+        - ``:return:`` None
+        """
+        if array_name not in self.arrays_metadata:
+            raise ValueError(f"unknown array name: {array_name}")
+
+        hints = []
+        for op_name in operations:
+            if op_name not in {'sum', 'mean', 'std', 'var', 'max', 'min', 'prod'}:
+                raise ValueError(f"unsupported operation: {op_name}")
+            hints.append({
+                'func_module': 'numpy',
+                'func_name': op_name,
+                'keywords': kwargs.copy(),
+                'output_key': f"{array_name}-{op_name}",
+                'type': 'reduction'
+            })
+
+        if hints:
+            self.handshake.set_task_hints(array_name, hints)
+
     @staticmethod
-    def __get_array_names(*callback_args: Callback_args) -> List[str]:
+    def __get_array_names(*callback_args: CallbackArgs) -> List[str]:
         """Flatten callback_args to a tuple of array names."""
         array_names = []
         for arg in callback_args:
