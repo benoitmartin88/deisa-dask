@@ -33,11 +33,9 @@ import subprocess
 import sys
 import threading
 import time
-import uuid
 
 import numpy as np
 import pytest
-
 
 # Number of send() -> callback hops performed per benchmark round. Each round
 # launches one mpirun process group and loops this many sends, so the reported
@@ -58,7 +56,7 @@ def _is_xdist():
     return "PYTEST_XDIST_WORKER" in os.environ
 
 
-def _mpi_bridge_main(scheduler_address: str, nb_bridges: int, chunk_size: int, timestep: int, array_name: str, n_sends: int):
+def _mpi_bridge_main(chunk_size: int, timestep: int, array_name: str, n_sends: int):
     """Run MPI bridge processes for benchmarking.
 
     Performs `n_sends` Bridge.send() calls. The per-hop send timestamp (ns,
@@ -70,6 +68,9 @@ def _mpi_bridge_main(scheduler_address: str, nb_bridges: int, chunk_size: int, t
     from deisa.dask import Bridge
 
     bridge_comm = MPI.COMM_WORLD
+    dims = MPI.Compute_dims(bridge_comm.Get_size(), 2)
+    bridge_comm = bridge_comm.Create_cart(dims)
+
     rank = bridge_comm.Get_rank()
     size = bridge_comm.Get_size()
 
@@ -78,13 +79,12 @@ def _mpi_bridge_main(scheduler_address: str, nb_bridges: int, chunk_size: int, t
     # with the per-rank block, global_shape = chunk_size along the split axis).
     global_shape = (chunk_size * size, chunk_size)
     chunk_shape = (chunk_size, chunk_size)
-    pos = (rank, 0)
 
     arrays_metadata = {
         array_name: {
             'global_shape': global_shape,
             'chunk_shape': chunk_shape,
-            'chunk_position': pos
+            'chunk_position': bridge_comm.Get_coords(rank)
         }
     }
 
@@ -101,7 +101,7 @@ def _mpi_bridge_main(scheduler_address: str, nb_bridges: int, chunk_size: int, t
         data.flat[1] = np.int64(i)  # hop index, so the callback pairs it
 
         bridge.send(array_name, data, timestep=timestep + i,
-                   update_workers=False, filter_workers=lambda w: list(w.keys()))
+                    update_workers=False, filter_workers=lambda w: list(w.keys()))
 
     bridge.close(timestep=timestep)
 
@@ -136,20 +136,21 @@ def test_time_to_callback_mpi(nb_bridges: int, benchmark):
     Deisa callback timestamp) is averaged over all hops and stored via
     benchmark.extra_info. No timing data is written to disk.
     """
-    from distributed import Client, LocalCluster
+    from distributed import LocalCluster
     from deisa.dask import Deisa
 
-    array_name = f"temperature_mpi_{nb_bridges}_{CHUNK_SIZE}_{uuid.uuid4().hex[:8]}"
+    array_name = f"temperature_mpi_{nb_bridges}_{CHUNK_SIZE}"
     timestep = 0
 
     def run_benchmark():
-        results = []          # true send -> callback deltas (ns), one per hop
-        count = [0]           # hops observed so far
+        results = []  # true send -> callback deltas (ns), one per hop
+        count = [0]  # hops observed so far
         all_done = threading.Event()
 
         def deisa_side():
             deisa = Deisa(feedback_queue_size=1024, timeout=60)
 
+            @deisa.register(array_name)
             def timed_callback(window):
                 # Deisa passes a list of DeisaArray (one per registered array
                 # name); window[0] is the GLOBAL dask array. Materialize it to
@@ -164,12 +165,12 @@ def test_time_to_callback_mpi(nb_bridges: int, benchmark):
                 if count[0] >= N_SENDS:
                     all_done.set()
 
-            deisa.register(array_name)(timed_callback)
+            # deisa.register(array_name)(timed_callback)
             deisa.execute_callbacks()
             # execute_callbacks() returns before the topic handler runs the
             # callbacks asynchronously; block until all N_SENDS have fired so
             # the measured results are populated before run_benchmark returns.
-            all_done.wait(timeout=60)
+            all_done.wait(timeout=60)  # TODO: should not be needed as execute_callbacks waits for all tasks to finish
 
         thread = threading.Thread(target=deisa_side)
         thread.start()
@@ -189,7 +190,7 @@ def test_time_to_callback_mpi(nb_bridges: int, benchmark):
 
     # --- setup (not measured): fresh cluster + workers per round -----------
     cluster = LocalCluster(
-        n_workers=2,
+        n_workers=1,
         threads_per_worker=1,
         processes=True,
         host='127.0.0.1',
@@ -197,13 +198,11 @@ def test_time_to_callback_mpi(nb_bridges: int, benchmark):
         dashboard_address=":0",
         worker_dashboard_address=":0"
     )
-    client = Client(cluster)
-    client.wait_for_workers(2, timeout=60)
+    cluster.wait_for_workers(1, timeout=10)
     os.environ["DEISA_DASK_SCHEDULER_ADDRESS"] = cluster.scheduler.address
 
-    results = benchmark.pedantic(run_benchmark, warmup_rounds=1, rounds=5, iterations=1)
+    results = benchmark.pedantic(run_benchmark, warmup_rounds=0, rounds=1, iterations=1)
 
-    client.close()
     cluster.close()
 
     # pytest-benchmark's main column measures the timed phase only (cluster
@@ -231,7 +230,7 @@ def test_time_to_callback_mpi(nb_bridges: int, benchmark):
             "std": std_ms,
             "n": len(results),
         }
-        print(f"\nTrue send->callback ({nb_bridges} MPI bridges, {CHUNK_SIZE}x{CHUNK_SIZE}, "
+        print(f"\nsend->callback ({nb_bridges} MPI bridges, {CHUNK_SIZE}x{CHUNK_SIZE}, "
               f"{N_SENDS} sends/round): "
               f"avg={avg_ms:.3f}ms, median={median_ms:.3f}ms, "
               f"min={min_ms:.3f}ms, max={max_ms:.3f}ms, std={std_ms:.3f}ms (n={len(results)})")
@@ -259,8 +258,6 @@ if __name__ == "__main__":
         try:
             os.environ["DEISA_DASK_SCHEDULER_ADDRESS"] = args.scheduler_address
             _mpi_bridge_main(
-                scheduler_address=args.scheduler_address,
-                nb_bridges=args.nb_bridges,
                 chunk_size=args.chunk_size,
                 timestep=args.timestep,
                 array_name=args.array_name,
@@ -269,6 +266,7 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"[ERROR] {e}", flush=True)
             import traceback
+
             traceback.print_exc()
             sys.exit(1)
         sys.exit(0)
