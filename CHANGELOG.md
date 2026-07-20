@@ -16,6 +16,10 @@ Types of changes:
 
 ## [Unreleased]
 
+### Added
+
+- benchmark: time-to-callback. Measure the time it takes for a callback to be executed.
+
 ### Fixed
 
 - fix Deisa `execute_callbacks` block until all callbacks complete

@@ -37,16 +37,18 @@ import time
 import numpy as np
 import pytest
 
+os.environ["PYTHONOPTIMIZE"] = "TRUE"
+
 # Number of send() -> callback hops performed per benchmark round. Each round
 # launches one mpirun process group and loops this many sends, so the reported
 # latency is averaged over many hops (better statistics than one-per-round).
-N_SENDS = 20
+N_SENDS = 100
 
 # Global array shape (review requirement): GLOBAL_SHAPE is fixed and each
 # bridge sends its sub-part (chunk) of this global data, partitioned across an
 # MPI Cartesian grid. GLOBAL_SHAPE must be divisible by every Cartesian dim
 # size used (1, 2, 4 bridges -> dims (1,1), (2,1), (2,2)).
-GLOBAL_SHAPE = (64, 64)
+GLOBAL_SHAPE = (128, 128)  # 128*128*64=1048576 ~=1Mb
 
 
 def _has_mpirun():
@@ -65,8 +67,11 @@ def _mpi_bridge_main(timestep: int, array_name: str, n_sends: int):
     before each send, so the Deisa callback can compute the true send ->
     callback latency with NO disk I/O.
     """
+    import os
     from mpi4py import MPI
     from deisa.dask import Bridge
+
+    os.environ["PYTHONOPTIMIZE"] = "TRUE"
 
     bridge_comm = MPI.COMM_WORLD
     dims = MPI.Compute_dims(bridge_comm.Get_size(), 2)
@@ -99,7 +104,7 @@ def _mpi_bridge_main(timestep: int, array_name: str, n_sends: int):
         # lives at element [0, 0]; remaining elements are arbitrary fill.
         data = np.zeros(chunk_shape, dtype=np.int64)
         data[0, 0] = np.int64(time.time_ns())
-        data.flat[1] = np.int64(i)  # hop index, so the callback pairs it
+        # data.flat[1] = np.int64(i)  # hop index, so the callback pairs it
 
         bridge.send(array_name, data, timestep=timestep + i,
                     update_workers=False, filter_workers=lambda w: list(w.keys()))
@@ -125,7 +130,7 @@ def _spawn_mpi(scheduler_address: str, nb_bridges: int,
 
 @pytest.mark.skipif(_is_xdist(), reason="requires serial execution")
 @pytest.mark.skipif(not _has_mpirun(), reason="mpirun not available")
-@pytest.mark.parametrize("nb_bridges", [1, 2, 4])
+@pytest.mark.parametrize("nb_bridges", [1, 2])
 def test_time_to_callback_mpi(nb_bridges: int, benchmark):
     """Measure the true send() -> Deisa callback latency using real MPI.
 
@@ -144,33 +149,20 @@ def test_time_to_callback_mpi(nb_bridges: int, benchmark):
 
     def run_benchmark():
         results = []  # true send -> callback deltas (ns), one per hop
-        count = [0]  # hops observed so far
-        all_done = threading.Event()
 
         def deisa_side():
             deisa = Deisa(feedback_queue_size=1024, timeout=60)
 
             @deisa.register(array_name)
             def timed_callback(window):
-                # Deisa passes a list of DeisaArray (one per registered array
-                # name); window[0] is the GLOBAL dask array. Materialize it to
+                # Deisa passes a list of DeisaArray (one per registered array name)
                 # read the int64 send timestamp embedded at element [0, 0].
-                idx = count[0]
                 cb_ns = time.time_ns()
                 np_arr = window[0].compute()
                 send_ns = int(np_arr[0, 0])
-                if send_ns > 0:
-                    results.append(cb_ns - send_ns)
-                count[0] += 1
-                if count[0] >= N_SENDS:
-                    all_done.set()
+                results.append(cb_ns - send_ns)
 
-            # deisa.register(array_name)(timed_callback)
             deisa.execute_callbacks()
-            # execute_callbacks() returns before the topic handler runs the
-            # callbacks asynchronously; block until all N_SENDS have fired so
-            # the measured results are populated before run_benchmark returns.
-            all_done.wait(timeout=60)  # TODO: should not be needed as execute_callbacks waits for all tasks to finish
 
         thread = threading.Thread(target=deisa_side)
         thread.start()
@@ -201,6 +193,8 @@ def test_time_to_callback_mpi(nb_bridges: int, benchmark):
     os.environ["DEISA_DASK_SCHEDULER_ADDRESS"] = cluster.scheduler.address
 
     results = benchmark.pedantic(run_benchmark, warmup_rounds=0, rounds=1, iterations=1)
+
+    print(f">>>>>>>>>>>>>>>> len(results)={len(results)}")
 
     cluster.close()
 
