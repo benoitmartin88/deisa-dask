@@ -42,10 +42,11 @@ import pytest
 # latency is averaged over many hops (better statistics than one-per-round).
 N_SENDS = 20
 
-# Global array shape is fixed at 64x64 (review requirement). The array is split
-# along axis 0 across the MPI ranks (1D partition); chunk_shape is derived per
-# bridge count below so the global shape is always (CHUNK_SIZE, CHUNK_SIZE).
-CHUNK_SIZE = 64
+# Global array shape (review requirement): GLOBAL_SHAPE is fixed and each
+# bridge sends its sub-part (chunk) of this global data, partitioned across an
+# MPI Cartesian grid. GLOBAL_SHAPE must be divisible by every Cartesian dim
+# size used (1, 2, 4 bridges -> dims (1,1), (2,1), (2,2)).
+GLOBAL_SHAPE = (64, 64)
 
 
 def _has_mpirun():
@@ -56,7 +57,7 @@ def _is_xdist():
     return "PYTEST_XDIST_WORKER" in os.environ
 
 
-def _mpi_bridge_main(chunk_size: int, timestep: int, array_name: str, n_sends: int):
+def _mpi_bridge_main(timestep: int, array_name: str, n_sends: int):
     """Run MPI bridge processes for benchmarking.
 
     Performs `n_sends` Bridge.send() calls. The per-hop send timestamp (ns,
@@ -72,13 +73,13 @@ def _mpi_bridge_main(chunk_size: int, timestep: int, array_name: str, n_sends: i
     bridge_comm = bridge_comm.Create_cart(dims)
 
     rank = bridge_comm.Get_rank()
-    size = bridge_comm.Get_size()
 
-    # 1D partition: the array is split along axis 0 across the MPI ranks.
-    # Mirrors the working geometry in test/test_mpi.py (chunk_position aligned
-    # with the per-rank block, global_shape = chunk_size along the split axis).
-    global_shape = (chunk_size * size, chunk_size)
-    chunk_shape = (chunk_size, chunk_size)
+    # GLOBAL_SHAPE is split across the MPI Cartesian grid (dims computed above).
+    # Each bridge owns its sub-part (chunk) of the global data: chunk_shape
+    # divides GLOBAL_SHAPE by the Cartesian dims and chunk_position is this
+    # bridge's coords in the grid.
+    global_shape = GLOBAL_SHAPE
+    chunk_shape = tuple(gs // d for gs, d in zip(GLOBAL_SHAPE, dims))
 
     arrays_metadata = {
         array_name: {
@@ -106,7 +107,7 @@ def _mpi_bridge_main(chunk_size: int, timestep: int, array_name: str, n_sends: i
     bridge.close(timestep=timestep)
 
 
-def _spawn_mpi(scheduler_address: str, nb_bridges: int, chunk_size: int,
+def _spawn_mpi(scheduler_address: str, nb_bridges: int,
                timestep: int, array_name: str, n_sends: int):
     """Launch the MPI bridge processes (a fresh process group each call)."""
     cmd = [
@@ -115,7 +116,6 @@ def _spawn_mpi(scheduler_address: str, nb_bridges: int, chunk_size: int,
         "--mpi-bridge",
         "--scheduler-address", scheduler_address,
         "--nb-bridges", str(nb_bridges),
-        "--chunk-size", str(chunk_size),
         "--timestep", str(timestep),
         "--array-name", array_name,
         "--n-sends", str(n_sends),
@@ -139,7 +139,7 @@ def test_time_to_callback_mpi(nb_bridges: int, benchmark):
     from distributed import LocalCluster
     from deisa.dask import Deisa
 
-    array_name = f"temperature_mpi_{nb_bridges}_{CHUNK_SIZE}"
+    array_name = f"temperature_mpi_{nb_bridges}_{GLOBAL_SHAPE[0]}"
     timestep = 0
 
     def run_benchmark():
@@ -178,7 +178,6 @@ def test_time_to_callback_mpi(nb_bridges: int, benchmark):
         result = _spawn_mpi(
             scheduler_address=os.environ["DEISA_DASK_SCHEDULER_ADDRESS"],
             nb_bridges=nb_bridges,
-            chunk_size=CHUNK_SIZE,
             timestep=timestep,
             array_name=array_name,
             n_sends=N_SENDS,
@@ -212,7 +211,7 @@ def test_time_to_callback_mpi(nb_bridges: int, benchmark):
     # benchmark.extra_info so it lands in the machine-readable JSON for CI
     # regression tracking.
     benchmark.extra_info["nb_bridges"] = nb_bridges
-    benchmark.extra_info["chunk_size"] = CHUNK_SIZE
+    benchmark.extra_info["global_shape"] = GLOBAL_SHAPE
     benchmark.extra_info["n_sends_per_round"] = N_SENDS
 
     if results and len(results) > 0:
@@ -230,7 +229,7 @@ def test_time_to_callback_mpi(nb_bridges: int, benchmark):
             "std": std_ms,
             "n": len(results),
         }
-        print(f"\nsend->callback ({nb_bridges} MPI bridges, {CHUNK_SIZE}x{CHUNK_SIZE}, "
+        print(f"\nsend->callback ({nb_bridges} MPI bridges, {GLOBAL_SHAPE[0]}x{GLOBAL_SHAPE[1]}, "
               f"{N_SENDS} sends/round): "
               f"avg={avg_ms:.3f}ms, median={median_ms:.3f}ms, "
               f"min={min_ms:.3f}ms, max={max_ms:.3f}ms, std={std_ms:.3f}ms (n={len(results)})")
@@ -244,7 +243,6 @@ if __name__ == "__main__":
 
     parser.add_argument("--scheduler-address")
     parser.add_argument("--nb-bridges", type=int, default=1)
-    parser.add_argument("--chunk-size", type=int, default=64)
     parser.add_argument("--timestep", type=int, default=0)
     parser.add_argument("--array-name", default="temperature")
     parser.add_argument("--n-sends", type=int, default=1)
@@ -258,7 +256,6 @@ if __name__ == "__main__":
         try:
             os.environ["DEISA_DASK_SCHEDULER_ADDRESS"] = args.scheduler_address
             _mpi_bridge_main(
-                chunk_size=args.chunk_size,
                 timestep=args.timestep,
                 array_name=args.array_name,
                 n_sends=args.n_sends,
