@@ -153,18 +153,24 @@ def _mpi_bridge_main(array_name: str, n_sends: int):
         bridge.send(array_name, data, timestep=i, update_workers=False, filter_workers=lambda w: list(w.keys()))
 
         # Block until the Deisa callback has executed for this timestep.
-        # bridge.get() polls the feedback queue (non-blocking per call)
-        # so we must loop until the entry for timestep `i` appears.
+        # The feedback entry is set only after the callback completes and
+        # calls deisa.set(). bridge.get() is non-blocking (returns None
+        # when the queue is empty), so we poll with a sleep between checks.
+        # The initial sleep gives the async topic handler a chance to receive
+        # the log_event message and dispatch the callback task before we
+        # start polling.
         t0 = time.monotonic()
+        deadline = t0 + FEEDBACK_TIMEOUT
+        time.sleep(0.05)
         while True:
             got = bridge.get(array_name, timestep=i)
             if got is not None:
                 break
-            elapsed = time.monotonic() - t0
-            if elapsed > FEEDBACK_TIMEOUT:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 raise RuntimeError(
                     f"[{rank}/{size}] timeout waiting for feedback on timestep {i} "
-                    f"after {elapsed:.1f}s (total send loop {time.monotonic() - t0_total:.1f}s)"
+                    f"after {t0 - t0_total:.1f}s total (total send loop {time.monotonic() - t0_total:.1f}s)"
                 )
             time.sleep(FEEDBACK_POLL_INTERVAL)
 
