@@ -139,11 +139,21 @@ def _mpi_bridge_main(array_name: str, n_sends: int):
         bridge.send(array_name, data, timestep=i, update_workers=False, filter_workers=lambda w: list(w.keys()))
 
         # Block until the Deisa callback has executed for this timestep.
-        # bridge.get() polls the feedback queue and returns only once the
-        # callback has called deisa.set(array_name, i, i) — the value is the
-        # timestep itself. This ensures only one send is in flight at a time.
-        got = bridge.get(array_name, timestep=i)
-        print(f"[{rank}/{size}] sent={i} feedback={got}", flush=True)
+        # bridge.get() polls the feedback queue (non-blocking per call)
+        # so we must loop until the entry for timestep `i` appears.
+        t0 = time.monotonic()
+        while True:
+            got = bridge.get(array_name, timestep=i)
+            if got is not None:
+                print(f"[{rank}/{size}] sent={i} feedback={got} ok", flush=True)
+                break
+            elapsed = time.monotonic() - t0
+            if elapsed > FEEDBACK_TIMEOUT:
+                raise RuntimeError(
+                    f"[{rank}/{size}] timeout waiting for feedback on timestep {i} "
+                    f"after {elapsed:.1f}s"
+                )
+            time.sleep(0.01)
 
     bridge.close(timestep=n_sends)
 
@@ -257,8 +267,8 @@ def test_time_to_callback_mpi(nb_bridges: int, benchmark, env_setup):
                 deisa.set(array_name, iteration, timestep=iteration)  # noqa: F821
 
                 # Signal back to the bridge that this timestep's callback has
-                # completed. The bridge.get() call on the MPI side checks for
-                # this entry in the feedback queue.
+                # completed. The bridge.get() polling loop on the MPI side checks
+                # for this entry in the feedback queue.
                 deisa.set(array_name, iteration, timestep=iteration)
 
             deisa.execute_callbacks()
