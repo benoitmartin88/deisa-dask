@@ -76,7 +76,7 @@ class NpEncoder(json.JSONEncoder):
 # How long bridge.get() polls waiting for feedback from the Deisa callback
 # (seconds). Set high enough to handle typical callback execution time plus
 # scheduler latency. A generous value avoids spurious timeouts under load.
-FEEDBACK_TIMEOUT = 120.0
+FEEDBACK_TIMEOUT = 10.0
 
 # Interval between polls in the bridge.get() feedback loop (seconds).
 # 100ms is a good balance between responsiveness and not flooding the
@@ -85,7 +85,7 @@ FEEDBACK_POLL_INTERVAL = 0.1
 
 # How often to print a progress marker during the N_SENDS loop on the
 # MPI side. Every N prints avoid slowing down the benchmark with I/O.
-MPI_PROGRESS_INTERVAL = 100
+MPI_PROGRESS_INTERVAL = 10
 
 # How often to print a progress marker in the Deisa callback.
 # Only the first N prints are emitted to keep CI logs manageable.
