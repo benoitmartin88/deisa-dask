@@ -220,7 +220,8 @@ class Deisa(IDeisa):
 
         # per-callback state
         callback_state = {
-            arr_name: {"window": collections.deque(maxlen=ws), "changed": False} for arr_name, ws in parsed
+            arr_name: {"window": collections.deque(maxlen=ws), "changed": False, "last_iteration": None}
+            for arr_name, ws in parsed
         }
 
         self._callbacks[callback_id] = {
@@ -394,8 +395,15 @@ class Deisa(IDeisa):
 
         # Update the sliding window for the modified array.
         entry = state[array_name]
+        if entry["last_iteration"] is not None and iteration < entry["last_iteration"]:
+            raise ValueError(
+                f"callback {callback_id}: array {array_name} received iteration "
+                f"{iteration} which is before last seen iteration "
+                f"{entry['last_iteration']}. Iterations must be monotonically increasing."
+            )
         entry["window"].append(build_deisa_array(darr, iteration))
         entry["changed"] = True
+        entry["last_iteration"] = iteration
 
         ordered_array_names = cb_data["array_names"]
 
@@ -432,7 +440,13 @@ class Deisa(IDeisa):
             entry["changed"] = False
 
         else:  # AND
-            if all(state[name]["changed"] for name in ordered_array_names):
+            # Verify all arrays arrived at the same iteration before calling
+            iterations = {state[name]["last_iteration"] for name in ordered_array_names}
+            if (
+                all(state[name]["changed"] for name in ordered_array_names)
+                and len(iterations) == 1
+                and None not in iterations
+            ):
                 _call_callback()
 
                 for name in ordered_array_names:
