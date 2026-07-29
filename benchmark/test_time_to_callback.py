@@ -78,7 +78,7 @@ class NpEncoder(json.JSONEncoder):
 # scheduler latency. A generous value avoids spurious timeouts under load.
 FEEDBACK_TIMEOUT = 10.0
 
-# Interval between polls in the bridge.get() feedback loop (seconds).
+# Interval between polls in the feedback loop (seconds).
 # 100ms is a good balance between responsiveness and not flooding the
 # Dask scheduler with queue reads.
 FEEDBACK_POLL_INTERVAL = 0.1
@@ -154,7 +154,9 @@ def _mpi_bridge_main(array_name: str, n_sends: int):
 
         # Block until the Deisa callback has executed for this timestep.
         # bridge.get() is non-blocking (returns None when the queue is
-        # empty), so we poll with a sleep between checks.
+        # empty), so we poll with a sleep between checks. The sleep gives
+        # the Deisa callback thread time to execute and call deisa.set()
+        # between polls.
         t0 = time.monotonic()
         deadline = t0 + FEEDBACK_TIMEOUT
         while True:
