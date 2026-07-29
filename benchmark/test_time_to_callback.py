@@ -49,40 +49,6 @@ N_SENDS = 100
 # time plus scheduler dispatch latency under normal load.
 FEEDBACK_TIMEOUT = 10.0
 
-# Interval between polls in the feedback loop (seconds).
-# 100ms is a good balance between responsiveness and not flooding the
-# Dask scheduler with queue reads.
-FEEDBACK_POLL_INTERVAL = 0.1
-
-# How often to print a progress marker during the N_SENDS loop on the
-# MPI side. Every N prints avoid slowing down the benchmark with I/O.
-MPI_PROGRESS_INTERVAL = 10
-
-# How often to print a progress marker in the Deisa callback.
-# Only the first N prints are emitted to keep CI logs manageable.
-CB_TRACE_LIMIT = 10
-
-
-class NpEncoder(json.JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, np.integer):
-            return int(obj)
-        if isinstance(obj, np.floating):
-            return float(obj)
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
-        return super(NpEncoder, self).default(obj)
-
-# How long bridge.get() polls waiting for feedback from the Deisa callback
-# (seconds). Set high enough to handle typical callback execution time plus
-# scheduler latency. A generous value avoids spurious timeouts under load.
-FEEDBACK_TIMEOUT = 10.0
-
-# Interval between polls in the feedback loop (seconds).
-# 100ms is a good balance between responsiveness and not flooding the
-# Dask scheduler with queue reads.
-FEEDBACK_POLL_INTERVAL = 0.1
-
 # How often to print a progress marker during the N_SENDS loop on the
 # MPI side. Every N prints avoid slowing down the benchmark with I/O.
 MPI_PROGRESS_INTERVAL = 10
@@ -275,12 +241,10 @@ def test_time_to_callback_mpi(nb_bridges: int, benchmark, env_setup):
                 # Signal back to the bridge that this timestep's callback has
                 # completed. The bridge.get() call on the MPI side waits for
                 # this entry in the feedback queue.
-                deisa.set(array_name, iteration, timestep=iteration)  # noqa: F821
-
                 # Signal back to the bridge that this timestep's callback has
-                # completed. The bridge.get() polling loop on the MPI side checks
-                # for this entry in the feedback queue.
-                deisa.set(array_name, iteration, timestep=iteration)
+                # completed. The bridge.get() call on the MPI side waits for
+                # this entry in the feedback queue.
+                deisa.set(array_name, iteration, timestep=iteration)  # noqa: F821
 
             deisa.execute_callbacks()
             del deisa
