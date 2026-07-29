@@ -171,7 +171,7 @@ def _mpi_bridge_main(array_name: str, n_sends: int):
 
         if (i + 1) % MPI_PROGRESS_INTERVAL == 0 or i == 0 or i == n_sends - 1:
             elapsed_total = time.monotonic() - t0_total
-            print(f"[{rank}/{size}] progress: {i+1}/{n_sends} sends done ({elapsed_total:.1f}s total)", flush=True)
+            print(f"[bridge {rank}] progress: {i + 1}/{n_sends} sends done ({elapsed_total:.1f}s total)", flush=True)
 
     bridge.close(timestep=n_sends)
 
