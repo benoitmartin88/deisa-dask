@@ -153,15 +153,10 @@ def _mpi_bridge_main(array_name: str, n_sends: int):
         bridge.send(array_name, data, timestep=i, update_workers=False, filter_workers=lambda w: list(w.keys()))
 
         # Block until the Deisa callback has executed for this timestep.
-        # The feedback entry is set only after the callback completes and
-        # calls deisa.set(). bridge.get() is non-blocking (returns None
-        # when the queue is empty), so we poll with a sleep between checks.
-        # The initial sleep gives the async topic handler a chance to receive
-        # the log_event message and dispatch the callback task before we
-        # start polling.
+        # bridge.get() is non-blocking (returns None when the queue is
+        # empty), so we poll with a sleep between checks.
         t0 = time.monotonic()
         deadline = t0 + FEEDBACK_TIMEOUT
-        time.sleep(0.05)
         while True:
             got = bridge.get(array_name, timestep=i)
             if got is not None:
@@ -299,6 +294,7 @@ def test_time_to_callback_mpi(nb_bridges: int, benchmark, env_setup):
 
         thread = threading.Thread(target=deisa_side)
         thread.start()
+        deisa_threads.append(thread)
 
         result = _spawn_mpi(
             scheduler_address=os.environ["DEISA_DASK_SCHEDULER_ADDRESS"],
@@ -308,7 +304,6 @@ def test_time_to_callback_mpi(nb_bridges: int, benchmark, env_setup):
         )
         assert result.returncode == 0, f"MPI bridge failed with returncode {result.returncode}"
 
-        thread.join(timeout=10)
         return results
 
     results = benchmark.pedantic(run_benchmark, warmup_rounds=0, rounds=1, iterations=1)
