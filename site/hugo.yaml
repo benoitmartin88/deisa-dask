@@ -9,9 +9,9 @@ enableGitInfo: true
 # enableEmoji: false
 hasCJKLanguage: true
 
-# services:
-#   googleAnalytics:
-#     ID: G-MEASUREMENT_ID
+services:
+  googleAnalytics:
+    ID: G-TTDV7JTL51
 
 outputs:
   home: [html, llms]
@@ -106,9 +106,9 @@ params:
   externalLinkDecoration: true
 
   banner:
-    key: 'announcement-v0.6.2'
+    key: 'announcement-v0.6.3'
     message: |
-      deisa-dask **v0.6.2** is here! 🎉 Discover [what's new]({{% relref "blog/0.6.2" %}})
+      deisa-dask **v0.6.3** is here! 🎉 Discover [what's new]({{% relref "blog/0.6.3" %}})
 
   navbar:
     displayTitle: true
