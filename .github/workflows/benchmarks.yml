@@ -1,0 +1,54 @@
+# This workflow runs a pytest benchmark and uploads the results to Bencher.
+# Triggers on push to this repository's main branch, or manually via workflow_dispatch.
+name: Benchmarks on main
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  benchmark_base_branch:
+    permissions:
+      checks: write
+    runs-on: ubuntu-latest
+    env:
+      UCX_TLS: tcp,self
+      FI_PROVIDER: tcp
+      PYTHONOPTIMIZE: 1
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --no-cache-dir mpi4py openmpi
+          python -m pip install dask==2026.3.0 distributed==2026.3.0
+          python -m pip install .
+          python -m pip install .[benchmark]
+
+
+      - uses: bencherdev/bencher@main
+      - name: Run and track base branch pytest benchmarks with Bencher
+        run: |
+          bencher run \
+          --project deisa-dask \
+          --key "${{ secrets.BENCHER_API_KEY }}" \
+          --branch "${{ github.ref_name }}" \
+          --testbed "gh-${RUNNER_OS}-${RUNNER_ARCH}" \
+          --threshold-measure 50 \
+          --threshold-test iqr \
+          --threshold-lower-boundary _ \
+          --threshold-upper-boundary 2.0 \
+          --threshold-measure 90 \
+          --threshold-test iqr \
+          --threshold-lower-boundary _ \
+          --threshold-upper-boundary 4.0 \
+          --thresholds-reset \
+          --error-on-alert \
+          --adapter json \
+          --file bencher-result.json \
+          --github-actions "${{ secrets.GITHUB_TOKEN }}" \
+          "pytest --log-cli-level=INFO benchmark/ --ignore=benchmark/test_dask_queue.py"
