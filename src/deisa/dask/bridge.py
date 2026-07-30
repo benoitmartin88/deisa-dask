@@ -43,7 +43,7 @@ from distributed.utils_comm import scatter_to_workers
 from tlz import valmap
 
 from dask.tokenize import tokenize
-from deisa.dask.constants import CLIENT_KEY, FEEDBACK_QUEUE_PREFIX, KEY_PREFIX
+from deisa.dask.constants import CLIENT_KEY, FEEDBACK_QUEUE_PREFIX, KEY_PREFIX, WAIT_FOR_EXECUTE_CB_EVENT
 from deisa.dask.handshake import Handshake
 from deisa.dask.utils import get_client
 
