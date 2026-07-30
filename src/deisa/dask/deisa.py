@@ -47,6 +47,7 @@ from deisa.dask.constants import (
     DEFAULT_SLIDING_WINDOW_SIZE,
     FEEDBACK_QUEUE_PREFIX,
     KEY_PREFIX,
+    WAIT_FOR_EXECUTE_CB_EVENT,
 )
 from deisa.dask.handshake import Handshake
 from deisa.dask.utils import build_deisa_array, get_client
@@ -303,7 +304,7 @@ class Deisa(IDeisa):
         logger.info("execute_callbacks()")
 
         logger.info("Bridges are ready, unblock bridges")
-        Event("deisa_wait", client=self.client).set()
+        Event(WAIT_FOR_EXECUTE_CB_EVENT, client=self.client).set()
 
         logger.info("execute_callbacks() waiting for bridges")
         self.handshake.wait_for_bridges_to_finish()

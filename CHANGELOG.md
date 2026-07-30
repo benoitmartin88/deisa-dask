@@ -14,6 +14,12 @@ Types of changes:
 - `Fixed` for any bug fixes.
 - `Security` in case of vulnerabilities.
 
+## [Unreleased]
+
+### Fixed
+
+- Missing first callback(s) due to not waiting for `Deisa.execute_callbacks()`
+
 ## [0.6.3]
 
 ### Added
