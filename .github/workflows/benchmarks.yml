@@ -39,13 +39,15 @@ jobs:
           --branch "${{ github.ref_name }}" \
           --testbed "gh-${RUNNER_OS}-${RUNNER_ARCH}" \
           --threshold-measure 50 \
-          --threshold-test iqr \
+          --threshold-test percentage \
           --threshold-lower-boundary _ \
-          --threshold-upper-boundary 2.0 \
+          --threshold-upper-boundary 0.10 \
+          --threshold-min-sample-size 10 \
           --threshold-measure 90 \
-          --threshold-test iqr \
+          --threshold-test percentage \
           --threshold-lower-boundary _ \
-          --threshold-upper-boundary 4.0 \
+          --threshold-upper-boundary 0.15 \
+          --threshold-min-sample-size 10 \
           --thresholds-reset \
           --error-on-alert \
           --adapter json \
