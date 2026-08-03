@@ -122,6 +122,7 @@ class Deisa(IDeisa):
         *callback_args: CallbackArgs,
         exception_handler: IDeisa.ExceptionHandler = __default_exception_handler,
         when: Literal["AND", "OR"] = "AND",
+        precompute: bool = False,
     ) -> Callable:
         """
         Registers a callback function with specific arguments, exception handling, and conditional execution criteria.
@@ -156,7 +157,7 @@ class Deisa(IDeisa):
         """
 
         def decorator(callback: IDeisa.Callback) -> IDeisa.Callback:
-            return self.register_callback(callback, *callback_args, exception_handler=exception_handler, when=when)
+            return self.register_callback(callback, *callback_args, exception_handler=exception_handler, when=when, precompute=precompute)
 
         return decorator
 
@@ -166,6 +167,7 @@ class Deisa(IDeisa):
         *callback_args: CallbackArgs,
         exception_handler: IDeisa.ExceptionHandler = __default_exception_handler,
         when: Literal["AND", "OR"] = "AND",
+        precompute: bool = False,
     ) -> Callable:
         """
         Registers a callback function with specific arguments, exception handling, and conditional execution criteria.
@@ -208,7 +210,7 @@ class Deisa(IDeisa):
             else:
                 raise TypeError("callback_args must be str or tuple")
 
-        callback_id = self._register_callback_impl(callback, parsed, exception_handler=exception_handler, when=when)
+        callback_id = self._register_callback_impl(callback, parsed, exception_handler=exception_handler, when=when, precompute=precompute)
         callback.callback_id = callback_id
         return callback
 
@@ -218,6 +220,7 @@ class Deisa(IDeisa):
         parsed: List[Window],
         exception_handler: IDeisa.ExceptionHandler,
         when: Literal["AND", "OR"],
+        precompute: bool = False,
     ) -> Callback_id:
 
         if when not in ("AND", "OR"):
