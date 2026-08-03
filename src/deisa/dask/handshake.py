@@ -152,11 +152,11 @@ class Handshake:
 
     def get_task_hints(self, array_name: str) -> list:
         assert self.__handshake_actor is not None
-        return self.__handshake_actor.get_task_hints(array_name)
+        return self.__handshake_actor.get_task_hints(array_name).result()
 
     def get_task_hints_dict(self) -> dict:
         assert self.__handshake_actor is not None
-        return self.__handshake_actor.get_task_hints_dict()
+        return self.__handshake_actor.get_task_hints_dict().result()
 
     def __wait_for_go(self) -> None:
         Event(Handshake._DEISA_WAIT_FOR_GO_EVENT, client=self.client).wait()
