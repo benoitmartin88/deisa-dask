@@ -28,6 +28,7 @@
 # =============================================================================
 import asyncio
 import logging
+import pickle
 import sys
 import uuid
 import zlib
@@ -335,9 +336,9 @@ class Bridge(IBridge):
             return
 
         to_send = {
-            'future-info': res,
-            'chunk_position': self.arrays_metadata[array_name]['chunk_position'],
-            'precomputed': partials
+            "future-info": res,
+            "chunk_position": self.arrays_metadata[array_name]["chunk_position"],
+            "precomputed": partials,
         }
         logger.debug(f"[{self.id}] send() gather: to_send={to_send}")
 
@@ -353,11 +354,11 @@ class Bridge(IBridge):
             keys = []
             all_partials = []
             for d in gathered_data:
-                who_has.update(d['future-info']['who_has'])
-                nbytes.update(d['future-info']['nbytes'])
-                keys.append(d['future-info']['future'])
-                if 'precomputed' in d:
-                    all_partials.append(d['precomputed'])
+                who_has.update(d["future-info"]["who_has"])
+                nbytes.update(d["future-info"]["nbytes"])
+                keys.append(d["future-info"]["future"])
+                if "precomputed" in d:
+                    all_partials.append(d["precomputed"])
 
             # only update the scheduler with who has what and register the future once
             self.client.sync(self.client.scheduler.update_data, who_has=who_has, nbytes=nbytes)
@@ -367,18 +368,23 @@ class Bridge(IBridge):
             self.client._send_to_scheduler({"op": "client-desires-keys", "keys": keys, "client": CLIENT_KEY})
 
             # Combine partials on rank 0
-            combined_partials = self._combine_reduction_partials(all_partials) if all_partials else {}
+            combined_partials = (
+                self._combine_reduction_partials(all_partials, array_name=array_name) if all_partials else {}
+            )
 
             to_send = {
-                'array_name': array_name,
-                'iteration': timestep,
-                'precomputed': combined_partials if combined_partials else None,
-                'futures': [{
-                    'future': d['future-info']['future'],
-                    'shape': chunk.shape,
-                    'dtype': str(chunk.dtype),
-                    'chunk_position': d['chunk_position']
-                } for d in gathered_data]
+                "array_name": array_name,
+                "iteration": timestep,
+                "precomputed": combined_partials if combined_partials else None,
+                "futures": [
+                    {
+                        "future": d["future-info"]["future"],
+                        "shape": chunk.shape,
+                        "dtype": str(chunk.dtype),
+                        "chunk_position": d["chunk_position"],
+                    }
+                    for d in gathered_data
+                ],
             }
             logger.debug(
                 f"[{self.id}] send() log_event: array={array_name}, timestep={timestep}, n_futures={len(gathered_data)}"
@@ -387,7 +393,14 @@ class Bridge(IBridge):
 
         # TODO: what to do if error ?
 
-    def _direct_send(self, array_name: str, res: dict, chunk: np.ndarray, timestep: int, precomputed: Optional[Dict] = None):
+    def _direct_send(
+        self,
+        array_name: str,
+        res: dict,
+        chunk: np.ndarray,
+        timestep: int,
+        precomputed: Optional[Dict] = None,
+    ):
         """
         Handle single-bridge array send without collective.
 
@@ -409,15 +422,17 @@ class Bridge(IBridge):
         self.client.sync(self.client.scheduler.update_data, who_has=who_has, nbytes=nbytes)
         self.client._send_to_scheduler({"op": "client-desires-keys", "keys": [future_key], "client": CLIENT_KEY})
         to_send = {
-            'array_name': array_name,
-            'iteration': timestep,
-            'precomputed': precomputed,
-            'futures': [{
-                'future': future_key,
-                'shape': chunk.shape,
-                'dtype': str(chunk.dtype),
-                'chunk_position': self.arrays_metadata[array_name]['chunk_position']
-            }]
+            "array_name": array_name,
+            "iteration": timestep,
+            "precomputed": precomputed,
+            "futures": [
+                {
+                    "future": future_key,
+                    "shape": chunk.shape,
+                    "dtype": str(chunk.dtype),
+                    "chunk_position": self.arrays_metadata[array_name]["chunk_position"],
+                }
+            ],
         }
         self.client.log_event(array_name, to_send)
 
@@ -527,16 +542,17 @@ class Bridge(IBridge):
         If no hints are available, this method returns an empty list (no precomputation).
 
         - ``:param array_name:`` The array name to get hints for.
-        - ``:return:`` List of operation hints with 'func_module', 'func_name', 'keywords', 'output_key'.
+        - ``:return:`` List of reduction hints (each carrying a pickled chunk
+            callable, pickled aggregator, and the dask kwargs to apply).
         """
         # Check cache first
         if self._task_hints.get(array_name):
             return self._task_hints[array_name]
-        
+
         # If not cached, need to fetch (only sub_comm rank 0 has client)
         sub_comm = self._array_comms.get(array_name)
         hints = []
-        
+
         if sub_comm is not None and sub_comm is not _COMM_NULL:
             if sub_comm.Get_rank() == 0 and self.handshake is not None:
                 hints = self.handshake.get_task_hints(array_name)
@@ -545,95 +561,99 @@ class Bridge(IBridge):
             else:
                 # Receive broadcast
                 hints = sub_comm.bcast(None, root=0)
-            
+
             # Cache the hints
             if hints:
                 self._task_hints[array_name] = hints
-        
+
         return hints
 
     def _execute_operations_on_chunk(self, array_name: str, chunk: np.ndarray, hints: List[Dict]) -> Dict:
         """
         Execute reduction operations locally on numpy chunk before scatter.
 
-        These operations produce partial results that will be combined on rank 0.
-        Uses dynamic function loading from the serialized task graph.
+        Each hint is the output of :func:`deisa.dask.task_hints.extract_reduction_hints`
+        and contains a pickled dask chunk callable plus the kwargs dask would
+        pass it. The callable is unpickled here and invoked on the local numpy
+        chunk — dask itself is never asked to run the task, so the bridge
+        can precompute the partial without scattering the full data.
 
         - ``:param array_name:`` The array name being processed.
         - ``:param chunk:`` The numpy ndarray data chunk.
         - ``:param hints:`` List of operation hints from task graph analysis.
         - ``:return:`` Dict of partial results keyed by output_key.
         """
-        import importlib
         partials = {}
         for hint in hints:
-            func_module = hint['func_module']
-            func_name = hint['func_name']
-            keywords = hint.get('keywords', {})
-            output_key = hint['output_key']
-
-            # Dynamically load the reduction function from its module
+            output_key = hint["output_key"]
             try:
-                module = importlib.import_module(func_module)
-                func = getattr(module, func_name)
-                
-                # Call the reduction function with the same keywords as in task graph
-                call_kwargs = {k: v for k, v in keywords.items() if k in ('dtype', 'keepdims')}
-                result = func(chunk, axis=None, **call_kwargs)
-                
-                # For mean/std/var, we need to store sufficient statistics
-                # to correctly combine partials (sum and count)
-                if func_name == 'mean':
-                    count = float(np.asarray(chunk).size)
-                    partials[f"{output_key}-sum"] = float(np.asarray(result).item() * count)
-                    partials[f"{output_key}-count"] = count
-                else:
-                    partials[output_key] = float(np.asarray(result).item())
+                chunk_func = pickle.loads(hint["chunk_func_pickle"])
+                chunk_kwargs = hint.get("chunk_kwargs", {}) or {}
+                partial = chunk_func(chunk, **chunk_kwargs)
             except Exception as e:
-                logger.warning(f"[{self.id}] _execute_operations_on_chunk: could not execute {func_module}.{func_name}: {e}")
+                logger.warning(f"[{self.id}] _execute_operations_on_chunk: could not execute {output_key}: {e}")
+                continue
+            partials[output_key] = partial
 
         logger.debug(f"[{self.id}] _execute_operations_on_chunk: {partials}")
         return partials
 
-    @staticmethod
-    def _combine_reduction_partials(all_partials: List[Dict]) -> Dict:
+    def _combine_reduction_partials(self, all_partials: List[Dict], array_name: Optional[str] = None) -> Dict:
         """
         Combine partial results from all bridges.
 
-        Called on rank 0 only. Merges partials using associative operations.
-        For mean, computes sum/count → mean.
+        Called on rank 0 only. Each hint's pickled aggregator (the dask combine
+        callable) is invoked on the matching list of bridge partials. Some
+        dask reductions (e.g. ``mean``, ``std``) apply a post-step (e.g.
+        ``math.sqrt``); that is recorded in the hint and applied here.
 
-        - ``:param all_partials:`` List of partial result dicts from all bridges.
-        - ``:return:`` Combined precomputed values dict.
+        - ``:param all_partials:`` List of partial dicts, one per bridge,
+          matching the order in :attr:`Bridge._array_comms`.
+        - ``:param array_name:`` Optional array name to look up hints for.
+          If ``None``, iterates over all arrays' hints.
+        - ``:return:`` Combined precomputed values dict, keyed by output_key.
         """
-        combined = {}
+        combined: Dict[str, Any] = {}
 
-        for partials in all_partials:
-            for key, value in partials.items():
-                if key not in combined:
-                    combined[key] = []
-                combined[key].append(value)
+        if array_name is not None:
+            hint_iter = ((array_name, hint) for hint in self._task_hints.get(array_name, []))
+        else:
+            hint_iter = ((aname, hint) for aname, hint_list in self._task_hints.items() for hint in hint_list)
 
-        # Compute final values - need to handle mean specially
-        # First pass: identify mean partials and process them
-        final_combined = {}
-        keys_to_skip = set()
-        
-        for key, values in combined.items():
-            if key.endswith('-sum'):
-                base_key = key[:-4]
-                count_key = f"{base_key}-count"
-                if count_key in combined:
-                    total_sum = sum(values)
-                    total_count = sum(combined[count_key])
-                    final_combined[base_key] = total_sum / total_count if total_count > 0 else 0
-                    keys_to_skip.add(key)
-                    keys_to_skip.add(count_key)
+        for aname, hint in hint_iter:
+            output_key = hint["output_key"]
+            try:
+                agg_func = pickle.loads(hint["agg_pickle"])
+            except Exception as e:
+                logger.warning(f"could not unpickle aggregator for {aname}/{output_key}: {e}")
+                continue
 
-        # Second pass: add non-mean values
-        for key, values in combined.items():
-            if key not in keys_to_skip:
-                final_combined[key] = sum(values)
+            # Collect this hint's partials from each bridge in the right order.
+            # Each bridge's partials dict may not contain output_key if the
+            # chunk_func raised during precompute - skip in that case.
+            hint_partials = []
+            for partials in all_partials:
+                if output_key in partials:
+                    hint_partials.append(partials[output_key])
+            if not hint_partials:
+                continue
 
-        logger.debug(f"_combine_reduction_partials: final={final_combined}")
-        return final_combined
+            try:
+                result = agg_func(hint_partials)
+            except Exception as e:
+                logger.warning(f"aggregator failed for {aname}/{output_key}: {e}")
+                continue
+
+            if hint.get("finalize") == "sqrt":
+                import math
+
+                try:
+                    result = math.sqrt(float(result))
+                except (TypeError, ValueError) as e:
+                    logger.warning(f"sqrt finalize failed for {aname}/{output_key}: {e}")
+                    continue
+
+            combined[output_key] = result
+
+        logger.debug(f"_combine_reduction_partials: final={combined}")
+        return combined

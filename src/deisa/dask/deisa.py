@@ -36,7 +36,6 @@ import weakref
 from typing import Any, Callable, Collection, Dict, List, Literal, Set, Tuple, Union
 
 import numpy as np
-from dask.delayed import delayed
 from deisa.core import CallbackArgs, Window
 from deisa.core.interface import IDeisa
 from distributed import Client, Event, Future, Queue
@@ -123,6 +122,7 @@ class Deisa(IDeisa):
         exception_handler: IDeisa.ExceptionHandler = __default_exception_handler,
         when: Literal["AND", "OR"] = "AND",
         precompute: bool = False,
+        force: bool = False,
     ) -> Callable:
         """
         Registers a callback function with specific arguments, exception handling, and conditional execution criteria.
@@ -157,7 +157,14 @@ class Deisa(IDeisa):
         """
 
         def decorator(callback: IDeisa.Callback) -> IDeisa.Callback:
-            return self.register_callback(callback, *callback_args, exception_handler=exception_handler, when=when, precompute=precompute)
+            return self.register_callback(
+                callback,
+                *callback_args,
+                exception_handler=exception_handler,
+                when=when,
+                precompute=precompute,
+                force=force,
+            )
 
         return decorator
 
@@ -168,6 +175,7 @@ class Deisa(IDeisa):
         exception_handler: IDeisa.ExceptionHandler = __default_exception_handler,
         when: Literal["AND", "OR"] = "AND",
         precompute: bool = False,
+        force: bool = False,
     ) -> Callable:
         """
         Registers a callback function with specific arguments, exception handling, and conditional execution criteria.
@@ -210,7 +218,9 @@ class Deisa(IDeisa):
             else:
                 raise TypeError("callback_args must be str or tuple")
 
-        callback_id = self._register_callback_impl(callback, parsed, exception_handler=exception_handler, when=when, precompute=precompute)
+        callback_id = self._register_callback_impl(
+            callback, parsed, exception_handler=exception_handler, when=when, precompute=precompute, force=force
+        )
         callback.callback_id = callback_id
         return callback
 
@@ -221,6 +231,7 @@ class Deisa(IDeisa):
         exception_handler: IDeisa.ExceptionHandler,
         when: Literal["AND", "OR"],
         precompute: bool = False,
+        force: bool = False,
     ) -> Callback_id:
 
         if when not in ("AND", "OR"):
@@ -254,7 +265,7 @@ class Deisa(IDeisa):
 
             # Analyze callback for reducible operations and store hints (only if precompute=True)
             if precompute:
-                task_hints = self._analyze_callback_for_operations(callback, array_name)
+                task_hints = self._analyze_callback_for_operations(callback, array_name, force=force)
                 if task_hints:
                     self.handshake.set_task_hints(array_name, task_hints)
 
@@ -392,7 +403,7 @@ class Deisa(IDeisa):
                 )
 
                 # Attach precomputed values to dask array if available
-                precomputed = payload.get('precomputed')
+                precomputed = payload.get("precomputed")
                 if precomputed:
                     logger.debug(f"topic_handler: attaching precomputed={precomputed} to dask array")
                     darr.precomputed = precomputed
@@ -564,29 +575,51 @@ class Deisa(IDeisa):
         # Use da.block to combine blocks
         return da.block(nested)
 
-    def _analyze_callback_for_operations(self, callback: Callable, array_name: str) -> List[Dict]:
+    def _analyze_callback_for_operations(self, callback: Callable, array_name: str, force: bool = False) -> List[Dict]:
         """
-        Analyze callback for reduction operations by executing on dask array stub.
+        Analyze the callback's source to extract dask reduction hints.
 
-        Uses a real dask array stub to build the task graph, then extracts operations
-        from the graph. Works for both lazy callbacks (returning dask arrays) and void
-        callbacks (calling reductions and ignoring results).
+        The callback is NOT executed: the AST is parsed and walked symbolically
+        to find compute boundaries (.compute(), client.compute(), etc.) and
+        the dask arrays they reference. Each dask array's task graph is
+        inspected to find the reductions to precompute on the bridge.
 
         - ``:param callback:`` The callback function to analyze.
         - ``:param array_name:`` The array name this callback operates on.
+        - ``:param force:`` If True, log warnings instead of raising on
+             analysis errors. Defaults to False.
         - ``:return:`` List of operation hint dicts.
         """
-        hints = []
+        from deisa.dask.precompute_analyzer import (
+            PrecomputeError,
+            analyze_callback,
+        )
 
-        stub, extract_hints = make_tracked_deisa_stub(array_name)
+        # Build a dask array stub matching the registered array's shape/chunks
+        # so the symbolic AST walker has something concrete to operate on.
+        # The chunking does not matter for hint extraction -- we only read
+        # the task graph structure, not the data.
+        metadata = self.arrays_metadata.get(array_name, {})
+        global_shape = metadata.get("global_shape")
+        chunks = metadata.get("chunks")
+        if global_shape is not None and chunks is not None:
+            stub = da.zeros(global_shape, chunks=chunks, dtype=np.float64)
+        else:
+            stub = da.zeros((10, 10), chunks=(5, 5), dtype=np.float64)
 
         try:
-            result = callback(stub)
-            hints = extract_hints(result)
+            return analyze_callback(
+                callback,
+                registered_arrays={array_name: stub},
+                force=force,
+            )
+        except PrecomputeError:
+            # analyze_callback handles force=True internally; if we get here
+            # the caller passed force=False, so propagate.
+            raise
         except Exception as e:
             logger.debug(f"_analyze_callback_for_operations: Analysis failed: {e}")
-
-        return hints
+            return []
 
     def precompute_operations(self, array_name: str, operations: List[str], **kwargs) -> None:
         """
@@ -606,17 +639,33 @@ class Deisa(IDeisa):
         if array_name not in self.arrays_metadata:
             raise ValueError(f"unknown array name: {array_name}")
 
-        hints = []
+        # Build a real dask array matching the registered array's shape/chunks
+        # and apply each requested reduction on it. Then extract the hints
+        # from the resulting graphs. This is the same path the AST-based
+        # analyzer uses, so the two APIs are guaranteed to produce
+        # interchangeable hints.
+        meta = self.arrays_metadata[array_name]
+        global_shape = tuple(meta["global_shape"])
+        chunks = tuple(meta["chunk_shape"])
+        stub = da.zeros(global_shape, chunks=chunks, dtype=np.float64)
+
+        from deisa.dask.task_hints import extract_reduction_hints
+
+        hints: List[Dict[str, Any]] = []
         for op_name in operations:
-            if op_name not in {'sum', 'mean', 'std', 'var', 'max', 'min', 'prod'}:
+            if op_name not in {"sum", "mean", "std", "var", "max", "min", "prod"}:
                 raise ValueError(f"unsupported operation: {op_name}")
-            hints.append({
-                'func_module': 'numpy',
-                'func_name': op_name,
-                'keywords': kwargs.copy(),
-                'output_key': f"{array_name}-{op_name}",
-                'type': 'reduction'
-            })
+            try:
+                method = getattr(stub, op_name)
+                reduced = method(**kwargs)
+            except Exception as e:
+                raise ValueError(f"could not build reduction graph for {op_name!r}: {e}") from e
+            # The dummy ``array_name`` suffix is the same one extract_reduction_hints
+            # would use, so we just take the first hint (there is only one reduction).
+            for hint in extract_reduction_hints(reduced, array_name=array_name):
+                if hint.get("output_key", "").endswith(f"-{op_name}"):
+                    hints.append(hint)
+                    break
 
         if hints:
             self.handshake.set_task_hints(array_name, hints)
