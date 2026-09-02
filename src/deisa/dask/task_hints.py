@@ -374,12 +374,19 @@ def extract_reduction_hints(darr: da.Array, array_name: str = "f") -> List[Dict[
             continue
 
         output_key = f"{array_name}-{op_name}"
+        # Backwards-compatible alias for callers that index hints by
+        # ``keywords`` rather than ``chunk_kwargs``. Also unwrap single-
+        # element axis tuples (dask normalizes ``axis=0`` to ``axis=(0,)``).
+        chunk_kwargs = dict(chunk_kwargs) if chunk_kwargs else {}
+        if isinstance(chunk_kwargs.get("axis"), tuple) and len(chunk_kwargs["axis"]) == 1:
+            chunk_kwargs["axis"] = chunk_kwargs["axis"][0]
         hints.append(
             {
                 "output_key": output_key,
                 "op_name": op_name,
                 "chunk_func_pickle": chunk_func_pickle,
                 "chunk_kwargs": chunk_kwargs,
+                "keywords": chunk_kwargs,
                 "agg_pickle": agg_pickle,
                 "agg_dep_structures": agg_deps,
                 "agg_keys": chunk_keys,
