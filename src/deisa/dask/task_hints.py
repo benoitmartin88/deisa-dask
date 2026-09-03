@@ -81,6 +81,33 @@ _OP_FROM_FUNC_NAME = {
 # Operations supported by ``_combine_reduction_partials`` on the bridge side.
 SUPPORTED_OPS = {"sum", "mean", "std", "var", "max", "min", "prod"}
 
+# Reduction kind classification -- controls how the bridge scatters the
+# partial and how the Deisa-side combine graph is built.
+#
+# - ``"scalar"``: the chunk_func returns a plain scalar (or numpy array for
+#   axis reductions). Per-bridge partials are summed via dask's natural
+#   ``da.stack`` + ``.sum(axis=0)`` -- no custom agg logic needed.
+#
+# - ``"mean"``: the chunk_func returns ``{"n": ..., "total": ...}`` (per
+#   dask's ``mean_chunk``). Per-bridge dicts are scattered as single
+#   pickled blobs; the Deisa-side dask graph builds a custom delayed task
+#   that resolves the dicts and calls ``dask.array.reductions.mean_agg``
+#   over them.
+#
+# - ``"moment"``: the chunk_func returns ``{"n": ..., "total": ..., "M": ...}``
+#   (per dask's ``moment_chunk``). Same scatter-then-delayed-agg pattern
+#   as ``"mean"`` but calls ``moment_agg``; ``std`` differs from ``var``
+#   only in the trailing ``sqrt`` (``finalize`` is set accordingly).
+_REDUCTION_KIND = {
+    "sum": "scalar",
+    "prod": "scalar",
+    "max": "scalar",
+    "min": "scalar",
+    "mean": "mean",
+    "var": "moment",
+    "std": "moment",
+}
+
 
 # ---------------------------------------------------------------------------
 # Layer name helpers
@@ -384,6 +411,7 @@ def extract_reduction_hints(darr: da.Array, array_name: str = "f") -> List[Dict[
             {
                 "output_key": output_key,
                 "op_name": op_name,
+                "kind": _REDUCTION_KIND.get(op_name, "scalar"),
                 "chunk_func_pickle": chunk_func_pickle,
                 "chunk_kwargs": chunk_kwargs,
                 "keywords": chunk_kwargs,

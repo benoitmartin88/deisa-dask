@@ -34,7 +34,7 @@ import uuid
 import zlib
 from collections import defaultdict, deque
 from numbers import Number
-from typing import Any, Deque, Dict, Final, Iterator, List, Optional, Union
+from typing import Any, Deque, Dict, Final, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
 from deisa.core import IBridge, ICommunicator, validate_arrays_metadata
@@ -57,6 +57,26 @@ try:
     _UNDEFINED = MPI.UNDEFINED
 except ImportError:
     _UNDEFINED = 2147483647
+
+
+def _extract_chunk_axis_from_hint(hint: Optional[Dict]) -> Optional[Tuple[int, ...]]:
+    """Pull the chunk_func's reduction-axes tuple out of a task hint.
+
+    Dask stores the axes being reduced in ``chunk_kwargs['axis']`` (either
+    a single int for one axis, or a tuple for several). For our precompute
+    topic event we need to ship this to the Deisa side so the combine's
+    output shape and agg ``axis`` are computed correctly. Returns
+    ``None`` when the hint is missing or has no ``axis`` kwarg.
+    """
+    if hint is None:
+        return None
+    ck = hint.get("chunk_kwargs") or {}
+    ax = ck.get("axis")
+    if isinstance(ax, (list, tuple)):
+        return tuple(int(a) for a in ax)
+    if ax is not None:
+        return (int(ax),)
+    return None
 
 
 class Bridge(IBridge):
@@ -337,13 +357,13 @@ class Bridge(IBridge):
         # - Otherwise (no reductions detected): fall back to the legacy path
         #   and scatter the full chunk, preserving backward compatibility for
         #   callbacks that don't return lazy dask reductions.
-        precomputed_meta: Optional[Dict[str, Dict]] = None
+        precomputed_meta: Dict[str, Dict[str, Any]] = {}
         if partials:
             logger.debug(
                 f"[{self.id}] send() precompute-active: scattering {len(partials)} partials "
                 f"instead of full chunk shape={chunk.shape}"
             )
-            partial_res = self._scatter_partials(partials, array_name, chunk, workers=workers)
+            partial_res = self._scatter_partials(partials, task_hints, array_name, workers=workers)
             res = partial_res["future-info"]
             precomputed_meta = partial_res["precomputed"]
         else:
@@ -359,6 +379,7 @@ class Bridge(IBridge):
                 timestep,
                 precomputed=precomputed_meta,
                 precomputed_meta=precomputed_meta,
+                task_hints=task_hints,
             )
             return
 
@@ -403,21 +424,39 @@ class Bridge(IBridge):
             # partial's reduced shape and dtype. The Deisa side reconstructs the
             # dask graph from these small partials -- the full chunk never
             # reaches the workers.
+            hint_by_key = {h["output_key"]: h for h in task_hints}
             futures_payload: List[Dict[str, Any]]
             if all_partials_meta:
                 # Precompute path: emit one entry per (bridge, reduction).
+                # ``chunk_position`` here is the MPI coords of the bridge
+                # that contributed this partial, so the Deisa side can
+                # rebuild the nested list structure that ``mean_agg`` /
+                # ``moment_agg`` expect (matching the chunk-grid layout).
+                # ``chunk_axis`` is the chunk_func's reduction axes tuple
+                # (the chunk_kwargs ``axis``), used by the topic handler
+                # to compute the combine's output shape and pass the
+                # correct ``axis`` to ``mean_agg`` / ``moment_agg``.
                 futures_payload = []
                 for bridge_idx, partial_meta in enumerate(all_partials_meta):
                     for output_key, p_info in partial_meta.items():
+                        chunk_axis = None
+                        hint = hint_by_key.get(output_key)
+                        if hint is not None:
+                            ck = hint.get("chunk_kwargs") or {}
+                            ax = ck.get("axis")
+                            if isinstance(ax, (list, tuple)):
+                                chunk_axis = tuple(int(a) for a in ax)
+                            elif ax is not None:
+                                chunk_axis = (int(ax),)
                         futures_payload.append(
                             {
                                 "future": p_info["future"],
                                 "shape": p_info["shape"],
                                 "dtype": p_info["dtype"],
-                                "chunk_position": (
-                                    bridge_idx,
-                                    output_key,
-                                ),  # (bridge idx, reduction key)
+                                "kind": p_info.get("kind", "scalar"),
+                                "finalize": p_info.get("finalize"),
+                                "chunk_position": gathered_data[bridge_idx]["chunk_position"],
+                                "chunk_axis": chunk_axis,
                                 "output_key": output_key,
                             }
                         )
@@ -458,6 +497,7 @@ class Bridge(IBridge):
         timestep: int,
         precomputed: Optional[Dict] = None,
         precomputed_meta: Optional[Dict[str, Dict]] = None,
+        task_hints: Optional[List[Dict]] = None,
     ):
         """
         Handle single-bridge array send without collective.
@@ -493,12 +533,19 @@ class Bridge(IBridge):
         # partial (with its reduced shape); on the legacy path, emit one entry
         # pointing at the full chunk.
         if precomputed_meta:
+            # Look up hint for each output_key to recover the chunk's
+            # reduction axes tuple (used by the topic handler to compute
+            # the combine's output shape).
+            hint_by_key = {h["output_key"]: h for h in (task_hints or [])}
             futures_payload = [
                 {
                     "future": info["future"],
                     "shape": info["shape"],
                     "dtype": info["dtype"],
-                    "chunk_position": (0, output_key),  # single bridge: bridge_idx=0
+                    "kind": info.get("kind", "scalar"),
+                    "finalize": info.get("finalize"),
+                    "chunk_position": self.arrays_metadata[array_name]["chunk_position"],
+                    "chunk_axis": _extract_chunk_axis_from_hint(hint_by_key.get(output_key)),
                     "output_key": output_key,
                 }
                 for output_key, info in precomputed_meta.items()
@@ -656,30 +703,37 @@ class Bridge(IBridge):
     def _scatter_partials(
         self,
         partials: Dict[str, Any],
+        hints: List[Dict[str, Any]],
         array_name: str,
-        chunk: np.ndarray,
         workers: List[str],
     ) -> Dict[str, Any]:
         """
         Scatter precomputed reduction partials to a worker instead of the full chunk.
 
         Each partial value is the local result of running a dask reduction's
-        chunk-stage callable on the bridge's numpy chunk. The values are scalar
-        (or 1-d arrays) -- orders of magnitude smaller than the full chunk --
-        so shipping them in place of the chunk is what makes the optimization
-        pay off.
+        chunk-stage callable on the bridge's numpy chunk. Two flavors:
+
+        - ``"scalar"`` partials (sum/prod/max/min): plain scalars or numpy
+          arrays. Shipped as one future key per reduction.
+        - ``"mean"`` partials (mean): a ``{"n": x, "total": y}`` dict from
+          dask's ``mean_chunk``. Shipped as one future key whose value is
+          the whole dict; the Deisa-side combine resolves the dicts and
+          calls ``mean_agg`` over them.
+        - ``"moment"`` partials (var/std): a ``{"n": x, "total": y, "M": z}``
+          dict from dask's ``moment_chunk``. Same dict-blob handling as
+          mean, but the combine calls ``moment_agg`` (and sqrt for std).
 
         Returns a dict shaped like the legacy ``_better_scatter`` result
         (``{"future": [...], "who_has": {...}, "nbytes": {...}}``) plus a
-        ``precomputed`` entry mapping each ``output_key`` to its reduced
-        ``{shape, dtype, future}`` so the topic handler can reconstruct the
-        dask graph from these small blocks.
+        ``precomputed`` entry mapping each ``output_key`` to its scatter
+        metadata (``{future, kind, shape, dtype, finalize}``) so the topic
+        handler can reconstruct the right dask graph.
 
         - ``:param partials:`` Mapping of ``output_key`` -> partial value
             produced by :meth:`_execute_operations_on_chunk`.
+        - ``:param hints:`` Task hints the bridge used to compute the
+            partials; needed for per-reduction ``kind`` and ``finalize``.
         - ``:param array_name:`` Array name (used for key prefixing).
-        - ``:param chunk:`` The bridge's numpy chunk (unused here but kept in
-            the signature for symmetry with the legacy scatter call).
         - ``:param workers:`` Single-element list of worker names to scatter to.
         - ``:return:`` Dict with ``future-info`` (legacy-shape scatter result
             containing all partials' keys) and ``precomputed`` (per-partial
@@ -688,19 +742,39 @@ class Bridge(IBridge):
         assert len(workers) == 1, "_scatter_partials expects a single target worker"
         target_worker = workers[0]
 
-        # Build a serializable mapping: {dask_key: partial_value}.
-        # The keys are namespaced with the array name and a uuid to avoid
-        # collisions across iterations and across arrays.
+        # Index hints by output_key for fast lookup.
+        hint_by_key = {h["output_key"]: h for h in hints}
+
         payload: Dict[str, Any] = {}
         shape_dtype: Dict[str, Dict[str, Any]] = {}
         for output_key, value in partials.items():
+            kind = hint_by_key.get(output_key, {}).get("kind", "scalar")
+            finalize = hint_by_key.get(output_key, {}).get("finalize")
             key = f"{KEY_PREFIX}{array_name}-partial-{output_key}-{uuid.uuid4().hex}"
             payload[key] = value
-            arr = np.asarray(value)
+            # Determine shape/dtype of the reduction output for the topic handler.
+            # For dict partials (mean/moment), the dict is the partial; we
+            # pick ``total`` (or ``M`` if ``total`` is missing) as the
+            # representative since its shape matches the reduction output.
+            if isinstance(value, dict):
+                if "total" in value:
+                    rep = np.asarray(value["total"])
+                elif "M" in value:
+                    rep = np.asarray(value["M"])
+                else:
+                    rep = np.asarray(next(iter(value.values())))
+                red_shape = tuple(rep.shape)
+                red_dtype = str(rep.dtype)
+            else:
+                arr = np.asarray(value)
+                red_shape = tuple(arr.shape)
+                red_dtype = str(arr.dtype)
             shape_dtype[output_key] = {
                 "future": key,
-                "shape": tuple(arr.shape),
-                "dtype": str(arr.dtype),
+                "kind": kind,
+                "shape": red_shape,
+                "dtype": red_dtype,
+                "finalize": finalize,
             }
 
         # Serialize for scatter (handles numpy arrays in dict values).
@@ -718,7 +792,7 @@ class Bridge(IBridge):
         future_keys = list(payload.keys())
         return {
             "future-info": {
-                "future": future_keys,  # list, not single key
+                "future": future_keys,
                 "who_has": who_has,
                 "nbytes": nbytes,
             },
@@ -737,8 +811,16 @@ class Bridge(IBridge):
         Each hint is the output of :func:`deisa.dask.task_hints.extract_reduction_hints`
         and contains a pickled dask chunk callable plus the kwargs dask would
         pass it. The callable is unpickled here and invoked on the local numpy
-        chunk — dask itself is never asked to run the task, so the bridge
+        chunk -- dask itself is never asked to run the task, so the bridge
         can precompute the partial without scattering the full data.
+
+        For ``mean`` and ``moment`` partials (i.e. ``hint["kind"] in {"mean",
+        "moment"}``), the chunk callable is invoked with ``keepdims=True``
+        forced. Dask's ``mean_agg`` / ``moment_agg`` walk per-bridge dict
+        partials with ``_concatenate2``, which requires at least 1-D shapes
+        to concatenate along -- ``keepdims=True`` produces (1, ...) / (1, 1,
+        ...) shapes that satisfy this requirement. The output shape/dtype
+        recorded for the topic handler reflects the ``keepdims=True`` output.
 
         - ``:param array_name:`` The array name being processed.
         - ``:param chunk:`` The numpy ndarray data chunk.
@@ -748,9 +830,15 @@ class Bridge(IBridge):
         partials = {}
         for hint in hints:
             output_key = hint["output_key"]
+            kind = hint.get("kind", "scalar")
             try:
                 chunk_func = pickle.loads(hint["chunk_func_pickle"])
-                chunk_kwargs = hint.get("chunk_kwargs", {}) or {}
+                chunk_kwargs = dict(hint.get("chunk_kwargs", {}) or {})
+                # mean / moment need keepdims=True so the per-bridge dict
+                # values are at least 1-D (matching what dask's own graph
+                # produces when it runs the agg layer directly).
+                if kind in ("mean", "moment"):
+                    chunk_kwargs["keepdims"] = True
                 partial = chunk_func(chunk, **chunk_kwargs)
             except Exception as e:
                 logger.warning(f"[{self.id}] _execute_operations_on_chunk: could not execute {output_key}: {e}")
