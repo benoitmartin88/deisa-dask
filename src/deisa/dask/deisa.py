@@ -393,7 +393,14 @@ class Deisa(IDeisa):
         for array_name in array_names:
             self._callbacks_by_array.setdefault(array_name, set()).add(callback_id)
 
-            # Analyze callback for reducible operations and store hints (only if precompute=True)
+            # Analyze callback for reducible operations and store hints (only if precompute=True).
+            # Stage 2A in progress: the new BranchSpec-based analyzer is
+            # available in ``branch.py``; the registration path below
+            # still stores legacy hint dicts (the bridge side is not yet
+            # migrated to consume BranchSpec). Stage 2A refactor is
+            # incomplete -- the bridge will fail for precompute=True
+            # callbacks until the bridge is migrated to consume
+            # BranchSpec. See ``branch.py`` and the design doc.
             if precompute:
                 task_hints = self._analyze_callback_for_operations(callback, array_name, force=force)
                 if task_hints:
@@ -794,25 +801,29 @@ class Deisa(IDeisa):
         # Use da.block to combine blocks
         return da.block(nested)
 
-    def _analyze_callback_for_operations(self, callback: Callable, array_name: str, force: bool = False) -> List[Dict]:
+    def _analyze_callback_for_branches(self, callback: Callable, array_name: str, force: bool = False):
         """
-        Analyze the callback's source to extract dask reduction hints.
+        Analyze the callback's source and build a list of :class:`BranchSpec`
+        objects describing the chunk-local sub-expressions the bridge can
+        execute.
+
+        Stage 2A: a thin wrapper over :func:`analyze_callback` that
+        re-packages the raw hint dicts as BranchSpec objects. Stage 3 will
+        extend ``analyze_branch`` to fold multi-layer chains into a single
+        BranchSpec; this method's contract stays the same.
 
         The callback is NOT executed: the AST is parsed and walked symbolically
         to find compute boundaries (.compute(), client.compute(), etc.) and
-        the dask arrays they reference. Each dask array's task graph is
-        inspected to find the reductions to precompute on the bridge.
+        the dask arrays they reference.
 
         - ``:param callback:`` The callback function to analyze.
         - ``:param array_name:`` The array name this callback operates on.
         - ``:param force:`` If True, log warnings instead of raising on
              analysis errors. Defaults to False.
-        - ``:return:`` List of operation hint dicts.
+        - ``:return:`` List of BranchSpec objects (empty if analysis fails
+             or no reductions are detected).
         """
-        from deisa.dask.precompute_analyzer import (
-            PrecomputeError,
-            analyze_callback,
-        )
+        from deisa.dask.branch import analyze_branch
 
         # Build a dask array stub matching the registered array's shape/chunks
         # so the symbolic AST walker has something concrete to operate on.
@@ -827,18 +838,28 @@ class Deisa(IDeisa):
             stub = da.zeros((10, 10), chunks=(5, 5), dtype=np.float64)
 
         try:
-            return analyze_callback(
+            return analyze_branch(
                 callback,
                 registered_arrays={array_name: stub},
                 force=force,
             )
-        except PrecomputeError:
-            # analyze_callback handles force=True internally; if we get here
-            # the caller passed force=False, so propagate.
-            raise
         except Exception as e:
-            logger.debug(f"_analyze_callback_for_operations: Analysis failed: {e}")
+            logger.debug(f"_analyze_callback_for_branches: Analysis failed: {e}")
             return []
+
+    def _analyze_callback_for_operations(self, callback: Callable, array_name: str, force: bool = False) -> List[Dict]:
+        """
+        Backward-compat shim -- returns raw hint dicts for callers that
+        still want them (e.g. unit tests). Internally delegates to
+        :meth:`_analyze_callback_for_branches` and converts BranchSpec
+        objects back to legacy hint dicts. New code should call
+        ``_analyze_callback_for_branches`` directly and consume
+        ``BranchSpec`` instances.
+        """
+        from deisa.dask.branch import branch_to_hint
+
+        branches = self._analyze_callback_for_branches(callback, array_name, force=force)
+        return [branch_to_hint(b) for b in branches]
 
     def precompute_operations(self, array_name: str, operations: List[str], **kwargs) -> None:
         """
