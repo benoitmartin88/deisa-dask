@@ -664,9 +664,18 @@ class _BoundaryWalker:
             for v in node.values:
                 if isinstance(v, ast.Constant):
                     parts.append(v.value)
+                elif isinstance(v, ast.FormattedValue):
+                    # f-string interpolation like f"sum={arr.sum()}": the
+                    # embedded expression is evaluated but its dask-side
+                    # effects are not part of the analyzed data flow (the
+                    # user is logging, not feeding the result back into a
+                    # chain of reductions). Recurse into the value for type
+                    # completeness, but the result is a plain string
+                    # fragment that we discard.
+                    parts.append(str(self._eval(v.value, scope)))
                 else:
                     parts.append(self._eval(v, scope))
-            return "".join(str(p) for p in parts)
+            return "".join(parts)
         if isinstance(node, ast.Starred):
             return self._eval(node.value, scope)
         raise IncompatibleCallbackError(
