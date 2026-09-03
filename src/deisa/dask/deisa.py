@@ -29,11 +29,12 @@
 
 import asyncio
 import collections
+import itertools
 import logging
 import threading
 import time
 import weakref
-from typing import Any, Callable, Collection, Dict, List, Literal, Set, Tuple, Union
+from typing import Any, Callable, Collection, Dict, List, Literal, Optional, Set, Tuple, Union
 
 import numpy as np
 from deisa.core import CallbackArgs, Window
@@ -41,6 +42,8 @@ from deisa.core.interface import IDeisa
 from distributed import Client, Event, Future, Queue
 
 import dask.array as da
+from dask.array.reductions import mean_agg, moment_agg
+from dask.delayed import delayed
 from deisa.dask.constants import (
     CALLBACK_PREFIX,
     CLIENT_KEY,
@@ -53,6 +56,133 @@ from deisa.dask.handshake import Handshake
 from deisa.dask.utils import build_deisa_array, get_client
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Precompute combine -- dict-blob partials (mean / var / std)
+# ---------------------------------------------------------------------------
+def _nest_partial_dicts_by_grid(
+    partials: List[Dict[str, Any]],
+) -> Tuple[Any, Tuple[int, ...]]:
+    """Arrange per-bridge dict-blob partials into a nested list that mirrors
+    the MPI chunk grid, so that ``mean_agg`` / ``moment_agg`` (which walk the
+    nested list with ``_concatenate2``) can combine them.
+
+    ``partials`` is a list of dicts each carrying a ``chunk_position`` --
+    the bridge's MPI coords. Returns ``(nested_list, grid_shape)`` where
+    ``grid_shape`` is the MPI grid shape (``(N, M, ...)``) and
+    ``nested_list[i_0][i_1]...`` is the dict (or future-of-dict) at MPI
+    coords ``(i_0, i_1, ...)``.
+
+    For a 1-D MPI grid (e.g. ``(2,)`` or ``(4,)``) this returns a flat
+    list of length N. For higher-D grids the list is nested.
+    """
+    # Determine grid shape from the unique coords across all partials.
+    coords = [tuple(p["chunk_position"]) for p in partials]
+    if not coords:
+        raise ValueError("_nest_partial_dicts_by_grid: no partials provided")
+    ndim = len(coords[0])
+    # Validate uniform ndim
+    for c in coords:
+        if len(c) != ndim:
+            raise ValueError(f"_nest_partial_dicts_by_grid: partials have inconsistent coord dimensions: {coords}")
+    # Per-axis sizes
+    axis_sizes: Dict[int, set] = {ax: set() for ax in range(ndim)}
+    for c in coords:
+        for ax, v in enumerate(c):
+            axis_sizes[ax].add(v)
+    grid_shape = tuple(len(axis_sizes[ax]) for ax in range(ndim))
+    # Validate full grid is filled
+    expected = set(itertools.product(*(range(g) for g in grid_shape)))
+    actual = set(coords)
+    if actual != expected:
+        raise ValueError(
+            f"_nest_partial_dicts_by_grid: partials do not cover the full grid (expected {expected}, got {actual})"
+        )
+
+    # Build a map from coords -> dict (or future)
+    by_coord: Dict[Tuple[int, ...], int] = {c: i for i, c in enumerate(coords)}
+
+    def _build_nested(dims_remaining: Tuple[int, ...], prefix: Tuple[int, ...]) -> Any:
+        if not dims_remaining:
+            return partials[by_coord[prefix]]["future"]
+        head, *tail = dims_remaining
+        return [_build_nested(tuple(tail), prefix + (i,)) for i in range(head)]
+
+    nested = _build_nested(grid_shape, ())
+    return nested, grid_shape
+
+
+def _agg_axis_for_grid(grid_shape: Tuple[int, ...]) -> Tuple[int, ...]:
+    """Return the axis tuple that ``mean_agg`` / ``moment_agg`` expect for a
+    nested list shaped like ``grid_shape``.
+
+    ``_concatenate2`` walks one axis per level of nesting, so for a grid of
+    shape ``(N, M)`` the axis must be ``(0, 1)``; for shape ``(N,)`` it must
+    be ``(0,)``.
+    """
+    return tuple(range(len(grid_shape)))
+
+
+def _build_dict_blob_combine_array(
+    partials: List[Dict[str, Any]],
+    array_name: str,
+    kind: str,
+    finalize: Optional[str],
+    hint_axis: Optional[Tuple[int, ...]],
+    array_ndim: int,
+) -> Any:
+    """Build a single-block dask array that combines per-bridge dict-blob
+    partials via ``mean_agg`` or ``moment_agg``.
+
+    For each output_key (``sum``, ``mean``, ...) the bridge shipped a single
+    future whose value is a dict ``{n: ..., total: ...[, M: ...]}`` (per
+    dask's ``mean_chunk`` / ``moment_chunk``). The Deisa side has one such
+    future per bridge (per MPI rank). To combine them we:
+
+    1. Arrange the futures in a nested list matching the MPI grid.
+    2. Build a delayed task that, when run, resolves the futures, calls
+       ``mean_agg`` / ``moment_agg`` over the nested list, and applies
+       ``sqrt`` if ``finalize == "sqrt"`` (std).
+    3. Wrap that single delayed task as ``da.from_delayed`` so the
+       callback sees a normal dask array.
+
+    The output shape comes from the chunk's ``axis`` hint: removing the
+    reduced axes from the array's ndim gives the reduction output's
+    shape. For ``mean()`` on a 2-D array (``axis=(0, 1)``), the output is
+    scalar ``()``. For ``mean(axis=0)``, the output is 1-d ``(N,)``.
+    """
+    if not partials:
+        raise ValueError("_build_dict_blob_combine_array: no partials provided")
+    nested, grid_shape = _nest_partial_dicts_by_grid(partials)
+    out_dtype = partials[0]["dtype"]
+    # Compute the output shape from the reduced axes.
+    if hint_axis is None:
+        # Fallback: rely on the bridge-recorded shape (keepdims=True result).
+        out_shape = partials[0]["shape"]
+    else:
+        kept_axes = tuple(ax for ax in range(array_ndim) if ax not in hint_axis)
+        out_shape = tuple(partials[0]["shape"][ax] for ax in kept_axes)
+    agg_kind = kind  # "mean" or "moment"
+    # The agg's axis is the chunk's reduction axis. mean_agg / moment_agg
+    # walk the nested list with one axis per nesting level, and the chunk's
+    # reduction axis happens to be the same as the MPI-grid axis when each
+    # bridge owns exactly one chunk along the reduced axes (our precompute
+    # invariant). For higher-D reductions that span multiple bridge axes,
+    # ``hint_axis`` carries the full tuple.
+    agg_axis = hint_axis if hint_axis is not None else _agg_axis_for_grid(grid_shape)
+
+    @delayed
+    def _combine(pairs):
+        if agg_kind == "mean":
+            result = mean_agg(pairs, dtype=np.dtype(out_dtype), axis=agg_axis)
+        else:
+            result = moment_agg(pairs, order=2, ddof=0, dtype=np.dtype(out_dtype), axis=agg_axis)
+        if finalize == "sqrt":
+            result = np.sqrt(result)
+        return result
+
+    return da.from_delayed(_combine(nested), shape=out_shape, dtype=out_dtype)
 
 
 class Deisa(IDeisa):
@@ -400,32 +530,74 @@ class Deisa(IDeisa):
                 if precomputed:
                     # Precompute path: each ``futures`` entry is one
                     # (bridge, reduction) pair with the partial's reduced
-                    # shape/dtype. Group by ``output_key`` so per-bridge
-                    # partials for the same reduction stack together into a
-                    # single dask array of shape ``(num_bridges, *partial_shape)``.
-                    # The full chunk never reaches the workers; ``arr.sum()``
-                    # in the callback is satisfied by dask's natural reduction
-                    # over the stacked partials.
+                    # shape/dtype. Group by ``output_key`` and dispatch on
+                    # the partial ``kind``:
+                    #
+                    # - ``"scalar"`` (sum/prod/max/min): stack per-bridge
+                    #   partials along a new axis via ``da.stack``. The
+                    #   callback's reduction (e.g. ``arr.sum()``) sums the
+                    #   stacked partials via dask's natural graph.
+                    # - ``"mean"``: each bridge ships a ``{n, total}`` dict
+                    #   blob (per dask's ``mean_chunk``). Build a delayed
+                    #   task that resolves the per-bridge dicts and calls
+                    #   ``dask.array.reductions.mean_agg`` over them,
+                    #   arranged in a nested list that matches the MPI
+                    #   chunk grid. Return the combined value as a scalar
+                    #   (full reduction) or N-d array (axis reduction)
+                    #   dask array.
+                    # - ``"moment"``: same pattern, but using ``moment_agg``.
+                    #   For ``std`` (finalize="sqrt"), the combined result
+                    #   is sqrt-ed before being returned.
                     by_reduction: Dict[str, List[Any]] = {}
                     for f in futures:
                         by_reduction.setdefault(f["output_key"], []).append(f)
                     darr_chunks: List[Any] = []
                     for output_key, partial_futures in by_reduction.items():
-                        partials_sorted = sorted(partial_futures, key=lambda p: p["chunk_position"][0])
-                        partial_shape = partials_sorted[0]["shape"]
-                        partial_dtype = partials_sorted[0]["dtype"]
-                        blocks = [
-                            da.from_delayed(p["future"], shape=partial_shape, dtype=partial_dtype)
-                            for p in partials_sorted
-                        ]
-                        # If a single bridge contributed one partial, return the
-                        # scalar block directly (no stack needed). Otherwise
-                        # stack the per-bridge partials along a new leading axis
-                        # so the callback's reduction can sum/combine them.
-                        if len(blocks) == 1:
-                            darr_chunks.append(blocks[0])
+                        kind = partial_futures[0].get("kind", "scalar")
+                        finalize = partial_futures[0].get("finalize")
+                        partial_shape = partial_futures[0]["shape"]
+                        partial_dtype = partial_futures[0]["dtype"]
+                        if kind == "scalar":
+                            # Sum-able scalar/array partials. Stack along
+                            # a new axis so the callback's reduction
+                            # combines them via dask's natural graph.
+                            sorted_partials = sorted(
+                                partial_futures,
+                                key=lambda p: tuple(p["chunk_position"]),
+                            )
+                            blocks = [
+                                da.from_delayed(p["future"], shape=partial_shape, dtype=partial_dtype)
+                                for p in sorted_partials
+                            ]
+                            if len(blocks) == 1:
+                                darr_chunks.append(blocks[0])
+                            else:
+                                darr_chunks.append(da.stack(blocks))
+                        elif kind in ("mean", "moment"):
+                            # Dict-blob partials. Build a nested list of
+                            # per-bridge dict futures matching the MPI
+                            # chunk grid, then call mean_agg / moment_agg
+                            # in a single delayed task.
+                            # ``chunk_axis`` is shipped in the topic event;
+                            # it tells us the chunk_func's reduction axes so
+                            # the combine's output shape and agg axis are
+                            # computed correctly.
+                            hint_axis = partial_futures[0].get("chunk_axis")
+                            array_ndim = len(_weak_self.arrays_metadata[array_name]["global_shape"])
+                            darr_chunks.append(
+                                _build_dict_blob_combine_array(
+                                    partial_futures,
+                                    array_name=array_name,
+                                    kind=kind,
+                                    finalize=finalize,
+                                    hint_axis=hint_axis,
+                                    array_ndim=array_ndim,
+                                )
+                            )
                         else:
-                            darr_chunks.append(da.stack(blocks))
+                            logger.warning(
+                                f"topic_handler: unknown precompute kind {kind!r} for {output_key}, skipping"
+                            )
                     # For precompute, the dask array *is* the partials; there's
                     # no global tiling. The callback consumes these blocks via
                     # the registered callback (the callback gets the stacked

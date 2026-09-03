@@ -235,3 +235,175 @@ class TestPrecomputeMemory:
         assert len(callback_results) == 1
         # See note in test_precompute_worker_only_sees_partials about
         # why we do not call execute_callbacks() here.
+
+    def test_precompute_mean_worker_only_sees_partials(self, env_setup_2workers):
+        """Same as test_precompute_worker_only_sees_partials but for
+        ``arr.mean()``. Mean's chunk_func produces a ``{n, total}`` dict
+        blob; the bridge should scatter that dict per bridge and the
+        Deisa-side combine should call ``mean_agg`` over the per-bridge
+        dicts. Workers must NOT hold the full chunk.
+        """
+        client, cluster = env_setup_2workers
+        chunk_shape = (2048, 2048)
+        global_shape = (chunk_shape[0] * 2, chunk_shape[1])
+        array_name = "temperature"
+
+        sim = TestSimulation(
+            client,
+            mpi_parallelism=(2, 1),
+            arrays_metadata={
+                array_name: {
+                    "global_shape": global_shape,
+                    "chunk_shape": chunk_shape,
+                },
+            },
+            wait_for_go=False,
+        )
+
+        deisa = Deisa(wait_for_go=False)
+
+        callback_results: List[float] = []
+
+        @deisa.register(array_name, precompute=True)
+        def _cb(window: list[DeisaArray]) -> None:
+            arr = window[-1]
+            logging.warning(f"MEAN TEST: callback received dask array shape={arr.shape}")
+            callback_results.append(float(arr.mean().compute()))
+
+        time.sleep(0.5)
+
+        sim.generate_data(array_name, iteration=1, update_workers=True)
+
+        assert wait_for(lambda: len(callback_results) >= 1, timeout=30), "callback was not called within 30s"
+
+        after = _worker_bytes_per_key(client)
+        after_max_per_worker = _largest_key_per_worker(after)
+        logging.warning(f"MEAN TEST: per-worker max key nbytes: {after_max_per_worker}")
+
+        # The mean dict-blob per bridge is ~32 bytes (two float64 scalars in a
+        # (1,1) shape each = 16 bytes; plus Python dict overhead). Allow
+        # generous slack but still order-of-magnitude smaller than the chunk.
+        max_allowed = 64 * 1024  # 64 KB
+        for worker, max_nbytes in after_max_per_worker.items():
+            assert max_nbytes < max_allowed, (
+                f"Worker {worker} holds a key of {max_nbytes} bytes; "
+                f"expected only the small dict-blob (< {max_allowed} bytes). "
+                f"Full chunk appears to have landed on the worker. "
+                f"Keys: {after}"
+            )
+
+        # Verify the global mean is correct (within floating-point tolerance).
+        # generate_data fills the array with random values in [0, 1), so the
+        # callback's ``arr.compute()`` must equal the global mean (==
+        # sum(arr) / N) because per-bridge partials are combined via
+        # ``mean_agg`` over {n: count, total: sum} dicts. We can't pin a
+        # specific numeric value (data is random), but the callback must
+        # have returned one finite positive float in (0, 1).
+        assert np.isfinite(callback_results[0])
+        assert 0.0 < callback_results[0] < 1.0
+
+    def test_precompute_var_worker_only_sees_partials(self, env_setup_2workers):
+        """Var uses ``moment_chunk`` and ``moment_agg``. Per-bridge partials
+        are ``{n, total, M}`` dicts; the Deisa-side combine calls
+        ``moment_agg`` over them. Workers must NOT hold the full chunk.
+        """
+        client, cluster = env_setup_2workers
+        chunk_shape = (2048, 2048)
+        global_shape = (chunk_shape[0] * 2, chunk_shape[1])
+        array_name = "temperature"
+
+        sim = TestSimulation(
+            client,
+            mpi_parallelism=(2, 1),
+            arrays_metadata={
+                array_name: {
+                    "global_shape": global_shape,
+                    "chunk_shape": chunk_shape,
+                },
+            },
+            wait_for_go=False,
+        )
+
+        deisa = Deisa(wait_for_go=False)
+
+        callback_results: List[float] = []
+
+        @deisa.register(array_name, precompute=True)
+        def _cb(window: list[DeisaArray]) -> None:
+            arr = window[-1]
+            logging.warning(f"VAR TEST: callback received dask array shape={arr.shape}")
+            callback_results.append(float(arr.var().compute()))
+
+        time.sleep(0.5)
+        sim.generate_data(array_name, iteration=1, update_workers=True)
+
+        assert wait_for(lambda: len(callback_results) >= 1, timeout=30), "callback was not called within 30s"
+
+        after = _worker_bytes_per_key(client)
+        after_max_per_worker = _largest_key_per_worker(after)
+        logging.warning(f"VAR TEST: per-worker max key nbytes: {after_max_per_worker}")
+
+        max_allowed = 64 * 1024
+        for worker, max_nbytes in after_max_per_worker.items():
+            assert max_nbytes < max_allowed, (
+                f"Worker {worker} holds a key of {max_nbytes} bytes; "
+                f"expected only the small moment-blob (< {max_allowed} bytes). "
+                f"Keys: {after}"
+            )
+
+        assert len(callback_results) == 1
+        assert np.isfinite(callback_results[0])
+        assert callback_results[0] >= 0.0  # variance is non-negative
+
+    def test_precompute_std_worker_only_sees_partials(self, env_setup_2workers):
+        """Std = sqrt(var). The bridge ships a moment partial; the topic
+        handler calls ``moment_agg`` and applies ``np.sqrt`` (the
+        ``finalize == "sqrt"`` step). Workers must NOT hold the full chunk.
+        """
+        client, cluster = env_setup_2workers
+        chunk_shape = (2048, 2048)
+        global_shape = (chunk_shape[0] * 2, chunk_shape[1])
+        array_name = "temperature"
+
+        sim = TestSimulation(
+            client,
+            mpi_parallelism=(2, 1),
+            arrays_metadata={
+                array_name: {
+                    "global_shape": global_shape,
+                    "chunk_shape": chunk_shape,
+                },
+            },
+            wait_for_go=False,
+        )
+
+        deisa = Deisa(wait_for_go=False)
+
+        callback_results: List[float] = []
+
+        @deisa.register(array_name, precompute=True)
+        def _cb(window: list[DeisaArray]) -> None:
+            arr = window[-1]
+            logging.warning(f"STD TEST: callback received dask array shape={arr.shape}")
+            callback_results.append(float(arr.std().compute()))
+
+        time.sleep(0.5)
+        sim.generate_data(array_name, iteration=1, update_workers=True)
+
+        assert wait_for(lambda: len(callback_results) >= 1, timeout=30), "callback was not called within 30s"
+
+        after = _worker_bytes_per_key(client)
+        after_max_per_worker = _largest_key_per_worker(after)
+        logging.warning(f"STD TEST: per-worker max key nbytes: {after_max_per_worker}")
+
+        max_allowed = 64 * 1024
+        for worker, max_nbytes in after_max_per_worker.items():
+            assert max_nbytes < max_allowed, (
+                f"Worker {worker} holds a key of {max_nbytes} bytes; "
+                f"expected only the small moment-blob (< {max_allowed} bytes). "
+                f"Keys: {after}"
+            )
+
+        assert len(callback_results) == 1
+        assert np.isfinite(callback_results[0])
+        assert callback_results[0] >= 0.0  # std is non-negative
