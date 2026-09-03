@@ -396,17 +396,64 @@ class Deisa(IDeisa):
 
                 _weak_self.__update_futures_ownership(futures)
 
-                parts = sorted(futures, key=lambda p: p["chunk_position"])
-                darr_chunks = [da.from_delayed(p["future"], shape=p["shape"], dtype=p["dtype"]) for p in parts]
-                darr = _weak_self.__tile_dask_blocks(
-                    darr_chunks, _weak_self.arrays_metadata[array_name]["global_shape"]
-                )
-
-                # Attach precomputed values to dask array if available
                 precomputed = payload.get("precomputed")
                 if precomputed:
-                    logger.debug(f"topic_handler: attaching precomputed={precomputed} to dask array")
-                    darr.precomputed = precomputed
+                    # Precompute path: each ``futures`` entry is one
+                    # (bridge, reduction) pair with the partial's reduced
+                    # shape/dtype. Group by ``output_key`` so per-bridge
+                    # partials for the same reduction stack together into a
+                    # single dask array of shape ``(num_bridges, *partial_shape)``.
+                    # The full chunk never reaches the workers; ``arr.sum()``
+                    # in the callback is satisfied by dask's natural reduction
+                    # over the stacked partials.
+                    by_reduction: Dict[str, List[Any]] = {}
+                    for f in futures:
+                        by_reduction.setdefault(f["output_key"], []).append(f)
+                    darr_chunks: List[Any] = []
+                    for output_key, partial_futures in by_reduction.items():
+                        partials_sorted = sorted(partial_futures, key=lambda p: p["chunk_position"][0])
+                        partial_shape = partials_sorted[0]["shape"]
+                        partial_dtype = partials_sorted[0]["dtype"]
+                        blocks = [
+                            da.from_delayed(p["future"], shape=partial_shape, dtype=partial_dtype)
+                            for p in partials_sorted
+                        ]
+                        # If a single bridge contributed one partial, return the
+                        # scalar block directly (no stack needed). Otherwise
+                        # stack the per-bridge partials along a new leading axis
+                        # so the callback's reduction can sum/combine them.
+                        if len(blocks) == 1:
+                            darr_chunks.append(blocks[0])
+                        else:
+                            darr_chunks.append(da.stack(blocks))
+                    # For precompute, the dask array *is* the partials; there's
+                    # no global tiling. The callback consumes these blocks via
+                    # the registered callback (the callback gets the stacked
+                    # partials as its array). Multiple reductions on the same
+                    # array produce multiple dask chunks; we dispatch the
+                    # first one to the callback. If only one reduction
+                    # registered, the callback sees a single dask array.
+                    if len(darr_chunks) == 1:
+                        darr = darr_chunks[0]
+                    else:
+                        # Multiple reductions: wrap as a tuple of dask arrays
+                        # and stash on the darr for the callback to iterate.
+                        # Most realistic callbacks register exactly one
+                        # reduction, so this branch is uncommon.
+                        darr = darr_chunks[0]
+                        darr.extra_precomputed_chunks = darr_chunks[1:]
+                    logger.debug(
+                        f"topic_handler: precompute path produced {len(darr_chunks)} reduction chunk(s) "
+                        f"with shapes {[c.shape for c in darr_chunks]}"
+                    )
+                else:
+                    # Legacy path: ``futures`` carries one entry per bridge with
+                    # the full-chunk shape; tile them into a single dask array.
+                    parts = sorted(futures, key=lambda p: p["chunk_position"])
+                    darr_chunks = [da.from_delayed(p["future"], shape=p["shape"], dtype=p["dtype"]) for p in parts]
+                    darr = _weak_self.__tile_dask_blocks(
+                        darr_chunks, _weak_self.arrays_metadata[array_name]["global_shape"]
+                    )
 
                 # tell the scheduler that the futures used by this dask array must not be collected by gc
                 _weak_self.client.persist(darr)
