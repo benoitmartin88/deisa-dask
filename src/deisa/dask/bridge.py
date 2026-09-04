@@ -381,6 +381,7 @@ class Bridge(IBridge):
                 precomputed=precomputed_meta,
                 precomputed_meta=precomputed_meta,
                 task_hints=task_hints,
+                branches=task_hints,  # BranchSpec list; legacy hints also accepted
             )
             return
 
@@ -425,7 +426,17 @@ class Bridge(IBridge):
             # partial's reduced shape and dtype. The Deisa side reconstructs the
             # dask graph from these small partials -- the full chunk never
             # reaches the workers.
-            hint_by_key = {h["output_key"]: h for h in task_hints}
+            #
+            # Build a per-output_key chunk_axis lookup. BranchSpec
+            # objects carry ``chunk_axis`` directly; legacy hint dicts
+            # require going through ``_extract_chunk_axis_from_hint``.
+            chunk_axis_by_key: Dict[str, Optional[Tuple[int, ...]]] = {}
+            for b in task_hints:
+                if isinstance(b, BranchSpec):
+                    chunk_axis_by_key[b.output_key] = b.chunk_axis
+                else:
+                    # Legacy hint dict.
+                    chunk_axis_by_key[b["output_key"]] = _extract_chunk_axis_from_hint(b)
             futures_payload: List[Dict[str, Any]]
             if all_partials_meta:
                 # Precompute path: emit one entry per (bridge, reduction).
@@ -440,15 +451,7 @@ class Bridge(IBridge):
                 futures_payload = []
                 for bridge_idx, partial_meta in enumerate(all_partials_meta):
                     for output_key, p_info in partial_meta.items():
-                        chunk_axis = None
-                        hint = hint_by_key.get(output_key)
-                        if hint is not None:
-                            ck = hint.get("chunk_kwargs") or {}
-                            ax = ck.get("axis")
-                            if isinstance(ax, (list, tuple)):
-                                chunk_axis = tuple(int(a) for a in ax)
-                            elif ax is not None:
-                                chunk_axis = (int(ax),)
+                        chunk_axis = chunk_axis_by_key.get(output_key)
                         futures_payload.append(
                             {
                                 "future": p_info["future"],
@@ -499,6 +502,7 @@ class Bridge(IBridge):
         precomputed: Optional[Dict] = None,
         precomputed_meta: Optional[Dict[str, Dict]] = None,
         task_hints: Optional[List[Dict]] = None,
+        branches: Optional[List[Any]] = None,
     ):
         """
         Handle single-bridge array send without collective.
@@ -534,10 +538,23 @@ class Bridge(IBridge):
         # partial (with its reduced shape); on the legacy path, emit one entry
         # pointing at the full chunk.
         if precomputed_meta:
-            # Look up hint for each output_key to recover the chunk's
-            # reduction axes tuple (used by the topic handler to compute
-            # the combine's output shape).
-            hint_by_key = {h["output_key"]: h for h in (task_hints or [])}
+            # Build a per-output_key lookup for chunk_axis. Prefer
+            # BranchSpec objects (the new wire format) over legacy
+            # hint dicts; both expose ``output_key`` and a way to get
+            # the chunk axis. BranchSpec carries ``chunk_axis``
+            # directly; the legacy hint requires going through
+            # ``_extract_chunk_axis_from_hint``.
+            chunk_axis_by_key: Dict[str, Optional[Tuple[int, ...]]] = {}
+            if branches:
+                for b in branches:
+                    if isinstance(b, BranchSpec):
+                        chunk_axis_by_key[b.output_key] = b.chunk_axis
+                    else:
+                        # Legacy hint dict.
+                        chunk_axis_by_key[b["output_key"]] = _extract_chunk_axis_from_hint(b)
+            elif task_hints:
+                for h in task_hints:
+                    chunk_axis_by_key[h["output_key"]] = _extract_chunk_axis_from_hint(h)
             futures_payload = [
                 {
                     "future": info["future"],
@@ -546,7 +563,7 @@ class Bridge(IBridge):
                     "kind": info.get("kind", "scalar"),
                     "finalize": info.get("finalize"),
                     "chunk_position": self.arrays_metadata[array_name]["chunk_position"],
-                    "chunk_axis": _extract_chunk_axis_from_hint(hint_by_key.get(output_key)),
+                    "chunk_axis": chunk_axis_by_key.get(output_key),
                     "output_key": output_key,
                 }
                 for output_key, info in precomputed_meta.items()
@@ -704,14 +721,14 @@ class Bridge(IBridge):
     def _scatter_partials(
         self,
         partials: Dict[str, Any],
-        hints: List[Dict[str, Any]],
+        branches: List[Any],  # List[BranchSpec] or List[dict] (legacy hints)
         array_name: str,
         workers: List[str],
     ) -> Dict[str, Any]:
         """
         Scatter precomputed reduction partials to a worker instead of the full chunk.
 
-        Each partial value is the local result of running a dask reduction's
+        Each partial value is the local result of running the branch's
         chunk-stage callable on the bridge's numpy chunk. Two flavors:
 
         - ``"scalar"`` partials (sum/prod/max/min): plain scalars or numpy
@@ -732,8 +749,10 @@ class Bridge(IBridge):
 
         - ``:param partials:`` Mapping of ``output_key`` -> partial value
             produced by :meth:`_execute_operations_on_chunk`.
-        - ``:param hints:`` Task hints the bridge used to compute the
-            partials; needed for per-reduction ``kind`` and ``finalize``.
+        - ``:param branches:`` The :class:`BranchSpec` objects the
+            bridge used to compute the partials. Carry per-reduction
+            ``kind``/``finalize``/``partial_shape``/``partial_dtype``
+            metadata.
         - ``:param array_name:`` Array name (used for key prefixing).
         - ``:param workers:`` Single-element list of worker names to scatter to.
         - ``:return:`` Dict with ``future-info`` (legacy-shape scatter result
@@ -743,33 +762,92 @@ class Bridge(IBridge):
         assert len(workers) == 1, "_scatter_partials expects a single target worker"
         target_worker = workers[0]
 
-        # Index hints by output_key for fast lookup.
-        hint_by_key = {h["output_key"]: h for h in hints}
+        # Index branches by output_key for fast lookup. BranchSpec
+        # carries the per-reduction metadata directly, so the loop
+        # body doesn't need to inspect the partial value (legacy code
+        # did ``isinstance(value, dict)`` and then peek at ``total``/
+        # ``M`` -- the analyzer already recorded that in
+        # ``branch.partial_shape``/``branch.partial_dtype``).
+        #
+        # Backward-compat: ``branches`` may be a list of legacy hint
+        # dicts (from the pre-BranchSpec registration path). We
+        # dispatch on element type -- BranchSpec items get their
+        # fields used directly; dict items get a small dict-lookup
+        # shim that mirrors the legacy behaviour.
+        if branches and not isinstance(branches[0], BranchSpec):
+            # Convert each legacy hint dict to a duck-typed
+            # BranchSpec-like accessor. Avoids importing the dataclass
+            # machinery just for a couple of fields.
+            class _DictBranch:
+                __slots__ = ("output_key", "output_kind", "finalize", "partial_shape", "partial_dtype")
+
+                def __init__(self, h):
+                    self.output_key = h["output_key"]
+                    self.output_kind = h.get("kind", "scalar")
+                    self.finalize = h.get("finalize")
+                    # Legacy hints don't carry shape/dtype; leave as
+                    # None and let the loop fall back to value inspection.
+                    self.partial_shape = h.get("shape")
+                    self.partial_dtype = h.get("dtype")
+
+            branches = [_DictBranch(h) for h in branches]
+        branch_by_key = {b.output_key: b for b in branches}
 
         payload: Dict[str, Any] = {}
         shape_dtype: Dict[str, Dict[str, Any]] = {}
         for output_key, value in partials.items():
-            kind = hint_by_key.get(output_key, {}).get("kind", "scalar")
-            finalize = hint_by_key.get(output_key, {}).get("finalize")
+            branch = branch_by_key.get(output_key)
+            if branch is None:
+                # Backward-compat: legacy hint path produced dicts here.
+                # We don't have shape/dtype metadata, so inspect the
+                # value as the old code did.
+                if isinstance(value, dict):
+                    if "total" in value:
+                        rep = np.asarray(value["total"])
+                    elif "M" in value:
+                        rep = np.asarray(value["M"])
+                    else:
+                        rep = np.asarray(next(iter(value.values())))
+                    red_shape = tuple(rep.shape)
+                    red_dtype = str(rep.dtype)
+                    kind = "mean" if "total" in value else "moment"
+                else:
+                    arr = np.asarray(value)
+                    red_shape = tuple(arr.shape)
+                    red_dtype = str(arr.dtype)
+                    kind = "scalar"
+                finalize = None
+            else:
+                kind = branch.output_kind
+                finalize = branch.finalize
+                red_shape = branch.partial_shape
+                red_dtype = branch.partial_dtype
+                # Backward-compat: legacy hint dicts (and any future
+                # branch that didn't record shape/dtype at the
+                # analyzer side) have ``partial_shape`` and
+                # ``partial_dtype`` set to None. Fall back to
+                # inspecting the actual partial value -- the
+                # same heuristic the pre-BranchSpec code used.
+                if red_shape is None or red_dtype is None:
+                    if isinstance(value, dict):
+                        if "total" in value:
+                            rep = np.asarray(value["total"])
+                        elif "M" in value:
+                            rep = np.asarray(value["M"])
+                        else:
+                            rep = np.asarray(next(iter(value.values())))
+                        red_shape = tuple(rep.shape)
+                        red_dtype = str(rep.dtype)
+                        # ``kind`` may also be missing on legacy
+                        # hints; default to dict-shape.
+                        if branch.output_kind == "scalar":
+                            kind = "mean" if "total" in value else "moment"
+                    else:
+                        arr = np.asarray(value)
+                        red_shape = tuple(arr.shape)
+                        red_dtype = str(arr.dtype)
             key = f"{KEY_PREFIX}{array_name}-partial-{output_key}-{uuid.uuid4().hex}"
             payload[key] = value
-            # Determine shape/dtype of the reduction output for the topic handler.
-            # For dict partials (mean/moment), the dict is the partial; we
-            # pick ``total`` (or ``M`` if ``total`` is missing) as the
-            # representative since its shape matches the reduction output.
-            if isinstance(value, dict):
-                if "total" in value:
-                    rep = np.asarray(value["total"])
-                elif "M" in value:
-                    rep = np.asarray(value["M"])
-                else:
-                    rep = np.asarray(next(iter(value.values())))
-                red_shape = tuple(rep.shape)
-                red_dtype = str(rep.dtype)
-            else:
-                arr = np.asarray(value)
-                red_shape = tuple(arr.shape)
-                red_dtype = str(arr.dtype)
             shape_dtype[output_key] = {
                 "future": key,
                 "kind": kind,
