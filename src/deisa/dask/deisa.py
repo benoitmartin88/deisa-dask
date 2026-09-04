@@ -394,13 +394,15 @@ class Deisa(IDeisa):
             self._callbacks_by_array.setdefault(array_name, set()).add(callback_id)
 
             # Analyze callback for reducible operations and store hints (only if precompute=True).
-            # Stage 2A in progress: the new BranchSpec-based analyzer is
-            # available in ``branch.py``; the registration path below
-            # still stores legacy hint dicts (the bridge side is not yet
-            # migrated to consume BranchSpec). Stage 2A refactor is
-            # incomplete -- the bridge will fail for precompute=True
-            # callbacks until the bridge is migrated to consume
-            # BranchSpec. See ``branch.py`` and the design doc.
+            # Stage 2A: BranchSpec dataclass + analyze_branch helper exist in
+            # ``branch.py``; the registration path here still uses the legacy
+            # hint-dict format. The bridge is partially migrated:
+            # ``_execute_operations_on_chunk`` accepts both BranchSpec
+            # objects and legacy hint dicts. The remaining bridge methods
+            # (``_scatter_partials``, ``_direct_send``, multi-bridge
+            # ``send()``) still consume the legacy hint dict format and
+            # need to be migrated before BranchSpec can be the wire format.
+            # See branch.py and references/branch-level-precompute-design.md.
             if precompute:
                 task_hints = self._analyze_callback_for_operations(callback, array_name, force=force)
                 if task_hints:
@@ -850,16 +852,41 @@ class Deisa(IDeisa):
     def _analyze_callback_for_operations(self, callback: Callable, array_name: str, force: bool = False) -> List[Dict]:
         """
         Backward-compat shim -- returns raw hint dicts for callers that
-        still want them (e.g. unit tests). Internally delegates to
-        :meth:`_analyze_callback_for_branches` and converts BranchSpec
-        objects back to legacy hint dicts. New code should call
-        ``_analyze_callback_for_branches`` directly and consume
-        ``BranchSpec`` instances.
-        """
-        from deisa.dask.branch import branch_to_hint
+        still expect them (e.g. unit tests). Uses the legacy
+        :func:`analyze_callback` directly so the hint dict's
+        ``chunk_func_pickle`` is the raw ``functools.partial(chunk_func)``
+        -- not the wrapped branch_func from
+        :meth:`_analyze_callback_for_branches`. The bridge's
+        :meth:`_execute_operations_on_chunk` calls
+        ``chunk_func(chunk, **chunk_kwargs)`` and expects chunk_kwargs
+        to carry the full set of args (axis, dtype, keepdims, ...); the
+        wrapped branch_func already binds those, so re-feeding them via
+        chunk_kwargs would conflict.
 
-        branches = self._analyze_callback_for_branches(callback, array_name, force=force)
-        return [branch_to_hint(b) for b in branches]
+        New code should call :meth:`_analyze_callback_for_branches`
+        directly and consume :class:`BranchSpec` instances.
+        """
+        from deisa.dask.precompute_analyzer import analyze_callback
+
+        # Build a dask array stub matching the registered array's shape/chunks
+        # so the symbolic AST walker has something concrete to operate on.
+        metadata = self.arrays_metadata.get(array_name, {})
+        global_shape = metadata.get("global_shape")
+        chunks = metadata.get("chunks")
+        if global_shape is not None and chunks is not None:
+            stub = da.zeros(global_shape, chunks=chunks, dtype=np.float64)
+        else:
+            stub = da.zeros((10, 10), chunks=(5, 5), dtype=np.float64)
+
+        try:
+            return analyze_callback(
+                callback,
+                registered_arrays={array_name: stub},
+                force=force,
+            )
+        except Exception as e:
+            logger.debug(f"_analyze_callback_for_operations: Analysis failed: {e}")
+            return []
 
     def precompute_operations(self, array_name: str, operations: List[str], **kwargs) -> None:
         """
