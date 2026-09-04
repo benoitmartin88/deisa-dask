@@ -393,20 +393,19 @@ class Deisa(IDeisa):
         for array_name in array_names:
             self._callbacks_by_array.setdefault(array_name, set()).add(callback_id)
 
-            # Analyze callback for reducible operations and store hints (only if precompute=True).
-            # Stage 2A: BranchSpec dataclass + analyze_branch helper exist in
-            # ``branch.py``; the registration path here still uses the legacy
-            # hint-dict format. The bridge is partially migrated:
-            # ``_execute_operations_on_chunk`` accepts both BranchSpec
-            # objects and legacy hint dicts. The remaining bridge methods
-            # (``_scatter_partials``, ``_direct_send``, multi-bridge
-            # ``send()``) still consume the legacy hint dict format and
-            # need to be migrated before BranchSpec can be the wire format.
-            # See branch.py and references/branch-level-precompute-design.md.
+            # Analyze callback for chunk-local branches and store the
+            # resulting BranchSpec objects (only if precompute=True).
+            # Stage 2A: BranchSpec is the new wire format. The bridge's
+            # _execute_operations_on_chunk, _scatter_partials,
+            # _direct_send, and the multi-bridge send() path all
+            # consume BranchSpec directly. Legacy hint dicts are also
+            # accepted as a backward-compat shim -- this is the active
+            # path until the analyzer is fully migrated to emit
+            # BranchSpec directly.
             if precompute:
-                task_hints = self._analyze_callback_for_operations(callback, array_name, force=force)
-                if task_hints:
-                    self.handshake.set_task_hints(array_name, task_hints)
+                branches = self._analyze_callback_for_branches(callback, array_name, force=force)
+                if branches:
+                    self.handshake.set_task_hints(array_name, branches)
 
             # create handler only once per topic
             if array_name not in self._topic_handlers:
