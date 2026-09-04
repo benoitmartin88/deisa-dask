@@ -155,6 +155,36 @@ def _derive_combined_output_shape(
     return tuple(partial_shape[ax] for ax in kept_axes)
 
 
+def _branch_func_with_kwargs(chunk, _cf=None, _kw=None):
+    """Top-level branch callable: ``chunk_func(chunk, **chunk_kwargs)``.
+
+    Defined at module level so pickle can find it across processes.
+    The default-arg trick (``_cf=chunk_func``, ``_kw=chunk_kwargs``)
+    binds the closure cells at function-definition time, which pickle
+    serializes correctly.
+    """
+    if _cf is None or _kw is None:
+        # Defensive: a stray call with no closure should never happen
+        # (BranchSpec.branch_func is always built via the helper), but
+        # be loud rather than silent.
+        raise RuntimeError("_branch_func_with_kwargs called without bound chunk_func / chunk_kwargs")
+    return _cf(chunk, **_kw)
+
+
+def _make_branch_func(chunk_func: Callable, chunk_kwargs: Dict[str, Any]) -> Callable[[Any], Any]:
+    """Build a pickle-safe branch callable that closes over ``chunk_func``
+    and ``chunk_kwargs``.
+
+    Returns a :func:`_branch_func_with_kwargs` partial with the
+    chunk_func and chunk_kwargs bound via the default-arg trick.
+    Returns a ``functools.partial`` so pickle can find the closure
+    contents at unpickle time.
+    """
+    import functools as _functools
+
+    return _functools.partial(_branch_func_with_kwargs, _cf=chunk_func, _kw=chunk_kwargs)
+
+
 def build_branch_from_hint(
     hint: Dict[str, Any],
     chunk_func: Callable[[Any], Any],
@@ -208,6 +238,15 @@ def build_branch_from_hint(
     if kind in (_BRANCH_KIND_MEAN, _BRANCH_KIND_MOMENT):
         effective_kwargs["keepdims"] = True
 
+    # Wrap the raw chunk_func in a closure that binds the analyzer's
+    # chunk_kwargs (axis, keepdims, dtype, ...). The bridge calls
+    # ``branch.branch_func(chunk)`` with no extra kwargs; this closure
+    # carries them. Pickle-friendly: a function with a closure of two
+    # picklable objects (a functools.partial and a dict). Uses the
+    # top-level ``_make_branch_func`` helper so the closure is
+    # picklable across processes.
+    branch_func = _make_branch_func(chunk_func, effective_kwargs)
+
     if placeholder is None:
         # Fallback: best-effort shape from hint metadata. The hint's
         # ``shape`` field is not populated by the analyzer; only the
@@ -220,7 +259,7 @@ def build_branch_from_hint(
         partial_shape: Tuple[int, ...] = tuple(hint.get("shape") or ())
         partial_dtype = str(hint.get("dtype", "float64"))
     else:
-        sample = chunk_func(placeholder, **effective_kwargs)
+        sample = branch_func(placeholder)
         if isinstance(sample, dict):
             # mean / moment -- the per-bridge partial is a dict with
             # per-key shape. Pick ``total`` as the representative
@@ -245,7 +284,7 @@ def build_branch_from_hint(
         input_name=input_name,
         output_key=hint["output_key"],
         output_kind=kind,
-        branch_func=chunk_func,
+        branch_func=branch_func,
         chunk_axis=chunk_axis,
         finalize=finalize,
         partial_shape=partial_shape,

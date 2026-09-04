@@ -44,6 +44,7 @@ from distributed.utils_comm import scatter_to_workers
 from tlz import valmap
 
 from dask.tokenize import tokenize
+from deisa.dask.branch import BranchSpec
 from deisa.dask.constants import CLIENT_KEY, FEEDBACK_QUEUE_PREFIX, KEY_PREFIX, WAIT_FOR_EXECUTE_CB_EVENT
 from deisa.dask.handshake import Handshake
 from deisa.dask.utils import get_client
@@ -804,42 +805,53 @@ class Bridge(IBridge):
         _, who_has, nbytes = await scatter_to_workers([worker], data)
         return True, who_has, nbytes
 
-    def _execute_operations_on_chunk(self, array_name: str, chunk: np.ndarray, hints: List[Dict]) -> Dict:
+    def _execute_operations_on_chunk(
+        self, array_name: str, chunk: np.ndarray, branches: List["BranchSpec"]
+    ) -> Dict[str, Any]:
         """
-        Execute reduction operations locally on numpy chunk before scatter.
+        Execute branch chunk-stage callables locally on the bridge's
+        numpy chunk before scattering.
 
-        Each hint is the output of :func:`deisa.dask.task_hints.extract_reduction_hints`
-        and contains a pickled dask chunk callable plus the kwargs dask would
-        pass it. The callable is unpickled here and invoked on the local numpy
-        chunk -- dask itself is never asked to run the task, so the bridge
-        can precompute the partial without scattering the full data.
-
-        For ``mean`` and ``moment`` partials (i.e. ``hint["kind"] in {"mean",
-        "moment"}``), the chunk callable is invoked with ``keepdims=True``
-        forced. Dask's ``mean_agg`` / ``moment_agg`` walk per-bridge dict
-        partials with ``_concatenate2``, which requires at least 1-D shapes
-        to concatenate along -- ``keepdims=True`` produces (1, ...) / (1, 1,
-        ...) shapes that satisfy this requirement. The output shape/dtype
-        recorded for the topic handler reflects the ``keepdims=True`` output.
+        Each branch in ``branches`` is a :class:`BranchSpec` whose
+        ``branch_func`` is a pickle-able Python callable that takes a
+        numpy chunk and returns the per-bridge partial (a scalar,
+        ndarray, or dict for mean/moment). The closure inside
+        ``branch_func`` already binds the analyzer's chunk kwargs
+        (axis, keepdims, dtype, ...), so the call here is
+        ``branch_func(chunk)`` with no extra arguments.
 
         - ``:param array_name:`` The array name being processed.
         - ``:param chunk:`` The numpy ndarray data chunk.
-        - ``:param hints:`` List of operation hints from task graph analysis.
+        - ``:param branches:`` List of :class:`BranchSpec` from
+            ``analyze_branch``.
         - ``:return:`` Dict of partial results keyed by output_key.
         """
+        from deisa.dask.branch import BranchSpec
+
         partials = {}
-        for hint in hints:
-            output_key = hint["output_key"]
-            kind = hint.get("kind", "scalar")
+        for branch in branches:
+            if not isinstance(branch, BranchSpec):
+                # Backward compat: legacy hint dicts are still produced
+                # by ``_analyze_callback_for_operations``. Convert on
+                # the fly using the same kwargs logic the legacy path
+                # used.
+                output_key = branch["output_key"]
+                kind = branch.get("kind", "scalar")
+                try:
+                    chunk_func = pickle.loads(branch["chunk_func_pickle"])
+                    chunk_kwargs = dict(branch.get("chunk_kwargs", {}) or {})
+                    if kind in ("mean", "moment"):
+                        chunk_kwargs["keepdims"] = True
+                    partial = chunk_func(chunk, **chunk_kwargs)
+                except Exception as e:
+                    logger.warning(f"[{self.id}] _execute_operations_on_chunk: could not execute {output_key}: {e}")
+                    continue
+                partials[output_key] = partial
+                continue
+
+            output_key = branch.output_key
             try:
-                chunk_func = pickle.loads(hint["chunk_func_pickle"])
-                chunk_kwargs = dict(hint.get("chunk_kwargs", {}) or {})
-                # mean / moment need keepdims=True so the per-bridge dict
-                # values are at least 1-D (matching what dask's own graph
-                # produces when it runs the agg layer directly).
-                if kind in ("mean", "moment"):
-                    chunk_kwargs["keepdims"] = True
-                partial = chunk_func(chunk, **chunk_kwargs)
+                partial = branch.branch_func(chunk)
             except Exception as e:
                 logger.warning(f"[{self.id}] _execute_operations_on_chunk: could not execute {output_key}: {e}")
                 continue
