@@ -276,6 +276,14 @@ def _analyze_callback(
         # uniformly so the bridge gets stable output keys.
         try:
             new_hints = extract_reduction_hints(darr, primary_name)
+        except UnsupportedReductionError:
+            # Cross-reduction dependency detected -- this is the
+            # signal we MUST propagate to the caller. The precompute
+            # path cannot produce correct per-bridge partials for an
+            # expression whose reduction depends on another
+            # reduction's output. Force=False users get an error
+            # here; force=True users get it handled by analyze_branch.
+            raise
         except Exception as e:  # pragma: no cover - safety net
             logger.debug("extract_reduction_hints failed: %s", e)
             new_hints = []

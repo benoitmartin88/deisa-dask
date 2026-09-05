@@ -825,6 +825,7 @@ class Deisa(IDeisa):
              or no reductions are detected).
         """
         from deisa.dask.branch import analyze_branch
+        from deisa.dask.precompute_analyzer import PrecomputeError
 
         # Build a dask array stub matching the registered array's shape/chunks
         # so the symbolic AST walker has something concrete to operate on.
@@ -844,9 +845,18 @@ class Deisa(IDeisa):
                 registered_arrays={array_name: stub},
                 force=force,
             )
+        except PrecomputeError:
+            # Cross-reduction, opaque parameter, etc. -- propagate so
+            # the caller learns the analysis was unable to deliver a
+            # hint. force=True cases are handled inside analyze_branch
+            # (which logs warnings instead of raising), so by the time
+            # we get here force=False was set and we must propagate.
+            raise
         except Exception as e:
-            logger.debug(f"_analyze_callback_for_branches: Analysis failed: {e}")
-            return []
+            if force:
+                logger.warning(f"_analyze_callback_for_branches: Analysis failed: {e}")
+                return []
+            raise
 
     def _analyze_callback_for_operations(self, callback: Callable, array_name: str, force: bool = False) -> List[Dict]:
         """
