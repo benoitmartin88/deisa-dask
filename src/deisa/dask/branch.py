@@ -50,6 +50,7 @@ See ``references/branch-level-precompute-design.md`` for the full design.
 
 from __future__ import annotations
 
+import functools
 import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -355,10 +356,20 @@ def analyze_branch(
     """Walk the callback's dask graph and emit a :class:`BranchSpec` per
     branch.
 
-    Stage 2A implementation: thin wrapper over
-    :func:`deisa.dask.task_hints.extract_reduction_hints`. Each
-    detected reduction becomes a length-1 BranchSpec. Stage 3 will
-    extend this to fold multi-layer chains.
+    Stage 2B implementation: every reduction hint becomes one
+    :class:`BranchSpec`. For each hint, the chain walker (``_walk_chain``)
+    inspects the registered dask array's task graph and, if the
+    reduction's chunk-stage has a single-input upstream chain of
+    pointwise layers, **folds the chain into one branch** -- the
+    branch_func applies every chain layer to the chunk on the bridge
+    side and ships a single (small) partial instead of relying on dask
+    workers to re-run the chunk-stage pointwise chain.
+
+    Folding is opportunistic. If ``_walk_chain`` returns ``None`` for a
+    hint (cross-array upstream, scalar constant, non-Blockwise
+    upstream, etc.) the branch degrades to the length-1 path: just the
+    reduction's chunk_func. That's still a correct optimization -- the
+    chain walker only adds coverage, it never removes it.
 
     Parameters
     ----------
@@ -379,13 +390,59 @@ def analyze_branch(
         One BranchSpec per detected reduction. Empty list if the
         callback contains no chunk-local precomputable operations.
     """
-    # Stage 2A: defer to the existing reduction hint extractor. The hint
-    # dicts already carry kind/finalize/chunk_kwargs metadata that maps
-    # 1:1 onto BranchSpec fields. The bridge_func for each branch is
-    # the same callable the hint's chunk_func_pickle encodes.
     import pickle as _pickle
 
     hints = extract_reduction_hints_from_callback(callback, registered_arrays, force=force)
+    if not hints:
+        return []
+
+    # The chain walker needs the **AST walker's** dask_arrays -- the
+    # dask expressions the walker built during symbolic evaluation
+    # (e.g. ``(arr*arr).sum()``). The registered placeholders' graphs
+    # only contain the root ``zeros_like`` layer; the chain layer(s)
+    # are added when the walker composes the expression. Run the AST
+    # walker explicitly so we have both the hints AND the dask_arrays
+    # from the same walk.
+    walker_dask_arrays: List[Dict[str, Any]] = []
+    try:
+        walker_dask_arrays = extract_dask_arrays_from_callback(callback, registered_arrays, force=force)
+    except Exception:
+        if not force:
+            raise
+        # force=True: fall through with empty walker_dask_arrays; the
+        # length-1 fallback still works.
+
+    # Pick the registered-array name and ndim to attach to branches.
+    primary = next(iter(registered_arrays)) if registered_arrays else "f"
+    primary_arr: Optional[Any] = None
+    array_ndim = 0
+    try:
+        primary_arr = next(iter(registered_arrays.values()))
+        array_ndim = int(getattr(primary_arr, "ndim", 0))
+    except Exception:
+        pass
+    # The chain walker needs at least one dask expression to walk. The
+    # AST walker builds one dask_arrays entry per compute boundary;
+    # if there's nothing in the list, the registered placeholder is
+    # the only thing available, but its graph is the root layer (no
+    # chain). We fall back to the length-1 path in that case.
+    # We use the FIRST walker dask_array as the graph to walk; this
+    # matches the analyzer's behavior of treating the first compute
+    # boundary as the primary one.
+    dask_arr_for_chain: Optional[Any] = None
+    if walker_dask_arrays:
+        candidate = walker_dask_arrays[0].get("array")
+        if hasattr(candidate, "__dask_graph__"):
+            dask_arr_for_chain = candidate
+
+    # The chain walker folds multi-layer pointwise chains into one
+    # branch_func. We dedupe chains per-hint: a chain is unique by its
+    # (agg-layer-name, length). Multiple hints can share the same chain
+    # (e.g. ``(arr**2).sum()`` and ``(arr**2).max()``); the walker
+    # builds the same branch_func either way. ``_seen_chains`` keeps a
+    # memo to avoid rebuilding identical functools.partial objects.
+    _seen_chains: Dict[Tuple[str, int], Any] = {}
+
     branches: List[BranchSpec] = []
     for hint in hints:
         try:
@@ -395,53 +452,368 @@ def analyze_branch(
                 logger.warning("analyze_branch: unpickle failed for %s: %s", hint.get("output_key"), e)
                 continue
             raise
-        # ``input_name`` for a length-1 branch is the first registered
-        # array (the analyzer's primary_name). Today every detected
-        # reduction is rooted at one array; the helper exposes the
-        # same assumption.
-        primary = next(iter(registered_arrays)) if registered_arrays else "f"
-        # ``array_ndim`` is the ndim of the first registered array's
-        # placeholder. The analyzer uses this to compute the combined
-        # output shape (see ``_derive_combined_output_shape``).
-        primary_arr: Optional[Any] = None
-        try:
-            primary_arr = next(iter(registered_arrays.values()))
-            array_ndim = int(getattr(primary_arr, "ndim", 0))
-        except Exception:
-            array_ndim = 0
-        # ``placeholder`` is the dask array passed as the first
-        # registered array. We use it to discover the partial's shape
-        # by running chunk_func on it (structural inspection; the
-        # chunk_func is a numpy op, no callback side effects).
+
+        # Discover the partial's shape and dtype by running the
+        # branch_func on a numpy placeholder. The placeholder is the
+        # dask array's first chunk, materialized via .compute() so the
+        # numpy ops return numpy values (chunk_funcs are numpy ops,
+        # not callback code).
         placeholder = primary_arr
-        # The chunk_func expects a numpy chunk, not a dask array.
-        # Materialize a numpy placeholder so the chunk_func produces the
-        # per-bridge partial shape (with ``keepdims=True`` semantics
-        # intact). Calling chunk_func on the raw dask placeholder
-        # would produce a dask-shaped result whose ``shape`` is the
-        # agg output, not the chunk-stage partial.
         if hasattr(placeholder, "compute"):
             try:
                 placeholder = placeholder.compute()
             except Exception:
-                # Best-effort fallback -- chunk_func may still produce
-                # something usable on the dask array.
                 pass
-        try:
-            branch = build_branch_from_hint(
+
+        branch = _try_chain_branch(
+            hint=hint,
+            chunk_func=chunk_func,
+            primary=primary,
+            array_ndim=array_ndim,
+            placeholder=placeholder,
+            dask_arr_for_chain=dask_arr_for_chain,
+            seen_chains=_seen_chains,
+        )
+        if branch is None:
+            # Chain walker refused; fall back to the length-1 path.
+            branch = _try_length1_branch(
                 hint=hint,
                 chunk_func=chunk_func,
-                input_name=primary,
+                primary=primary,
                 array_ndim=array_ndim,
                 placeholder=placeholder,
             )
-        except Exception as e:
+        if branch is None:
             if force:
-                logger.warning("analyze_branch: build failed for %s: %s", hint.get("output_key"), e)
+                logger.warning("analyze_branch: build failed for %s", hint.get("output_key"))
                 continue
-            raise
+            # Both paths returned None -- this shouldn't happen for
+            # hints that came out of the analyzer (the length-1 path is
+            # supposed to always succeed). Raise defensively.
+            raise RuntimeError(f"analyze_branch: cannot build branch for hint {hint.get('output_key')!r}")
         branches.append(branch)
     return branches
+
+
+def _try_chain_branch(
+    hint: Dict[str, Any],
+    chunk_func: Callable,
+    primary: str,
+    array_ndim: int,
+    placeholder: Optional[Any],
+    dask_arr_for_chain: Optional[Any],
+    seen_chains: Dict[Tuple[str, int], Any],
+) -> Optional[BranchSpec]:
+    """Try to fold the hint's reduction into a chain-folded BranchSpec.
+
+    Returns ``None`` if the registered array has no dask graph (no
+    chain to walk) or if ``_walk_chain`` refuses to fold (cross-array,
+    constant, etc.). The caller falls back to the length-1 path on
+    ``None``.
+    """
+    if dask_arr_for_chain is None:
+        return None
+    graph = dask_arr_for_chain.__dask_graph__()
+    # Find the aggregate layer name from the hint's chunk_kwargs.
+    # ``extract_reduction_hints`` stores the agg-layer name implicitly
+    # via the chunk_func's identity; for chain walking we need the
+    # explicit aggregate layer name. Walk the graph looking for any
+    # aggregate layer reachable from the primary array.
+    agg_name = _find_primary_aggregate(graph)
+    if agg_name is None:
+        return None
+    chain = _walk_chain(graph, agg_name)
+    if chain is None:
+        return None
+    # The walker returns layers from root-to-chunk-stage. The chain
+    # already covers the pointwise steps; the reduction's chunk_func
+    # IS the last step. We build a single branch_func via
+    # ``_build_chain_branch_func``. If a memoized branch exists for
+    # this chain, reuse it.
+    chain_key = (agg_name, len(chain))
+    chain_branch_func = seen_chains.get(chain_key)
+    if chain_branch_func is None:
+        chain_branch_func = _build_chain_branch_func(chain)
+        seen_chains[chain_key] = chain_branch_func
+    try:
+        return _build_chain_branch(
+            hint=hint,
+            chain=chain,
+            input_name=primary,
+            array_ndim=array_ndim,
+            placeholder=placeholder,
+            chain_branch_func=chain_branch_func,
+        )
+    except Exception:
+        return None
+
+
+def _try_length1_branch(
+    hint: Dict[str, Any],
+    chunk_func: Callable,
+    primary: str,
+    array_ndim: int,
+    placeholder: Optional[Any],
+) -> Optional[BranchSpec]:
+    """Build a length-1 BranchSpec from a per-reduction hint.
+
+    The branch_func is the hint's chunk_func wrapped in a
+    pickle-friendly closure (``_make_branch_func``) that binds the
+    chunk_kwargs (axis, keepdims, dtype, ...). The bridge calls this
+    branch_func with just the chunk and no extra kwargs.
+    """
+    try:
+        return build_branch_from_hint(
+            hint=hint,
+            chunk_func=chunk_func,
+            input_name=primary,
+            array_ndim=array_ndim,
+            placeholder=placeholder,
+        )
+    except Exception:
+        return None
+
+
+def _find_primary_aggregate(graph) -> Optional[str]:
+    """Return the first ``-aggregate-`` layer name in the graph.
+
+    Today every detected reduction is rooted at one array; the
+    analyzer emits hints per-array-info. The chain walker only needs
+    ONE aggregate layer per branch to start walking back from -- and
+    when a callback has multiple independent reductions (e.g.
+    ``energy = (arr**2).sum(); drift = arr.mean(axis=0)``), the
+    walker will refuse chains it can't fold and the caller falls back
+    to the length-1 path for the rest.
+    """
+    for layer_name in graph.layers:
+        if "-aggregate-" in layer_name:
+            return layer_name
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Chain-folding (Stage 2B)
+# ---------------------------------------------------------------------------
+def _walk_chain(graph, agg_name: str) -> Optional[List[Tuple[Callable, dict, int]]]:
+    """Walk from a chunk-stage layer back to the placeholder root.
+
+    Returns a list of ``(func, kwargs, input_count)`` triples in
+    root-to-chunk-stage order, or ``None`` if the chain can't be folded
+    (cross-array, scalar constants, non-Blockwise upstream, etc.).
+
+    The returned chain is built entirely from the dask task graph;
+    no task is ever executed. ``input_count`` records how many upstream
+    references the layer has -- 1 for a normal single-input pointwise
+    op, 2 for a self-referential op like ``arr * arr``.
+    """
+    if "-aggregate-" not in agg_name:
+        return None
+    chunk_layer_name = _find_chunk_layer(graph, agg_name.split("-aggregate-", 1)[0])
+    if chunk_layer_name is None:
+        return None
+    chain: List[Tuple[Callable, dict, int]] = []
+    current = chunk_layer_name
+    seen = set()
+    while current is not None and current not in seen:
+        seen.add(current)
+        layer = graph.layers[current]
+        if "-aggregate-" in current:
+            break
+        func, kwargs = _extract_layer_func(layer)
+        if func is None:
+            break
+        upstream = _find_single_upstream(layer)
+        if upstream is None:
+            return None
+        upstream_name, upstream_input_count = upstream
+        # If the upstream isn't a layer in the graph, we've hit the
+        # root (placeholder DataNode). The branch_func receives the
+        # actual chunk from the bridge, so we don't fold the root.
+        if upstream_name not in graph.layers:
+            break
+        chain.append((func, kwargs, upstream_input_count))
+        current = upstream_name
+    chain.reverse()
+    return chain
+
+
+def _find_chunk_layer(graph, agg_base: str) -> Optional[str]:
+    """Find the chunk-stage layer whose name matches ``agg_base``.
+
+    The existing ``extract_reduction_hints`` has a richer version of
+    this that also handles ``-`` suffix variants; for chain folding we
+    only need the exact-base match.
+    """
+    for layer_name in graph.layers:
+        if "-aggregate-" in layer_name:
+            continue
+        layer_base = layer_name.rsplit("-", 1)[0] if "-" in layer_name else layer_name
+        if layer_base == agg_base:
+            return layer_name
+    return None
+
+
+def _extract_layer_func(layer) -> Tuple[Optional[Callable], dict]:
+    """Pull the first task's ``func`` and ``kwargs`` out of a Blockwise
+    layer. Returns ``(None, {})`` if the layer has no task-shaped values.
+    """
+    for value in layer.values():
+        if hasattr(value, "func") and callable(value.func):
+            kwargs = dict(value.kwargs) if value.kwargs else {}
+            return value.func, kwargs
+    return None, {}
+
+
+def _find_single_upstream(layer) -> Optional[Tuple[str, int]]:
+    """Return ``(upstream_layer_name, array_input_count)`` if the
+    layer reads from a single upstream Blockwise (one or more times --
+    e.g. ``arr * arr`` reads from ``arr`` twice and is still
+    chunk-local). Returns ``None`` if the layer reads from multiple
+    distinct array upstreams (cross-array, can't fold) or contains
+    scalar constants (deferred to a later commit).
+    """
+    if not hasattr(layer, "indices") or not layer.indices:
+        return None
+    in_keys = list(layer.indices)
+    if len(in_keys) == 0:
+        return None
+    upstream_names = set()
+    array_input_count = 0
+    has_non_array_input = False
+    for in_key in in_keys:
+        # An ``in_key`` is an "array input" only if it has a string
+        # first element (dask layer names are strings; constants
+        # like ``(2, None)`` have a non-string first element).
+        if isinstance(in_key, (list, tuple)) and len(in_key) >= 1 and isinstance(in_key[0], str):
+            upstream_names.add(in_key[0])
+            array_input_count += 1
+        else:
+            # Scalar constant or other non-array input.
+            has_non_array_input = True
+    if not upstream_names or len(upstream_names) > 1:
+        return None
+    if has_non_array_input:
+        # Stage 2B: refuse to fold chains with constants. The
+        # constant would need to be embedded into the branch_func
+        # call (e.g. ``add(chunk, 1)``) which requires extracting the
+        # constant value from the Blockwise task's args. Defer to a
+        # later commit.
+        return None
+    return (next(iter(upstream_names)), array_input_count)
+
+
+def _build_chain_branch_func(chain: List[Tuple[Callable, dict, int]]) -> Callable[[Any], Any]:
+    """Compose a list of ``(func, kwargs, input_count)`` into a single
+    branch_func(chunk). Layers reading from a single upstream twice
+    (e.g. ``arr * arr``) get the chunk passed twice.
+
+    Returns a module-level callable (``_chain_branch_func``) bound to
+    the chain tuple via :func:`functools.partial`. The closure is on a
+    top-level function so pickle can find it across processes. Building
+    a fresh ``def branch_func(chunk, _chain=...)`` inside this helper
+    would produce an unpicklable local function (AttributeError: Can't
+    get local object). The ``functools.partial`` + module-level target
+    recipe is the only shape that pickles cleanly.
+    """
+    chain_tuple = tuple(chain)
+    return functools.partial(_chain_branch_func, _chain=chain_tuple)
+
+
+def _chain_branch_func(chunk, _chain=None):
+    """Module-level branch callable: apply each (func, kwargs, input_count)
+    in the chain to the chunk, threading the result through.
+
+    Pair with :func:`_build_chain_branch_func` which binds ``_chain``
+    via :func:`functools.partial`. Defined at module level so pickle
+    can find it across the bridge process boundary.
+    """
+    if _chain is None:
+        raise RuntimeError("_chain_branch_func called without bound _chain")
+    x = chunk
+    for func, kwargs, input_count in _chain:
+        if input_count == 1:
+            x = func(x, **kwargs)
+        elif input_count == 2:
+            x = func(x, x, **kwargs)
+        else:
+            # For now refuse; can be extended for N-ary pointwise.
+            raise ValueError(f"chain has layer with {input_count} inputs; only 1 or 2 supported")
+    return x
+
+
+def _build_chain_branch(
+    hint: Dict[str, Any],
+    chain: List[Tuple[Callable, dict, int]],
+    input_name: str,
+    array_ndim: int,
+    placeholder: Optional[Any] = None,
+    chain_branch_func: Optional[Callable] = None,
+) -> BranchSpec:
+    """Build a chain-folded :class:`BranchSpec` from a hint and a
+    layer chain.
+
+    The chain's ``branch_func`` is the composition of the layer
+    funcs (root-to-chunk-stage). The hint provides the reduction's
+    ``kind``/``finalize``/``chunk_axis`` metadata; ``keepdims=True``
+    is forced for mean/moment (same as the length-1 path).
+
+    If ``chain_branch_func`` is provided (the memoized version), use
+    it directly instead of rebuilding. Otherwise build a fresh
+    callable from ``chain``.
+    """
+    kind = hint.get("kind", _BRANCH_KIND_SCALAR)
+    finalize = hint.get("finalize")
+
+    ck = hint.get("chunk_kwargs") or {}
+    ax = ck.get("axis")
+    if isinstance(ax, (list, tuple)):
+        chunk_axis = tuple(int(a) for a in ax)
+    elif ax is not None:
+        chunk_axis = (int(ax),)
+    else:
+        chunk_axis = None
+
+    effective_kwargs = dict(ck)
+    if kind in (_BRANCH_KIND_MEAN, _BRANCH_KIND_MOMENT):
+        effective_kwargs["keepdims"] = True
+
+    if chain_branch_func is None:
+        chain_branch_func = _build_chain_branch_func(chain)
+
+    if placeholder is None:
+        partial_shape: Tuple[int, ...] = tuple(hint.get("shape") or ())
+        partial_dtype = str(hint.get("dtype", "float64"))
+    else:
+        sample = chain_branch_func(placeholder)
+        if isinstance(sample, dict):
+            if "total" in sample:
+                rep = np.asarray(sample["total"])
+            elif "M" in sample:
+                rep = np.asarray(sample["M"])
+            else:
+                rep = np.asarray(next(iter(sample.values())))
+            partial_shape = tuple(rep.shape)
+            partial_dtype = str(rep.dtype)
+        else:
+            arr = np.asarray(sample)
+            partial_shape = tuple(arr.shape)
+            partial_dtype = str(arr.dtype)
+
+    output_shape = _derive_combined_output_shape(chunk_axis, array_ndim, partial_shape)
+    output_dtype = partial_dtype
+
+    return BranchSpec(
+        input_name=input_name,
+        output_key=hint["output_key"],
+        output_kind=kind,
+        branch_func=chain_branch_func,
+        chunk_axis=chunk_axis,
+        finalize=finalize,
+        partial_shape=partial_shape,
+        partial_dtype=partial_dtype,
+        output_shape=output_shape,
+        output_dtype=output_dtype,
+    )
 
 
 def extract_reduction_hints_from_callback(
@@ -469,3 +841,29 @@ def extract_reduction_hints_from_callback(
             return []
         raise
     return hints
+
+
+def extract_dask_arrays_from_callback(
+    callback: Callable,
+    registered_arrays: Dict[str, Any],
+    force: bool = False,
+) -> List[Dict[str, Any]]:
+    """Return the AST walker's dask_arrays list for a callback.
+
+    Each entry is ``{"array": darr, "kind": ..., "lineno": ...}`` where
+    ``darr`` is the dask expression the walker built at a compute
+    boundary (e.g. ``(arr*arr).sum()``). The chain walker in
+    :func:`_walk_chain` needs these expressions' graphs (not the
+    registered placeholders' graphs) because the placeholders only
+    have the root layer, not the chain.
+    """
+    from deisa.dask.precompute_analyzer import analyze_callback_with_dask_arrays
+
+    try:
+        _hints, dask_arrays = analyze_callback_with_dask_arrays(callback, registered_arrays, force=force)
+    except Exception:
+        if force:
+            logger.warning("analyze_branch: AST walk failed; force=True, returning empty dask_arrays")
+            return []
+        raise
+    return dask_arrays
