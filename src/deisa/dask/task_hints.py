@@ -317,6 +317,101 @@ def _serialize_func(func: Any) -> bytes:
     return pickle.dumps(func)
 
 
+def _chunk_inputs_reach_other_aggregate(graph, chunk_layer_name: str) -> set:
+    """Walk back from ``chunk_layer_name`` through the graph's
+    Blockwise layers and return the names of any aggregate layers
+    (``-aggregate-`` in name) reachable from the chunk-stage's inputs.
+
+    For a chain like ``(arr - arr.mean()).sum()``:
+    - The outer ``sum`` aggregate's chunk-stage reads from a
+      ``subtract`` Blockwise
+    - That ``subtract`` Blockwise reads from ``arr`` AND from a
+      ``mean-aggregate-...`` layer (the inner reduction's output)
+    - So walking back from the outer chunk-stage reaches an aggregate
+      layer.
+
+    When this happens, computing the outer reduction locally on a
+    bridge would silently produce wrong results: the bridge doesn't
+    have the global mean, only its chunk's mean. The expression
+    requires data from **all bridges**, so we must refuse to
+    precompute it -- the legacy path (scatter full chunk, let dask
+    workers compute the expression correctly) is the only safe
+    behavior.
+
+    Returns the set of aggregate-layer names reached (empty set if
+    none). Callers should refuse the entire dask expression when the
+    set is non-empty.
+    """
+    reachable_aggregates: set = set()
+    visited: set = set()
+    queue: set = {chunk_layer_name}
+    while queue:
+        current = queue.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+        if current not in graph.layers:
+            # Upstream root -- not a layer in this graph (typically the
+            # registered placeholder). Stop here.
+            continue
+        if "-aggregate-" in current:
+            reachable_aggregates.add(current)
+            # Don't keep walking past an aggregate -- its output is
+            # already a fully-reduced value (e.g. the inner mean's
+            # output is a scalar per chunk, computed in its own
+            # aggregate layer). Reaching ANY aggregate is the
+            # cross-reduction signal we care about.
+            continue
+        layer = graph.layers[current]
+        # Walk upstream via the Blockwise ``indices`` (new-style) or
+        # via the first task's args (legacy-style).
+        upstream = _blockwise_upstream_layer_names(layer)
+        queue.update(layer for layer in upstream if isinstance(layer, str))
+    return reachable_aggregates
+
+
+def _blockwise_upstream_layer_names(layer) -> List[str]:
+    """Return the upstream layer names referenced by a Blockwise
+    layer's task. Falls back to scanning the first task's args if the
+    layer isn't a Blockwise.
+    """
+    # New-style Blockwise: ``layer.indices`` is a mapping from output
+    # coordinate -> input coordinate where each input coordinate is a
+    # tuple ``(layer_name, block_index)`` (for Blockwise deps) or a
+    # tuple containing a constant.
+    if hasattr(layer, "indices") and layer.indices:
+        names = []
+        for in_key in layer.indices:
+            if isinstance(in_key, (list, tuple)) and len(in_key) >= 1 and isinstance(in_key[0], str):
+                names.append(in_key[0])
+        return names
+    # Legacy-style: scan the first task's args for layer-name strings.
+    names = []
+    for value in layer.values():
+        if _is_task(value):
+            for arg in value.args:
+                if isinstance(arg, str):
+                    names.append(arg)
+                else:
+                    name = getattr(arg, "key", None)
+                    if isinstance(name, str):
+                        names.append(name.split("(", 1)[0])
+            return names
+        if isinstance(value, tuple) and len(value) >= 2:
+            # legacy form: (func, deps, ...) where deps is nested
+            # list/tuple of layer-name strings
+            deps = value[1]
+            stack = [deps]
+            while stack:
+                item = stack.pop()
+                if isinstance(item, (list, tuple)):
+                    stack.extend(item)
+                elif isinstance(item, str):
+                    names.append(item)
+            return names
+    return names
+
+
 def extract_reduction_hints(darr: da.Array, array_name: str = "f") -> List[Dict[str, Any]]:
     """Inspect ``darr``'s task graph and return a hint dict per reduction.
 
@@ -336,6 +431,44 @@ def extract_reduction_hints(darr: da.Array, array_name: str = "f") -> List[Dict[
         return hints
 
     has_sqrt = _has_sqrt_poststep(graph)
+
+    # First pass: refuse any dask expression whose reductions' chunk
+    # stages depend on data from another reduction's aggregate. The
+    # only way to compute those correctly is to let dask run them
+    # end-to-end on the workers (with the full chunk present), NOT to
+    # precompute per-bridge partials. We do this once per dask array
+    # (not per aggregate layer) so a single cross-reduction expression
+    # produces zero hints rather than zero hints for the inner + a
+    # wrong hint for the outer.
+    for layer_name in list(graph.layers):
+        if not _is_aggregate_layer(layer_name):
+            continue
+        agg_base = _base_for_aggregate(layer_name)
+        chunk_layer_name = _find_chunk_layer(graph, agg_base)
+        if chunk_layer_name is None:
+            continue
+        reachable = _chunk_inputs_reach_other_aggregate(graph, chunk_layer_name)
+        # ``reachable`` includes ``layer_name`` itself only if the
+        # chunk-stage IS the aggregate (shouldn't happen with standard
+        # dask reductions). What we actually care about is OTHER
+        # aggregates in the reachable set -- those are reductions
+        # whose output the chunk-stage depends on.
+        other_aggregates = reachable - {layer_name}
+        if other_aggregates:
+            other_ops = sorted({_base_for_aggregate(a) for a in other_aggregates})
+            from deisa.dask.precompute_analyzer import UnsupportedReductionError
+
+            raise UnsupportedReductionError(
+                f"Reduction '{_base_for_aggregate(layer_name)}' depends on the output of "
+                f"other reduction(s) {other_ops}. Bridge-local precompute cannot produce "
+                f"correct per-bridge partials for this expression because the input "
+                f"requires data from ALL bridges (not just this bridge's chunk). "
+                f"Redesign the callback to use a single reduction (e.g. split the "
+                f"expression into two callbacks, or pre-compute the inner reduction "
+                f"in a separate step). With ``force=True``, the legacy full-chunk "
+                f"scatter path runs and dask computes the expression correctly on "
+                f"the workers (at the cost of placing the full chunk on workers)."
+            )
 
     for layer_name, layer in graph.layers.items():
         if not _is_aggregate_layer(layer_name):

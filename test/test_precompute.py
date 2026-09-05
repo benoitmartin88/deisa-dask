@@ -532,6 +532,134 @@ def test_offline_compression_raises_materialization() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Cross-reduction refusal (multi-reduction branches)
+# ---------------------------------------------------------------------------
+def test_cross_reduction_raises_unsupported_reduction_error() -> None:
+    """``(arr - arr.mean()).sum()`` must raise, NOT silently produce wrong hints.
+
+    The naive per-reduction hint extraction emits two hints:
+    - f-mean: arr.mean() -> per-bridge {n, total}
+    - f-sum:  (arr - mean).sum() -> per-bridge (chunk - chunk.mean()).sum()
+
+    The f-sum hint is WRONG in multi-bridge setups because the bridge
+    computes (chunk - chunk.mean()).sum() locally -- but the correct
+    expression requires the GLOBAL mean, which lives across bridges.
+    Per-bridge, (chunk - chunk.mean()).sum() is always 0, so the
+    global answer is always 0 regardless of input data.
+
+    We refuse the whole expression. With force=True the analyzer
+    swallows the error and returns no hints (so the user gets the
+    legacy full-chunk scatter path if they explicitly opt out).
+    """
+    arr = _simple_stub()
+    src = """
+        def callback(arr):
+            return (arr - arr.mean()).sum().compute()
+        """
+    cb = _make_function("callback", src)
+    from deisa.dask.precompute_analyzer import UnsupportedReductionError
+
+    with pytest.raises(UnsupportedReductionError) as exc_info:
+        analyze_callback(cb, {"f": arr})
+    # The error message must name the offending reduction and the
+    # cross-reduction dependency so the user can fix the callback.
+    msg = str(exc_info.value).lower()
+    assert "sum" in msg  # the outer reduction
+    assert "mean" in msg  # the inner reduction it depends on
+    assert "bridge" in msg or "global" in msg or "all bridges" in msg
+
+
+def test_cross_reduction_nested() -> None:
+    """Three-deep nested reductions must also be caught.
+
+    ``(arr - arr.mean().sum()).sum()``: the outer sum depends on
+    ``arr.mean().sum()`` (a sum of a mean), which itself depends on
+    arr. The walker follows the chain all the way back to the inner
+    aggregate and refuses.
+    """
+    arr = _simple_stub()
+    src = """
+        def callback(arr):
+            return (arr - arr.mean().sum()).sum().compute()
+        """
+    cb = _make_function("callback", src)
+    from deisa.dask.precompute_analyzer import UnsupportedReductionError
+
+    with pytest.raises(UnsupportedReductionError):
+        analyze_callback(cb, {"f": arr})
+
+
+def test_cross_reduction_in_helper() -> None:
+    """Cross-reduction inside a same-file helper is caught the same way.
+
+    Mirrors the gysela diagnostic patterns where ``measure()`` and
+    ``density()`` helpers may compose reductions. The analyzer walks
+    helper bodies, so a cross-reduction dependency in a helper also
+    triggers the refusal.
+    """
+    arr = _simple_stub()
+    src = """
+        def callback(arr):
+            return drift(arr).compute()
+
+        def drift(arr):
+            return (arr - arr.mean()).sum()
+        """
+    cb = _make_function("callback", src)
+    helpers = {"drift": _make_function("drift", src)}
+    from deisa.dask.precompute_analyzer import UnsupportedReductionError
+
+    with pytest.raises(UnsupportedReductionError):
+        analyze_callback(cb, {"f": arr}, helpers=helpers)
+
+
+def test_cross_reduction_force_true_returns_no_hints(caplog) -> None:
+    """``force=True`` swallows the refusal with a warning.
+
+    With force=True the user is explicitly opting out of the
+    precompute safety net. The analyzer logs a warning and returns
+    zero hints, which the registration layer turns into a
+    legacy full-chunk scatter (or raises -- depending on the
+    registration-time policy).
+    """
+    arr = _simple_stub()
+    src = """
+        def callback(arr):
+            return (arr - arr.mean()).sum().compute()
+        """
+    cb = _make_function("callback", src)
+    with caplog.at_level("WARNING"):
+        hints = analyze_callback(cb, {"f": arr}, force=True)
+    assert hints == []
+    # A warning was emitted about the refusal.
+    assert any(
+        "unsupported" in str(rec.message).lower() or "reduc" in str(rec.message).lower() for rec in caplog.records
+    )
+
+
+def test_independent_reductions_not_refused() -> None:
+    """Two INDEPENDENT reductions on the same array must NOT be refused.
+
+    The walker only refuses when one reduction's chunk-stage depends
+    on ANOTHER reduction's aggregate layer. Two independent
+    reductions (no shared sub-expression) are emitted as separate
+    hints and precomputed independently.
+    """
+    arr = _simple_stub()
+    src = """
+        def callback(arr):
+            a = arr.sum().compute()
+            b = arr.mean().compute()
+        """
+    cb = _make_function("callback", src)
+    hints = analyze_callback(cb, {"f": arr})
+    # Both reductions detected -- the walker does not refuse.
+    op_names = _op_names(hints)
+    assert "sum" in op_names
+    assert "mean" in op_names
+
+
+# ---------------------------------------------------------------------------
 # Safety: callback is NEVER executed
 # ---------------------------------------------------------------------------
 def test_callback_never_executed_during_analysis() -> None:
