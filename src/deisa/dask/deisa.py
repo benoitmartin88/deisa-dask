@@ -29,11 +29,12 @@
 
 import asyncio
 import collections
+import itertools
 import logging
 import threading
 import time
 import weakref
-from typing import Any, Callable, Collection, Dict, List, Literal, Set, Tuple, Union
+from typing import Any, Callable, Collection, Dict, List, Literal, Optional, Set, Tuple, Union
 
 import numpy as np
 from deisa.core import CallbackArgs, Window
@@ -41,6 +42,8 @@ from deisa.core.interface import IDeisa
 from distributed import Client, Event, Future, Queue
 
 import dask.array as da
+from dask.array.reductions import mean_agg, moment_agg
+from dask.delayed import delayed
 from deisa.dask.constants import (
     CALLBACK_PREFIX,
     CLIENT_KEY,
@@ -53,6 +56,133 @@ from deisa.dask.handshake import Handshake
 from deisa.dask.utils import build_deisa_array, get_client
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Precompute combine -- dict-blob partials (mean / var / std)
+# ---------------------------------------------------------------------------
+def _nest_partial_dicts_by_grid(
+    partials: List[Dict[str, Any]],
+) -> Tuple[Any, Tuple[int, ...]]:
+    """Arrange per-bridge dict-blob partials into a nested list that mirrors
+    the MPI chunk grid, so that ``mean_agg`` / ``moment_agg`` (which walk the
+    nested list with ``_concatenate2``) can combine them.
+
+    ``partials`` is a list of dicts each carrying a ``chunk_position`` --
+    the bridge's MPI coords. Returns ``(nested_list, grid_shape)`` where
+    ``grid_shape`` is the MPI grid shape (``(N, M, ...)``) and
+    ``nested_list[i_0][i_1]...`` is the dict (or future-of-dict) at MPI
+    coords ``(i_0, i_1, ...)``.
+
+    For a 1-D MPI grid (e.g. ``(2,)`` or ``(4,)``) this returns a flat
+    list of length N. For higher-D grids the list is nested.
+    """
+    # Determine grid shape from the unique coords across all partials.
+    coords = [tuple(p["chunk_position"]) for p in partials]
+    if not coords:
+        raise ValueError("_nest_partial_dicts_by_grid: no partials provided")
+    ndim = len(coords[0])
+    # Validate uniform ndim
+    for c in coords:
+        if len(c) != ndim:
+            raise ValueError(f"_nest_partial_dicts_by_grid: partials have inconsistent coord dimensions: {coords}")
+    # Per-axis sizes
+    axis_sizes: Dict[int, set] = {ax: set() for ax in range(ndim)}
+    for c in coords:
+        for ax, v in enumerate(c):
+            axis_sizes[ax].add(v)
+    grid_shape = tuple(len(axis_sizes[ax]) for ax in range(ndim))
+    # Validate full grid is filled
+    expected = set(itertools.product(*(range(g) for g in grid_shape)))
+    actual = set(coords)
+    if actual != expected:
+        raise ValueError(
+            f"_nest_partial_dicts_by_grid: partials do not cover the full grid (expected {expected}, got {actual})"
+        )
+
+    # Build a map from coords -> dict (or future)
+    by_coord: Dict[Tuple[int, ...], int] = {c: i for i, c in enumerate(coords)}
+
+    def _build_nested(dims_remaining: Tuple[int, ...], prefix: Tuple[int, ...]) -> Any:
+        if not dims_remaining:
+            return partials[by_coord[prefix]]["future"]
+        head, *tail = dims_remaining
+        return [_build_nested(tuple(tail), prefix + (i,)) for i in range(head)]
+
+    nested = _build_nested(grid_shape, ())
+    return nested, grid_shape
+
+
+def _agg_axis_for_grid(grid_shape: Tuple[int, ...]) -> Tuple[int, ...]:
+    """Return the axis tuple that ``mean_agg`` / ``moment_agg`` expect for a
+    nested list shaped like ``grid_shape``.
+
+    ``_concatenate2`` walks one axis per level of nesting, so for a grid of
+    shape ``(N, M)`` the axis must be ``(0, 1)``; for shape ``(N,)`` it must
+    be ``(0,)``.
+    """
+    return tuple(range(len(grid_shape)))
+
+
+def _build_dict_blob_combine_array(
+    partials: List[Dict[str, Any]],
+    array_name: str,
+    kind: str,
+    finalize: Optional[str],
+    hint_axis: Optional[Tuple[int, ...]],
+    array_ndim: int,
+) -> Any:
+    """Build a single-block dask array that combines per-bridge dict-blob
+    partials via ``mean_agg`` or ``moment_agg``.
+
+    For each output_key (``sum``, ``mean``, ...) the bridge shipped a single
+    future whose value is a dict ``{n: ..., total: ...[, M: ...]}`` (per
+    dask's ``mean_chunk`` / ``moment_chunk``). The Deisa side has one such
+    future per bridge (per MPI rank). To combine them we:
+
+    1. Arrange the futures in a nested list matching the MPI grid.
+    2. Build a delayed task that, when run, resolves the futures, calls
+       ``mean_agg`` / ``moment_agg`` over the nested list, and applies
+       ``sqrt`` if ``finalize == "sqrt"`` (std).
+    3. Wrap that single delayed task as ``da.from_delayed`` so the
+       callback sees a normal dask array.
+
+    The output shape comes from the chunk's ``axis`` hint: removing the
+    reduced axes from the array's ndim gives the reduction output's
+    shape. For ``mean()`` on a 2-D array (``axis=(0, 1)``), the output is
+    scalar ``()``. For ``mean(axis=0)``, the output is 1-d ``(N,)``.
+    """
+    if not partials:
+        raise ValueError("_build_dict_blob_combine_array: no partials provided")
+    nested, grid_shape = _nest_partial_dicts_by_grid(partials)
+    out_dtype = partials[0]["dtype"]
+    # Compute the output shape from the reduced axes.
+    if hint_axis is None:
+        # Fallback: rely on the bridge-recorded shape (keepdims=True result).
+        out_shape = partials[0]["shape"]
+    else:
+        kept_axes = tuple(ax for ax in range(array_ndim) if ax not in hint_axis)
+        out_shape = tuple(partials[0]["shape"][ax] for ax in kept_axes)
+    agg_kind = kind  # "mean" or "moment"
+    # The agg's axis is the chunk's reduction axis. mean_agg / moment_agg
+    # walk the nested list with one axis per nesting level, and the chunk's
+    # reduction axis happens to be the same as the MPI-grid axis when each
+    # bridge owns exactly one chunk along the reduced axes (our precompute
+    # invariant). For higher-D reductions that span multiple bridge axes,
+    # ``hint_axis`` carries the full tuple.
+    agg_axis = hint_axis if hint_axis is not None else _agg_axis_for_grid(grid_shape)
+
+    @delayed
+    def _combine(pairs):
+        if agg_kind == "mean":
+            result = mean_agg(pairs, dtype=np.dtype(out_dtype), axis=agg_axis)
+        else:
+            result = moment_agg(pairs, order=2, ddof=0, dtype=np.dtype(out_dtype), axis=agg_axis)
+        if finalize == "sqrt":
+            result = np.sqrt(result)
+        return result
+
+    return da.from_delayed(_combine(nested), shape=out_shape, dtype=out_dtype)
 
 
 class Deisa(IDeisa):
@@ -121,6 +251,7 @@ class Deisa(IDeisa):
         *callback_args: CallbackArgs,
         exception_handler: IDeisa.ExceptionHandler = __default_exception_handler,
         when: Literal["AND", "OR"] = "AND",
+        force: bool = False,
     ) -> Callable:
         """
         Registers a callback function with specific arguments, exception handling, and conditional execution criteria.
@@ -139,17 +270,34 @@ class Deisa(IDeisa):
         ``@deisa.register(Window("arr1", 2), Window("arr2", 5), "arr3")``  # window size 2 for arr1 and 5 for arr2,
                                                                              default window size for arr3
 
+        Every callback is automatically analyzed for dask reduction operations
+        (sum, mean, std, var, max, min, prod) which are executed locally on
+        each bridge before scatter to reduce network transfer. There is no
+        opt-in: the optimization is always attempted, and any callback that
+        cannot be precomputed (no reductions, or a reduction that depends on
+        another reduction's output) raises at registration time. Use
+        ``force=True`` to skip the analysis with a warning and fall back to
+        the legacy full-chunk scatter path.
+
         - ``:param callback_args:`` Variable-length arguments representing callback-specific parameters.
         - ``:param exception_handler:`` Optional exception handler to manage errors during callback execution.
              Defaults to ``__default_exception_handler``.
         - ``:param when:`` Specifies the conditional logic for triggering the callback. Can be 'AND' or 'OR'.
              Defaults to 'AND'.
+        - ``:param force:`` If True, skip precompute analysis with a warning and use the
+             legacy full-chunk scatter path. Defaults to False (analysis is required).
         - ``:return:`` A callable that wraps the provided callback with the configured parameters and logic.
         - ``:rtype:`` Callable
         """
 
         def decorator(callback: IDeisa.Callback) -> IDeisa.Callback:
-            return self.register_callback(callback, *callback_args, exception_handler=exception_handler, when=when)
+            return self.register_callback(
+                callback,
+                *callback_args,
+                exception_handler=exception_handler,
+                when=when,
+                force=force,
+            )
 
         return decorator
 
@@ -159,6 +307,7 @@ class Deisa(IDeisa):
         *callback_args: CallbackArgs,
         exception_handler: IDeisa.ExceptionHandler = __default_exception_handler,
         when: Literal["AND", "OR"] = "AND",
+        force: bool = False,
     ) -> Callable:
         """
         Registers a callback function with specific arguments, exception handling, and conditional execution criteria.
@@ -180,9 +329,9 @@ class Deisa(IDeisa):
         - ``:param callback:``  Callback function to register.
         - ``:param callback_args:``  Variable-length arguments representing callback-specific parameters.
         - ``:param exception_handler:``  Optional exception handler to manage errors during callback execution.
-             Defaults to ``__default_exception_handler``.
         - ``:param when:``  Specifies the conditional logic for triggering the callback. Can be 'AND' or 'OR'.
-            Defaults to 'AND'.
+        - ``:param force:``  If True, skip precompute analysis with a warning and
+             use the legacy full-chunk scatter path.
         - ``:return:``  A callable that wraps the provided callback with the configured parameters and logic.
         """
         logger.debug(f"register_callback: callback={callback}, callback_args={callback_args}")
@@ -199,7 +348,9 @@ class Deisa(IDeisa):
             else:
                 raise TypeError("callback_args must be str or tuple")
 
-        callback_id = self._register_callback_impl(callback, parsed, exception_handler=exception_handler, when=when)
+        callback_id = self._register_callback_impl(
+            callback, parsed, exception_handler=exception_handler, when=when, force=force
+        )
         callback.callback_id = callback_id
         return callback
 
@@ -209,6 +360,7 @@ class Deisa(IDeisa):
         parsed: List[Window],
         exception_handler: IDeisa.ExceptionHandler,
         when: Literal["AND", "OR"],
+        force: bool = False,
     ) -> Callback_id:
 
         if when not in ("AND", "OR"):
@@ -239,6 +391,57 @@ class Deisa(IDeisa):
 
         for array_name in array_names:
             self._callbacks_by_array.setdefault(array_name, set()).add(callback_id)
+
+            # Analyze the callback for chunk-local reductions and store
+            # the resulting BranchSpec objects on the HandshakeActor.
+            # Precompute is always attempted -- there is no opt-in.
+            # If the analyzer produces zero branches (no reductions
+            # found, OR a cross-reduction dependency refused), we
+            # raise here so the caller learns about it. A silent
+            # full-chunk scatter (the legacy path) on a callback that
+            # the user expected to be precomputed is exactly the
+            # silent-large-chunk behavior we want to prevent.
+            # ``force=True`` is the explicit escape hatch -- the
+            # analyzer logs warnings instead of raising, and the
+            # bridge falls back to the legacy full-chunk scatter
+            # path (which is the correct behavior for void side-
+            # effect callbacks, FFT-heavy callbacks, and any other
+            # case the precompute path can't handle).
+            #
+            # Stage 2A: BranchSpec is the new wire format. The bridge's
+            # _execute_operations_on_chunk, _scatter_partials,
+            # _direct_send, and the multi-bridge send() path all
+            # consume BranchSpec directly. Legacy hint dicts are also
+            # accepted as a backward-compat shim -- this is the active
+            # path until the analyzer is fully migrated to emit
+            # BranchSpec directly.
+            from deisa.dask.precompute_analyzer import NoPrecomputableReductionError
+
+            branches = self._analyze_callback_for_branches(callback, array_name, force=force)
+            if branches:
+                self.handshake.set_task_hints(array_name, branches)
+            elif not force:
+                logger.debug(
+                    f"_register_callback_impl: callback {callback.__name__!r} produced "
+                    f"no precomputable branches for array '{array_name}'. Without "
+                    f"branches, the bridge will fall back to scattering the FULL "
+                    f"chunk to the dask workers -- this is the behavior the "
+                    f"precompute optimization is designed to avoid. Set force=True "
+                    f"and catch the exception if the full-chunk path is acceptable."
+                )
+                raise NoPrecomputableReductionError(
+                    f"Callback {callback.__name__!r} produced no precomputable "
+                    f"reductions for array '{array_name}'. The precompute path "
+                    f"requires at least one chunk-local reduction. To run the "
+                    f"callback on the legacy full-chunk scatter path, redesign the "
+                    f"callback to use a single dask reduction (sum, mean, var, std, "
+                    f"min, max, prod) and avoid expressions whose reduction depends "
+                    f"on another reduction's output."
+                )
+            # else: force=True with no branches -- the analyzer
+            # already logged a warning, and we continue without
+            # setting task_hints so the bridge uses the legacy
+            # full-chunk scatter path.
 
             # create handler only once per topic
             if array_name not in self._topic_handlers:
@@ -367,11 +570,106 @@ class Deisa(IDeisa):
 
                 _weak_self.__update_futures_ownership(futures)
 
-                parts = sorted(futures, key=lambda p: p["chunk_position"])
-                darr_chunks = [da.from_delayed(p["future"], shape=p["shape"], dtype=p["dtype"]) for p in parts]
-                darr = _weak_self.__tile_dask_blocks(
-                    darr_chunks, _weak_self.arrays_metadata[array_name]["global_shape"]
-                )
+                precomputed = payload.get("precomputed")
+                if precomputed:
+                    # Precompute path: each ``futures`` entry is one
+                    # (bridge, reduction) pair with the partial's reduced
+                    # shape/dtype. Group by ``output_key`` and dispatch on
+                    # the partial ``kind``:
+                    #
+                    # - ``"scalar"`` (sum/prod/max/min): stack per-bridge
+                    #   partials along a new axis via ``da.stack``. The
+                    #   callback's reduction (e.g. ``arr.sum()``) sums the
+                    #   stacked partials via dask's natural graph.
+                    # - ``"mean"``: each bridge ships a ``{n, total}`` dict
+                    #   blob (per dask's ``mean_chunk``). Build a delayed
+                    #   task that resolves the per-bridge dicts and calls
+                    #   ``dask.array.reductions.mean_agg`` over them,
+                    #   arranged in a nested list that matches the MPI
+                    #   chunk grid. Return the combined value as a scalar
+                    #   (full reduction) or N-d array (axis reduction)
+                    #   dask array.
+                    # - ``"moment"``: same pattern, but using ``moment_agg``.
+                    #   For ``std`` (finalize="sqrt"), the combined result
+                    #   is sqrt-ed before being returned.
+                    by_reduction: Dict[str, List[Any]] = {}
+                    for f in futures:
+                        by_reduction.setdefault(f["output_key"], []).append(f)
+                    darr_chunks: List[Any] = []
+                    for output_key, partial_futures in by_reduction.items():
+                        kind = partial_futures[0].get("kind", "scalar")
+                        finalize = partial_futures[0].get("finalize")
+                        partial_shape = partial_futures[0]["shape"]
+                        partial_dtype = partial_futures[0]["dtype"]
+                        if kind == "scalar":
+                            # Sum-able scalar/array partials. Stack along
+                            # a new axis so the callback's reduction
+                            # combines them via dask's natural graph.
+                            sorted_partials = sorted(
+                                partial_futures,
+                                key=lambda p: tuple(p["chunk_position"]),
+                            )
+                            blocks = [
+                                da.from_delayed(p["future"], shape=partial_shape, dtype=partial_dtype)
+                                for p in sorted_partials
+                            ]
+                            if len(blocks) == 1:
+                                darr_chunks.append(blocks[0])
+                            else:
+                                darr_chunks.append(da.stack(blocks))
+                        elif kind in ("mean", "moment"):
+                            # Dict-blob partials. Build a nested list of
+                            # per-bridge dict futures matching the MPI
+                            # chunk grid, then call mean_agg / moment_agg
+                            # in a single delayed task.
+                            # ``chunk_axis`` is shipped in the topic event;
+                            # it tells us the chunk_func's reduction axes so
+                            # the combine's output shape and agg axis are
+                            # computed correctly.
+                            hint_axis = partial_futures[0].get("chunk_axis")
+                            array_ndim = len(_weak_self.arrays_metadata[array_name]["global_shape"])
+                            darr_chunks.append(
+                                _build_dict_blob_combine_array(
+                                    partial_futures,
+                                    array_name=array_name,
+                                    kind=kind,
+                                    finalize=finalize,
+                                    hint_axis=hint_axis,
+                                    array_ndim=array_ndim,
+                                )
+                            )
+                        else:
+                            logger.warning(
+                                f"topic_handler: unknown precompute kind {kind!r} for {output_key}, skipping"
+                            )
+                    # For precompute, the dask array *is* the partials; there's
+                    # no global tiling. The callback consumes these blocks via
+                    # the registered callback (the callback gets the stacked
+                    # partials as its array). Multiple reductions on the same
+                    # array produce multiple dask chunks; we dispatch the
+                    # first one to the callback. If only one reduction
+                    # registered, the callback sees a single dask array.
+                    if len(darr_chunks) == 1:
+                        darr = darr_chunks[0]
+                    else:
+                        # Multiple reductions: wrap as a tuple of dask arrays
+                        # and stash on the darr for the callback to iterate.
+                        # Most realistic callbacks register exactly one
+                        # reduction, so this branch is uncommon.
+                        darr = darr_chunks[0]
+                        darr.extra_precomputed_chunks = darr_chunks[1:]
+                    logger.debug(
+                        f"topic_handler: precompute path produced {len(darr_chunks)} reduction chunk(s) "
+                        f"with shapes {[c.shape for c in darr_chunks]}"
+                    )
+                else:
+                    # Legacy path: ``futures`` carries one entry per bridge with
+                    # the full-chunk shape; tile them into a single dask array.
+                    parts = sorted(futures, key=lambda p: p["chunk_position"])
+                    darr_chunks = [da.from_delayed(p["future"], shape=p["shape"], dtype=p["dtype"]) for p in parts]
+                    darr = _weak_self.__tile_dask_blocks(
+                        darr_chunks, _weak_self.arrays_metadata[array_name]["global_shape"]
+                    )
 
                 # tell the scheduler that the futures used by this dask array must not be collected by gc
                 _weak_self.client.persist(darr)
@@ -540,8 +838,152 @@ class Deisa(IDeisa):
         # Use da.block to combine blocks
         return da.block(nested)
 
+    def _analyze_callback_for_branches(self, callback: Callable, array_name: str, force: bool = False):
+        """
+        Analyze the callback's source and build a list of :class:`BranchSpec`
+        objects describing the chunk-local sub-expressions the bridge can
+        execute.
+
+        Stage 2A: a thin wrapper over :func:`analyze_callback` that
+        re-packages the raw hint dicts as BranchSpec objects. Stage 3 will
+        extend ``analyze_branch`` to fold multi-layer chains into a single
+        BranchSpec; this method's contract stays the same.
+
+        The callback is NOT executed: the AST is parsed and walked symbolically
+        to find compute boundaries (.compute(), client.compute(), etc.) and
+        the dask arrays they reference.
+
+        - ``:param callback:`` The callback function to analyze.
+        - ``:param array_name:`` The array name this callback operates on.
+        - ``:param force:`` If True, log warnings instead of raising on
+             analysis errors. Defaults to False.
+        - ``:return:`` List of BranchSpec objects (empty if analysis fails
+             or no reductions are detected).
+        """
+        from deisa.dask.branch import analyze_branch
+        from deisa.dask.precompute_analyzer import PrecomputeError
+
+        # Build a dask array stub matching the registered array's shape/chunks
+        # so the symbolic AST walker has something concrete to operate on.
+        # The chunking does not matter for hint extraction -- we only read
+        # the task graph structure, not the data.
+        metadata = self.arrays_metadata.get(array_name, {})
+        global_shape = metadata.get("global_shape")
+        chunks = metadata.get("chunks")
+        if global_shape is not None and chunks is not None:
+            stub = da.zeros(global_shape, chunks=chunks, dtype=np.float64)
+        else:
+            stub = da.zeros((10, 10), chunks=(5, 5), dtype=np.float64)
+
+        try:
+            return analyze_branch(
+                callback,
+                registered_arrays={array_name: stub},
+                force=force,
+            )
+        except PrecomputeError:
+            # Cross-reduction, opaque parameter, etc. -- propagate so
+            # the caller learns the analysis was unable to deliver a
+            # hint. force=True cases are handled inside analyze_branch
+            # (which logs warnings instead of raising), so by the time
+            # we get here force=False was set and we must propagate.
+            raise
+        except Exception as e:
+            if force:
+                logger.debug(f"_analyze_callback_for_branches: Analysis failed: {e}")
+                return []
+            raise
+
+    def _analyze_callback_for_operations(self, callback: Callable, array_name: str, force: bool = False) -> List[Dict]:
+        """
+        Backward-compat shim -- returns raw hint dicts for callers that
+        still expect them (e.g. unit tests). Uses the legacy
+        :func:`analyze_callback` directly so the hint dict's
+        ``chunk_func_pickle`` is the raw ``functools.partial(chunk_func)``
+        -- not the wrapped branch_func from
+        :meth:`_analyze_callback_for_branches`. The bridge's
+        :meth:`_execute_operations_on_chunk` calls
+        ``chunk_func(chunk, **chunk_kwargs)`` and expects chunk_kwargs
+        to carry the full set of args (axis, dtype, keepdims, ...); the
+        wrapped branch_func already binds those, so re-feeding them via
+        chunk_kwargs would conflict.
+
+        New code should call :meth:`_analyze_callback_for_branches`
+        directly and consume :class:`BranchSpec` instances.
+        """
+        from deisa.dask.precompute_analyzer import analyze_callback
+
+        # Build a dask array stub matching the registered array's shape/chunks
+        # so the symbolic AST walker has something concrete to operate on.
+        metadata = self.arrays_metadata.get(array_name, {})
+        global_shape = metadata.get("global_shape")
+        chunks = metadata.get("chunks")
+        if global_shape is not None and chunks is not None:
+            stub = da.zeros(global_shape, chunks=chunks, dtype=np.float64)
+        else:
+            stub = da.zeros((10, 10), chunks=(5, 5), dtype=np.float64)
+
+        try:
+            return analyze_callback(
+                callback,
+                registered_arrays={array_name: stub},
+                force=force,
+            )
+        except Exception as e:
+            logger.debug(f"_analyze_callback_for_operations: Analysis failed: {e}")
+            return []
+
+    def precompute_operations(self, array_name: str, operations: List[str], **kwargs) -> None:
+        """
+        Explicitly register reduction operations for precomputation on bridge side.
+
+        Use this when the callback does not return a dask array but still performs
+        reduction operations that can be computed locally on each bridge.
+
+        Example:
+            deisa.precompute_operations('temperature', ['sum', 'mean'])
+
+        - ``:param array_name:`` The array name to register operations for.
+        - ``:param operations:`` List of numpy reduction functions: 'sum', 'mean', 'std', 'var', 'max', 'min', 'prod'.
+        - ``:param kwargs:`` Additional kwargs passed to numpy functions (e.g., axis, keepdims).
+        - ``:return:`` None
+        """
+        if array_name not in self.arrays_metadata:
+            raise ValueError(f"unknown array name: {array_name}")
+
+        # Build a real dask array matching the registered array's shape/chunks
+        # and apply each requested reduction on it. Then extract the hints
+        # from the resulting graphs. This is the same path the AST-based
+        # analyzer uses, so the two APIs are guaranteed to produce
+        # interchangeable hints.
+        meta = self.arrays_metadata[array_name]
+        global_shape = tuple(meta["global_shape"])
+        chunks = tuple(meta["chunk_shape"])
+        stub = da.zeros(global_shape, chunks=chunks, dtype=np.float64)
+
+        from deisa.dask.task_hints import extract_reduction_hints
+
+        hints: List[Dict[str, Any]] = []
+        for op_name in operations:
+            if op_name not in {"sum", "mean", "std", "var", "max", "min", "prod"}:
+                raise ValueError(f"unsupported operation: {op_name}")
+            try:
+                method = getattr(stub, op_name)
+                reduced = method(**kwargs)
+            except Exception as e:
+                raise ValueError(f"could not build reduction graph for {op_name!r}: {e}") from e
+            # The dummy ``array_name`` suffix is the same one extract_reduction_hints
+            # would use, so we just take the first hint (there is only one reduction).
+            for hint in extract_reduction_hints(reduced, array_name=array_name):
+                if hint.get("output_key", "").endswith(f"-{op_name}"):
+                    hints.append(hint)
+                    break
+
+        if hints:
+            self.handshake.set_task_hints(array_name, hints)
+
     @staticmethod
-    def __get_array_names(*callback_args: Callback_args) -> List[str]:
+    def __get_array_names(*callback_args: CallbackArgs) -> List[str]:
         """Flatten callback_args to a tuple of array names."""
         array_names = []
         for arg in callback_args:

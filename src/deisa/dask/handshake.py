@@ -54,6 +54,7 @@ class Handshake:
             self.analytics_ready = False
             self.feedback_queue_size = 1024
             self.timestep: Optional[int] = None
+            self.task_hints = {}  # array_name -> List[Dict] for bridge-local execution
 
         def set_bridges_ready(self, nb_bridges: int, arrays_metadata: dict) -> None:
             logger.debug(
@@ -85,6 +86,16 @@ class Handshake:
 
         def get_feedback_queue_size(self) -> int | Future:
             return self.feedback_queue_size
+
+        def set_task_hints(self, array_name: str, hints: list) -> None:
+            logger.debug(f"set_task_hints(): array_name={array_name}, hints={hints}")
+            self.task_hints[array_name] = hints
+
+        def get_task_hints(self, array_name: str) -> list | Future:
+            return self.task_hints.get(array_name, [])
+
+        def get_task_hints_dict(self) -> dict | Future:
+            return self.task_hints
 
         def __go(self) -> None:
             logger.debug("Handshake go !")
@@ -134,6 +145,18 @@ class Handshake:
     def get_nb_bridges(self) -> int:
         assert self.__handshake_actor is not None
         return self.__handshake_actor.get_nb_bridges().result()
+
+    def set_task_hints(self, array_name: str, hints: list) -> None:
+        assert self.__handshake_actor is not None
+        self.__handshake_actor.set_task_hints(array_name, hints)
+
+    def get_task_hints(self, array_name: str) -> list:
+        assert self.__handshake_actor is not None
+        return self.__handshake_actor.get_task_hints(array_name).result()
+
+    def get_task_hints_dict(self) -> dict:
+        assert self.__handshake_actor is not None
+        return self.__handshake_actor.get_task_hints_dict().result()
 
     def __wait_for_go(self) -> None:
         Event(Handshake._DEISA_WAIT_FOR_GO_EVENT, client=self.client).wait()

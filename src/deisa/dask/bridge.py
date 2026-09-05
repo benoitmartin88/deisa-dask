@@ -28,12 +28,13 @@
 # =============================================================================
 import asyncio
 import logging
+import pickle
 import sys
 import uuid
 import zlib
 from collections import defaultdict, deque
 from numbers import Number
-from typing import Any, Deque, Dict, Final, Iterator, List, Optional, Union
+from typing import Any, Deque, Dict, Final, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
 from deisa.core import IBridge, ICommunicator, validate_arrays_metadata
@@ -43,6 +44,7 @@ from distributed.utils_comm import scatter_to_workers
 from tlz import valmap
 
 from dask.tokenize import tokenize
+from deisa.dask.branch import BranchSpec
 from deisa.dask.constants import CLIENT_KEY, FEEDBACK_QUEUE_PREFIX, KEY_PREFIX, WAIT_FOR_EXECUTE_CB_EVENT
 from deisa.dask.handshake import Handshake
 from deisa.dask.utils import get_client
@@ -56,6 +58,26 @@ try:
     _UNDEFINED = MPI.UNDEFINED
 except ImportError:
     _UNDEFINED = 2147483647
+
+
+def _extract_chunk_axis_from_hint(hint: Optional[Dict]) -> Optional[Tuple[int, ...]]:
+    """Pull the chunk_func's reduction-axes tuple out of a task hint.
+
+    Dask stores the axes being reduced in ``chunk_kwargs['axis']`` (either
+    a single int for one axis, or a tuple for several). For our precompute
+    topic event we need to ship this to the Deisa side so the combine's
+    output shape and agg ``axis`` are computed correctly. Returns
+    ``None`` when the hint is missing or has no ``axis`` kwarg.
+    """
+    if hint is None:
+        return None
+    ck = hint.get("chunk_kwargs") or {}
+    ax = ck.get("axis")
+    if isinstance(ax, (list, tuple)):
+        return tuple(int(a) for a in ax)
+    if ax is not None:
+        return (int(ax),)
+    return None
 
 
 class Bridge(IBridge):
@@ -100,6 +122,7 @@ class Bridge(IBridge):
         self.client: Optional[Client] = None
         self._array_comms: Dict[str, Any] = {}  # array_name -> sub-comm (from comm.Split)
         self._handshake_metadata = None
+        self._task_hints: Dict[str, List[Dict]] = {}  # array_name -> hints for local execution
 
         if self.id == 0:
             # only id 0 has a real dask client
@@ -203,6 +226,11 @@ class Bridge(IBridge):
             # create a new client for sub_comm id==0 if needed
             if not self.client and sub_comm is not _COMM_NULL and sub_comm.Get_rank() == 0:
                 self.client = get_client(timeout=10, name=f"bridge-{self.comm.Get_rank()}")
+                # Connect to existing handshake actor from analytics side (created by Deisa)
+                self.handshake = Handshake(self.client)
+
+            # Store empty hints initially - they will be fetched on first send()
+            self._task_hints[array_name] = []
 
             logger.debug(
                 f"[{self.id}] _setup_array_comms: "
@@ -308,8 +336,12 @@ class Bridge(IBridge):
 
         assert len(workers) == 1, "worker list should be of length 1."
 
-        # Send data to worker
-        res = self._better_scatter(chunk, workers=workers, hash=False)  # send data to workers
+        # Fetch task hints and execute reduction operations locally on the
+        # bridge-process numpy chunk. The resulting partials are tiny (scalar /
+        # 1-d arrays) compared to the full chunk -- the goal of precompute is
+        # to ship only the partials to the worker, never the full chunk.
+        task_hints = self._get_task_hints(array_name)
+        partials = self._execute_operations_on_chunk(array_name, chunk, task_hints)
 
         # Determine communicator from cached sub-comms (from comm.Split())
         sub_comm = self._array_comms.get(array_name)
@@ -319,12 +351,45 @@ class Bridge(IBridge):
             logger.debug(f"[{self.id}] send() rank not in participating set for '{array_name}', skipping")
             return
 
+        # Decide what to ship to workers:
+        # - If precompute produced partials for this callback: scatter ONLY the
+        #   partials (tiny). The full chunk stays on the bridge process and
+        #   never enters worker memory.
+        # - Otherwise (no reductions detected): fall back to the legacy path
+        #   and scatter the full chunk, preserving backward compatibility for
+        #   callbacks that don't return lazy dask reductions.
+        precomputed_meta: Dict[str, Dict[str, Any]] = {}
+        if partials:
+            logger.debug(
+                f"[{self.id}] send() precompute-active: scattering {len(partials)} partials "
+                f"instead of full chunk shape={chunk.shape}"
+            )
+            partial_res = self._scatter_partials(partials, task_hints, array_name, workers=workers)
+            res = partial_res["future-info"]
+            precomputed_meta = partial_res["precomputed"]
+        else:
+            logger.debug(f"[{self.id}] send() precompute-inactive: scattering full chunk shape={chunk.shape}")
+            res = self._better_scatter(chunk, workers=workers, hash=False)
+
         # Single-bridge fast-path: no collective needed
         if sub_comm.Get_size() == 1:
-            self._direct_send(array_name, res, chunk, timestep)
+            self._direct_send(
+                array_name,
+                res,
+                chunk,
+                timestep,
+                precomputed=precomputed_meta,
+                precomputed_meta=precomputed_meta,
+                task_hints=task_hints,
+                branches=task_hints,  # BranchSpec list; legacy hints also accepted
+            )
             return
 
-        to_send = {"future-info": res, "chunk_position": self.arrays_metadata[array_name]["chunk_position"]}
+        to_send = {
+            "future-info": res,
+            "chunk_position": self.arrays_metadata[array_name]["chunk_position"],
+            "precomputed": precomputed_meta,
+        }
         logger.debug(f"[{self.id}] send() gather: to_send={to_send}")
 
         gathered_data = sub_comm.gather(to_send, root=0)
@@ -333,73 +398,191 @@ class Bridge(IBridge):
 
         if gathered_data:
             assert self.client is not None, "client cannot be None for Bridge id 0."
-            # rank 0 (root=0 in comm.gather): aggregate who_has from all chunks
+            # rank 0 (root=0 in comm.gather): aggregate who_has from all partials/chunks
             who_has = {}
             nbytes = {}
             keys = []
+            all_partials_meta: List[Optional[Dict[str, Dict]]] = []
             for d in gathered_data:
                 who_has.update(d["future-info"]["who_has"])
                 nbytes.update(d["future-info"]["nbytes"])
-                keys.append(d["future-info"]["future"])
+                future_field = d["future-info"]["future"]
+                if isinstance(future_field, list):
+                    keys.extend(future_field)
+                else:
+                    keys.append(future_field)
+                if d.get("precomputed"):
+                    all_partials_meta.append(d["precomputed"])
 
-            # only update the scheduler with who has what and register the future once
+            # only update the scheduler with who has what and register the futures once
             self.client.sync(self.client.scheduler.update_data, who_has=who_has, nbytes=nbytes)
 
             # mimic mechanism from Queue. Keep a reference on keys until reception in topic handler.
             # TODO: id=0 can use a queue
             self.client._send_to_scheduler({"op": "client-desires-keys", "keys": keys, "client": CLIENT_KEY})
 
-            to_send = {
-                "array_name": array_name,
-                "iteration": timestep,
-                "futures": [
+            # Build the topic event. When precompute is active, `futures` lists
+            # one entry per (bridge, reduction) pair, each entry pointing to the
+            # partial's reduced shape and dtype. The Deisa side reconstructs the
+            # dask graph from these small partials -- the full chunk never
+            # reaches the workers.
+            #
+            # Build a per-output_key chunk_axis lookup. BranchSpec
+            # objects carry ``chunk_axis`` directly; legacy hint dicts
+            # require going through ``_extract_chunk_axis_from_hint``.
+            chunk_axis_by_key: Dict[str, Optional[Tuple[int, ...]]] = {}
+            for b in task_hints:
+                if isinstance(b, BranchSpec):
+                    chunk_axis_by_key[b.output_key] = b.chunk_axis
+                else:
+                    # Legacy hint dict.
+                    chunk_axis_by_key[b["output_key"]] = _extract_chunk_axis_from_hint(b)
+            futures_payload: List[Dict[str, Any]]
+            if all_partials_meta:
+                # Precompute path: emit one entry per (bridge, reduction).
+                # ``chunk_position`` here is the MPI coords of the bridge
+                # that contributed this partial, so the Deisa side can
+                # rebuild the nested list structure that ``mean_agg`` /
+                # ``moment_agg`` expect (matching the chunk-grid layout).
+                # ``chunk_axis`` is the chunk_func's reduction axes tuple
+                # (the chunk_kwargs ``axis``), used by the topic handler
+                # to compute the combine's output shape and pass the
+                # correct ``axis`` to ``mean_agg`` / ``moment_agg``.
+                futures_payload = []
+                for bridge_idx, partial_meta in enumerate(all_partials_meta):
+                    for output_key, p_info in partial_meta.items():
+                        chunk_axis = chunk_axis_by_key.get(output_key)
+                        futures_payload.append(
+                            {
+                                "future": p_info["future"],
+                                "shape": p_info["shape"],
+                                "dtype": p_info["dtype"],
+                                "kind": p_info.get("kind", "scalar"),
+                                "finalize": p_info.get("finalize"),
+                                "chunk_position": gathered_data[bridge_idx]["chunk_position"],
+                                "chunk_axis": chunk_axis,
+                                "output_key": output_key,
+                            }
+                        )
+            else:
+                # Legacy path: emit one entry per bridge with the full-chunk
+                # shape, same as before the precompute feature.
+                futures_payload = [
                     {
-                        "future": d["future-info"]["future"],
+                        "future": d["future-info"]["future"][0]
+                        if isinstance(d["future-info"]["future"], list)
+                        else d["future-info"]["future"],
                         "shape": chunk.shape,
                         "dtype": str(chunk.dtype),
                         "chunk_position": d["chunk_position"],
                     }
                     for d in gathered_data
-                ],
+                ]
+
+            to_send = {
+                "array_name": array_name,
+                "iteration": timestep,
+                "precomputed": True if all_partials_meta else None,
+                "futures": futures_payload,
             }
             logger.debug(
-                f"[{self.id}] send() log_event: array={array_name}, timestep={timestep}, n_futures={len(gathered_data)}"
+                f"[{self.id}] send() log_event: array={array_name}, "
+                f"timestep={timestep}, n_futures={len(futures_payload)}"
             )
             self.client.log_event(array_name, to_send)
 
         # TODO: what to do if error ?
 
-    def _direct_send(self, array_name: str, res: dict, chunk: np.ndarray, timestep: int):
+    def _direct_send(
+        self,
+        array_name: str,
+        res: dict,
+        chunk: np.ndarray,
+        timestep: int,
+        precomputed: Optional[Dict] = None,
+        precomputed_meta: Optional[Dict[str, Dict]] = None,
+        task_hints: Optional[List[Dict]] = None,
+        branches: Optional[List[Any]] = None,
+    ):
         """
         Handle single-bridge array send without collective.
 
         For arrays that exist on only one bridge, we skip the gather() entirely
         and directly update the Dask scheduler.
 
-        - ``:param array_name:`` The name of the data array being sent.
-        - ``:param res:`` The scatter result dict containing future, who_has, and nbytes.
-        - ``:param chunk:`` The numpy ndarray data chunk.
+        - ``:param array_name:`` The array name being sent.
+        - ``:param res:`` The scatter result (legacy: dict with a single ``future``;
+            precompute: dict with a list ``future`` of all partial keys).
+        - ``:param chunk:`` The numpy ndarray data chunk (kept for legacy shape/dtype).
         - ``:param timestep:`` The current timestep.
+        - ``:param precomputed:`` Optional precomputed values dict (legacy key,
+            kept for API stability; prefer ``precomputed_meta``).
+        - ``:param precomputed_meta:`` Per-partial scatter metadata
+            (``{output_key: {"future", "shape", "dtype"}}``); only set on the
+            precompute path. When provided, the topic event's ``futures`` list
+            carries the partials' reduced shapes instead of the full-chunk shape.
         """
         assert self.client is not None, "client cannot be None for single-bridge send."
 
-        future_key = res["future"]
         who_has = res["who_has"]
         nbytes = res["nbytes"]
 
+        # On the precompute path, ``res["future"]`` is a list of partial keys
+        # (one per reduction). On the legacy path, it's a single future key.
+        future_keys = res["future"] if isinstance(res["future"], list) else [res["future"]]
+
         self.client.sync(self.client.scheduler.update_data, who_has=who_has, nbytes=nbytes)
-        self.client._send_to_scheduler({"op": "client-desires-keys", "keys": [future_key], "client": CLIENT_KEY})
-        to_send = {
-            "array_name": array_name,
-            "iteration": timestep,
-            "futures": [
+        self.client._send_to_scheduler({"op": "client-desires-keys", "keys": future_keys, "client": CLIENT_KEY})
+
+        # Build the topic event. On the precompute path, emit one entry per
+        # partial (with its reduced shape); on the legacy path, emit one entry
+        # pointing at the full chunk.
+        if precomputed_meta:
+            # Build a per-output_key lookup for chunk_axis. Prefer
+            # BranchSpec objects (the new wire format) over legacy
+            # hint dicts; both expose ``output_key`` and a way to get
+            # the chunk axis. BranchSpec carries ``chunk_axis``
+            # directly; the legacy hint requires going through
+            # ``_extract_chunk_axis_from_hint``.
+            chunk_axis_by_key: Dict[str, Optional[Tuple[int, ...]]] = {}
+            if branches:
+                for b in branches:
+                    if isinstance(b, BranchSpec):
+                        chunk_axis_by_key[b.output_key] = b.chunk_axis
+                    else:
+                        # Legacy hint dict.
+                        chunk_axis_by_key[b["output_key"]] = _extract_chunk_axis_from_hint(b)
+            elif task_hints:
+                for h in task_hints:
+                    chunk_axis_by_key[h["output_key"]] = _extract_chunk_axis_from_hint(h)
+            futures_payload = [
                 {
-                    "future": future_key,
+                    "future": info["future"],
+                    "shape": info["shape"],
+                    "dtype": info["dtype"],
+                    "kind": info.get("kind", "scalar"),
+                    "finalize": info.get("finalize"),
+                    "chunk_position": self.arrays_metadata[array_name]["chunk_position"],
+                    "chunk_axis": chunk_axis_by_key.get(output_key),
+                    "output_key": output_key,
+                }
+                for output_key, info in precomputed_meta.items()
+            ]
+        else:
+            futures_payload = [
+                {
+                    "future": future_keys[0],
                     "shape": chunk.shape,
                     "dtype": str(chunk.dtype),
                     "chunk_position": self.arrays_metadata[array_name]["chunk_position"],
                 }
-            ],
+            ]
+
+        to_send = {
+            "array_name": array_name,
+            "iteration": timestep,
+            "precomputed": True if precomputed_meta else precomputed,
+            "futures": futures_payload,
         }
         self.client.log_event(array_name, to_send)
 
@@ -500,3 +683,266 @@ class Bridge(IBridge):
             assert len(out) == 1
             out = list(out.values())[0]
         return out
+
+    def _get_task_hints(self, array_name: str) -> List[Dict]:
+        """
+        Retrieve stored task hints for an array.
+
+        Hints are fetched from HandshakeActor on sub_comm rank 0 and broadcast to all ranks.
+        If no hints are available, this method returns an empty list (no precomputation).
+
+        - ``:param array_name:`` The array name to get hints for.
+        - ``:return:`` List of reduction hints (each carrying a pickled chunk
+            callable, pickled aggregator, and the dask kwargs to apply).
+        """
+        # Check cache first
+        if self._task_hints.get(array_name):
+            return self._task_hints[array_name]
+
+        # If not cached, need to fetch (only sub_comm rank 0 has client)
+        sub_comm = self._array_comms.get(array_name)
+        hints: List[Dict] = []
+
+        if sub_comm is not None and sub_comm is not _COMM_NULL:
+            if sub_comm.Get_rank() == 0 and self.handshake is not None:
+                hints = self.handshake.get_task_hints(array_name)
+                # Broadcast to all ranks in sub_comm
+                sub_comm.bcast(hints, root=0)
+            else:
+                # Receive broadcast
+                hints = sub_comm.bcast(None, root=0)
+
+            # Cache the hints
+            if hints:
+                self._task_hints[array_name] = hints
+
+        return hints
+
+    def _scatter_partials(
+        self,
+        partials: Dict[str, Any],
+        branches: List[Any],  # List[BranchSpec] or List[dict] (legacy hints)
+        array_name: str,
+        workers: List[str],
+    ) -> Dict[str, Any]:
+        """
+        Scatter precomputed reduction partials to a worker instead of the full chunk.
+
+        Each partial value is the local result of running the branch's
+        chunk-stage callable on the bridge's numpy chunk. Two flavors:
+
+        - ``"scalar"`` partials (sum/prod/max/min): plain scalars or numpy
+          arrays. Shipped as one future key per reduction.
+        - ``"mean"`` partials (mean): a ``{"n": x, "total": y}`` dict from
+          dask's ``mean_chunk``. Shipped as one future key whose value is
+          the whole dict; the Deisa-side combine resolves the dicts and
+          calls ``mean_agg`` over them.
+        - ``"moment"`` partials (var/std): a ``{"n": x, "total": y, "M": z}``
+          dict from dask's ``moment_chunk``. Same dict-blob handling as
+          mean, but the combine calls ``moment_agg`` (and sqrt for std).
+
+        Returns a dict shaped like the legacy ``_better_scatter`` result
+        (``{"future": [...], "who_has": {...}, "nbytes": {...}}``) plus a
+        ``precomputed`` entry mapping each ``output_key`` to its scatter
+        metadata (``{future, kind, shape, dtype, finalize}``) so the topic
+        handler can reconstruct the right dask graph.
+
+        - ``:param partials:`` Mapping of ``output_key`` -> partial value
+            produced by :meth:`_execute_operations_on_chunk`.
+        - ``:param branches:`` The :class:`BranchSpec` objects the
+            bridge used to compute the partials. Carry per-reduction
+            ``kind``/``finalize``/``partial_shape``/``partial_dtype``
+            metadata.
+        - ``:param array_name:`` Array name (used for key prefixing).
+        - ``:param workers:`` Single-element list of worker names to scatter to.
+        - ``:return:`` Dict with ``future-info`` (legacy-shape scatter result
+            containing all partials' keys) and ``precomputed`` (per-partial
+            metadata for the topic handler).
+        """
+        assert len(workers) == 1, "_scatter_partials expects a single target worker"
+        target_worker = workers[0]
+
+        # Index branches by output_key for fast lookup. BranchSpec
+        # carries the per-reduction metadata directly, so the loop
+        # body doesn't need to inspect the partial value (legacy code
+        # did ``isinstance(value, dict)`` and then peek at ``total``/
+        # ``M`` -- the analyzer already recorded that in
+        # ``branch.partial_shape``/``branch.partial_dtype``).
+        #
+        # Backward-compat: ``branches`` may be a list of legacy hint
+        # dicts (from the pre-BranchSpec registration path). We
+        # dispatch on element type -- BranchSpec items get their
+        # fields used directly; dict items get a small dict-lookup
+        # shim that mirrors the legacy behaviour.
+        if branches and not isinstance(branches[0], BranchSpec):
+            # Convert each legacy hint dict to a duck-typed
+            # BranchSpec-like accessor. Avoids importing the dataclass
+            # machinery just for a couple of fields.
+            class _DictBranch:
+                __slots__ = ("output_key", "output_kind", "finalize", "partial_shape", "partial_dtype")
+
+                def __init__(self, h):
+                    self.output_key = h["output_key"]
+                    self.output_kind = h.get("kind", "scalar")
+                    self.finalize = h.get("finalize")
+                    # Legacy hints don't carry shape/dtype; leave as
+                    # None and let the loop fall back to value inspection.
+                    self.partial_shape = h.get("shape")
+                    self.partial_dtype = h.get("dtype")
+
+            branches = [_DictBranch(h) for h in branches]
+        branch_by_key = {b.output_key: b for b in branches}
+
+        payload: Dict[str, Any] = {}
+        shape_dtype: Dict[str, Dict[str, Any]] = {}
+        for output_key, value in partials.items():
+            branch = branch_by_key.get(output_key)
+            if branch is None:
+                # Backward-compat: legacy hint path produced dicts here.
+                # We don't have shape/dtype metadata, so inspect the
+                # value as the old code did.
+                if isinstance(value, dict):
+                    if "total" in value:
+                        rep = np.asarray(value["total"])
+                    elif "M" in value:
+                        rep = np.asarray(value["M"])
+                    else:
+                        rep = np.asarray(next(iter(value.values())))
+                    red_shape = tuple(rep.shape)
+                    red_dtype = str(rep.dtype)
+                    kind = "mean" if "total" in value else "moment"
+                else:
+                    arr = np.asarray(value)
+                    red_shape = tuple(arr.shape)
+                    red_dtype = str(arr.dtype)
+                    kind = "scalar"
+                finalize = None
+            else:
+                kind = branch.output_kind
+                finalize = branch.finalize
+                red_shape = branch.partial_shape
+                red_dtype = branch.partial_dtype
+                # Backward-compat: legacy hint dicts (and any future
+                # branch that didn't record shape/dtype at the
+                # analyzer side) have ``partial_shape`` and
+                # ``partial_dtype`` set to None. Fall back to
+                # inspecting the actual partial value -- the
+                # same heuristic the pre-BranchSpec code used.
+                if red_shape is None or red_dtype is None:
+                    if isinstance(value, dict):
+                        if "total" in value:
+                            rep = np.asarray(value["total"])
+                        elif "M" in value:
+                            rep = np.asarray(value["M"])
+                        else:
+                            rep = np.asarray(next(iter(value.values())))
+                        red_shape = tuple(rep.shape)
+                        red_dtype = str(rep.dtype)
+                        # ``kind`` may also be missing on legacy
+                        # hints; default to dict-shape.
+                        if branch.output_kind == "scalar":
+                            kind = "mean" if "total" in value else "moment"
+                    else:
+                        arr = np.asarray(value)
+                        red_shape = tuple(arr.shape)
+                        red_dtype = str(arr.dtype)
+            key = f"{KEY_PREFIX}{array_name}-partial-{output_key}-{uuid.uuid4().hex}"
+            payload[key] = value
+            shape_dtype[output_key] = {
+                "future": key,
+                "kind": kind,
+                "shape": red_shape,
+                "dtype": red_dtype,
+                "finalize": finalize,
+            }
+
+        # Serialize for scatter (handles numpy arrays in dict values).
+        payload2 = valmap(to_serialize, payload)
+
+        # Use scatter_to_workers directly so we get the (who_has, nbytes) pair.
+        # Mirrors the legacy ``_better_scatter`` pattern: client.sync when a
+        # Client is available, asyncio.run otherwise (rank-0 only has the
+        # Client; non-rank-0 bridges run the scatter from a fresh event loop).
+        if self.client is not None:
+            _, who_has, nbytes = self.client.sync(self._scatter_to_workers_async, target_worker, payload2)
+        else:
+            _, who_has, nbytes = asyncio.run(self._scatter_to_workers_async(target_worker, payload2))
+
+        future_keys = list(payload.keys())
+        return {
+            "future-info": {
+                "future": future_keys,
+                "who_has": who_has,
+                "nbytes": nbytes,
+            },
+            "precomputed": shape_dtype,
+        }
+
+    async def _scatter_to_workers_async(self, worker: str, data: Dict[str, Any]):
+        """Async helper: scatter ``data`` to a single worker. Returns (ok, who_has, nbytes)."""
+        _, who_has, nbytes = await scatter_to_workers([worker], data)
+        return True, who_has, nbytes
+
+    def _execute_operations_on_chunk(
+        self, array_name: str, chunk: np.ndarray, branches: List["BranchSpec"]
+    ) -> Dict[str, Any]:
+        """
+        Execute branch chunk-stage callables locally on the bridge's
+        numpy chunk before scattering.
+
+        Each branch in ``branches`` is a :class:`BranchSpec` whose
+        ``branch_func`` is a pickle-able Python callable that takes a
+        numpy chunk and returns the per-bridge partial (a scalar,
+        ndarray, or dict for mean/moment). The closure inside
+        ``branch_func`` already binds the analyzer's chunk kwargs
+        (axis, keepdims, dtype, ...), so the call here is
+        ``branch_func(chunk)`` with no extra arguments.
+
+        - ``:param array_name:`` The array name being processed.
+        - ``:param chunk:`` The numpy ndarray data chunk.
+        - ``:param branches:`` List of :class:`BranchSpec` from
+            ``analyze_branch``.
+        - ``:return:`` Dict of partial results keyed by output_key.
+        """
+        from deisa.dask.branch import BranchSpec
+
+        partials = {}
+        for branch in branches:
+            if not isinstance(branch, BranchSpec):
+                # Backward compat: legacy hint dicts are still produced
+                # by ``_analyze_callback_for_operations``. Convert on
+                # the fly using the same kwargs logic the legacy path
+                # used.
+                output_key = branch["output_key"]
+                kind = branch.get("kind", "scalar")
+                try:
+                    chunk_func = pickle.loads(branch["chunk_func_pickle"])
+                    chunk_kwargs = dict(branch.get("chunk_kwargs", {}) or {})
+                    if kind in ("mean", "moment"):
+                        chunk_kwargs["keepdims"] = True
+                    partial = chunk_func(chunk, **chunk_kwargs)
+                except Exception as e:
+                    logger.warning(f"[{self.id}] _execute_operations_on_chunk: could not execute {output_key}: {e}")
+                    continue
+                partials[output_key] = partial
+                continue
+
+            output_key = branch.output_key
+            try:
+                partial = branch.branch_func(chunk)
+            except Exception as e:
+                logger.warning(f"[{self.id}] _execute_operations_on_chunk: could not execute {output_key}: {e}")
+                continue
+            partials[output_key] = partial
+
+        logger.debug(f"[{self.id}] _execute_operations_on_chunk: {partials}")
+        return partials
+
+    # NOTE: pre-v2 architecture used a centralized ``_combine_reduction_partials``
+    # on rank 0 to combine partials across bridges before scattering. That
+    # approach was replaced in PR #4 by the per-bridge partial-scatter: each
+    # bridge now ships its own raw partial to a worker, and the second-stage
+    # combine (e.g. summing per-bridge scalar partials for ``arr.sum()``) is
+    # expressed naturally by the dask graph the Deisa side builds from the
+    # partials. Keeping the old combiner here is unnecessary and would defeat
+    # the wire/worker-memory savings the optimization is meant to deliver.
