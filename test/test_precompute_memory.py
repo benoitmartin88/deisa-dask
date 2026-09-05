@@ -1,11 +1,10 @@
 # =============================================================================
 # Memory-measurement tests for the precompute feature.
 #
-# Goal: prove that when a callback is registered with precompute=True and the
-# analyzer detects reducible operations, the *full* array chunk never lands
-# on a worker. Only the small per-bridge reduction partials should appear in
-# worker memory. The full chunk stays on the bridge process (which is the
-# simulator here).
+# Goal: prove that when a callback is registered and the analyzer detects
+# reducible operations, the *full* array chunk never lands on a worker. Only
+# the small per-bridge reduction partials should appear in worker memory.
+# The full chunk stays on the bridge process (which is the simulator here).
 #
 # We use Dask's built-in memory counters (worker.data + nbytes) instead of
 # psutil so the test has no external dependency. The test runs against a
@@ -91,7 +90,7 @@ class TestPrecomputeMemory:
     """
 
     def test_precompute_worker_only_sees_partials(self, env_setup_2workers):
-        """With precompute=True and a callback that reduces to a scalar, only
+        """With a callback that reduces to a scalar, only
         the per-bridge partials (scalar size, ~8 bytes) should appear on
         workers. The full chunk (~8 MB) must NOT appear.
         """
@@ -119,7 +118,7 @@ class TestPrecomputeMemory:
 
         callback_results: List[float] = []
 
-        @deisa.register(array_name, precompute=True)
+        @deisa.register(array_name)
         def _cb(window: list[DeisaArray]) -> None:
             # `window[-1]` is the dask array the topic handler built. It
             # should be the STACKED per-bridge partials (shape (2,)) when
@@ -202,8 +201,12 @@ class TestPrecomputeMemory:
 
         callback_results: List[float] = []
 
-        @deisa.register(array_name)
-        # NOTE: no precompute=True
+        @deisa.register(array_name, force=True)
+        # NOTE: force=True opts out of precompute and falls back to the
+        # legacy full-chunk scatter path. The callback has a reduction
+        # (``arr.sum()``), so without force=True it would be precomputed.
+        # This control test confirms the memory harness can detect the
+        # full chunk on workers when force=True is used.
         def _cb(window: list[DeisaArray]) -> None:
             arr = window[-1]
             logging.warning(f"NO-PRECOMPUTE TEST: callback received shape={arr.shape}")
@@ -264,7 +267,7 @@ class TestPrecomputeMemory:
 
         callback_results: List[float] = []
 
-        @deisa.register(array_name, precompute=True)
+        @deisa.register(array_name)
         def _cb(window: list[DeisaArray]) -> None:
             arr = window[-1]
             logging.warning(f"MEAN TEST: callback received dask array shape={arr.shape}")
@@ -328,7 +331,7 @@ class TestPrecomputeMemory:
 
         callback_results: List[float] = []
 
-        @deisa.register(array_name, precompute=True)
+        @deisa.register(array_name)
         def _cb(window: list[DeisaArray]) -> None:
             arr = window[-1]
             logging.warning(f"VAR TEST: callback received dask array shape={arr.shape}")
@@ -381,7 +384,7 @@ class TestPrecomputeMemory:
 
         callback_results: List[float] = []
 
-        @deisa.register(array_name, precompute=True)
+        @deisa.register(array_name)
         def _cb(window: list[DeisaArray]) -> None:
             arr = window[-1]
             logging.warning(f"STD TEST: callback received dask array shape={arr.shape}")
@@ -445,7 +448,7 @@ class TestPrecomputeMemory:
 
         callback_results: List[float] = []
 
-        @deisa.register(array_name, precompute=True)
+        @deisa.register(array_name)
         def _cb(window: list[DeisaArray]) -> None:
             arr = window[-1]
             logging.warning(f"CHAIN TEST: callback received dask array shape={arr.shape}")

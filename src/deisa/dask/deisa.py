@@ -251,7 +251,6 @@ class Deisa(IDeisa):
         *callback_args: CallbackArgs,
         exception_handler: IDeisa.ExceptionHandler = __default_exception_handler,
         when: Literal["AND", "OR"] = "AND",
-        precompute: bool = False,
         force: bool = False,
     ) -> Callable:
         """
@@ -271,17 +270,22 @@ class Deisa(IDeisa):
         ``@deisa.register(Window("arr1", 2), Window("arr2", 5), "arr3")``  # window size 2 for arr1 and 5 for arr2,
                                                                              default window size for arr3
 
-        When ``precompute=True``, the callback is analyzed to extract dask reduction operations
-        (sum, mean, std, var, max, min, prod) which are executed locally on each bridge before
-        scatter to reduce network transfer.
+        Every callback is automatically analyzed for dask reduction operations
+        (sum, mean, std, var, max, min, prod) which are executed locally on
+        each bridge before scatter to reduce network transfer. There is no
+        opt-in: the optimization is always attempted, and any callback that
+        cannot be precomputed (no reductions, or a reduction that depends on
+        another reduction's output) raises at registration time. Use
+        ``force=True`` to skip the analysis with a warning and fall back to
+        the legacy full-chunk scatter path.
 
         - ``:param callback_args:`` Variable-length arguments representing callback-specific parameters.
         - ``:param exception_handler:`` Optional exception handler to manage errors during callback execution.
              Defaults to ``__default_exception_handler``.
         - ``:param when:`` Specifies the conditional logic for triggering the callback. Can be 'AND' or 'OR'.
              Defaults to 'AND'.
-        - ``:param precompute:`` If True, analyze callback for dask reductions and execute on bridge.
-             Defaults to False.
+        - ``:param force:`` If True, skip precompute analysis with a warning and use the
+             legacy full-chunk scatter path. Defaults to False (analysis is required).
         - ``:return:`` A callable that wraps the provided callback with the configured parameters and logic.
         - ``:rtype:`` Callable
         """
@@ -292,7 +296,6 @@ class Deisa(IDeisa):
                 *callback_args,
                 exception_handler=exception_handler,
                 when=when,
-                precompute=precompute,
                 force=force,
             )
 
@@ -304,7 +307,6 @@ class Deisa(IDeisa):
         *callback_args: CallbackArgs,
         exception_handler: IDeisa.ExceptionHandler = __default_exception_handler,
         when: Literal["AND", "OR"] = "AND",
-        precompute: bool = False,
         force: bool = False,
     ) -> Callable:
         """
@@ -327,11 +329,9 @@ class Deisa(IDeisa):
         - ``:param callback:``  Callback function to register.
         - ``:param callback_args:``  Variable-length arguments representing callback-specific parameters.
         - ``:param exception_handler:``  Optional exception handler to manage errors during callback execution.
-             Defaults to ``__default_exception_handler``.
         - ``:param when:``  Specifies the conditional logic for triggering the callback. Can be 'AND' or 'OR'.
-             Defaults to 'AND'.
-        - ``:param precompute:`` If True, analyze callback for dask reductions and execute on bridge.
-             Defaults to False.
+        - ``:param force:``  If True, skip precompute analysis with a warning and
+             use the legacy full-chunk scatter path.
         - ``:return:``  A callable that wraps the provided callback with the configured parameters and logic.
         """
         logger.debug(f"register_callback: callback={callback}, callback_args={callback_args}")
@@ -349,7 +349,7 @@ class Deisa(IDeisa):
                 raise TypeError("callback_args must be str or tuple")
 
         callback_id = self._register_callback_impl(
-            callback, parsed, exception_handler=exception_handler, when=when, precompute=precompute, force=force
+            callback, parsed, exception_handler=exception_handler, when=when, force=force
         )
         callback.callback_id = callback_id
         return callback
@@ -360,7 +360,6 @@ class Deisa(IDeisa):
         parsed: List[Window],
         exception_handler: IDeisa.ExceptionHandler,
         when: Literal["AND", "OR"],
-        precompute: bool = False,
         force: bool = False,
     ) -> Callback_id:
 
@@ -393,8 +392,22 @@ class Deisa(IDeisa):
         for array_name in array_names:
             self._callbacks_by_array.setdefault(array_name, set()).add(callback_id)
 
-            # Analyze callback for chunk-local branches and store the
-            # resulting BranchSpec objects (only if precompute=True).
+            # Analyze the callback for chunk-local reductions and store
+            # the resulting BranchSpec objects on the HandshakeActor.
+            # Precompute is always attempted -- there is no opt-in.
+            # If the analyzer produces zero branches (no reductions
+            # found, OR a cross-reduction dependency refused), we
+            # raise here so the caller learns about it. A silent
+            # full-chunk scatter (the legacy path) on a callback that
+            # the user expected to be precomputed is exactly the
+            # silent-large-chunk behavior we want to prevent.
+            # ``force=True`` is the explicit escape hatch -- the
+            # analyzer logs warnings instead of raising, and the
+            # bridge falls back to the legacy full-chunk scatter
+            # path (which is the correct behavior for void side-
+            # effect callbacks, FFT-heavy callbacks, and any other
+            # case the precompute path can't handle).
+            #
             # Stage 2A: BranchSpec is the new wire format. The bridge's
             # _execute_operations_on_chunk, _scatter_partials,
             # _direct_send, and the multi-bridge send() path all
@@ -402,10 +415,33 @@ class Deisa(IDeisa):
             # accepted as a backward-compat shim -- this is the active
             # path until the analyzer is fully migrated to emit
             # BranchSpec directly.
-            if precompute:
-                branches = self._analyze_callback_for_branches(callback, array_name, force=force)
-                if branches:
-                    self.handshake.set_task_hints(array_name, branches)
+            from deisa.dask.precompute_analyzer import NoPrecomputableReductionError
+
+            branches = self._analyze_callback_for_branches(callback, array_name, force=force)
+            if branches:
+                self.handshake.set_task_hints(array_name, branches)
+            elif not force:
+                logger.debug(
+                    f"_register_callback_impl: callback {callback.__name__!r} produced "
+                    f"no precomputable branches for array '{array_name}'. Without "
+                    f"branches, the bridge will fall back to scattering the FULL "
+                    f"chunk to the dask workers -- this is the behavior the "
+                    f"precompute optimization is designed to avoid. Set force=True "
+                    f"and catch the exception if the full-chunk path is acceptable."
+                )
+                raise NoPrecomputableReductionError(
+                    f"Callback {callback.__name__!r} produced no precomputable "
+                    f"reductions for array '{array_name}'. The precompute path "
+                    f"requires at least one chunk-local reduction. To run the "
+                    f"callback on the legacy full-chunk scatter path, redesign the "
+                    f"callback to use a single dask reduction (sum, mean, var, std, "
+                    f"min, max, prod) and avoid expressions whose reduction depends "
+                    f"on another reduction's output."
+                )
+            # else: force=True with no branches -- the analyzer
+            # already logged a warning, and we continue without
+            # setting task_hints so the bridge uses the legacy
+            # full-chunk scatter path.
 
             # create handler only once per topic
             if array_name not in self._topic_handlers:
@@ -854,7 +890,7 @@ class Deisa(IDeisa):
             raise
         except Exception as e:
             if force:
-                logger.warning(f"_analyze_callback_for_branches: Analysis failed: {e}")
+                logger.debug(f"_analyze_callback_for_branches: Analysis failed: {e}")
                 return []
             raise
 
