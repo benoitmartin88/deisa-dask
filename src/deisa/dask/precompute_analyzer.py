@@ -52,7 +52,7 @@ import ast
 import inspect
 import logging
 import textwrap
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -140,7 +140,7 @@ def analyze_callback(
     - ``:raises PrecomputeError:`` On any unresolvable reduction (unless ``force=True``).
     """
     try:
-        hints, err = _analyze_callback(callback, registered_arrays, helpers, force)
+        hints, err, _dask_arrays = _analyze_callback(callback, registered_arrays, helpers, force)
     except PrecomputeError as e:
         if force:
             logger.warning("analyze_callback: %s (force=True, skipping)", e)
@@ -156,16 +156,53 @@ def analyze_callback(
     return hints
 
 
+def analyze_callback_with_dask_arrays(
+    callback: Callable,
+    registered_arrays: Dict[str, Any],
+    helpers: Optional[Dict[str, Callable]] = None,
+    force: bool = False,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Variant of :func:`analyze_callback` that also returns the
+    AST walker's ``dask_arrays``.
+
+    Each entry in the returned dask_arrays list is ``{"array": darr,
+    "kind": "compute"|"client.compute"|..., "lineno": int}`` --
+    ``darr`` is the dask expression the walker built at that compute
+    boundary (e.g. ``(arr*arr).sum()``). This is the graph the chain
+    walker in :mod:`deisa.dask.branch` needs to fold multi-layer
+    pointwise chains; the registered placeholders' graphs only have
+    the root layer, not the chain.
+    """
+    try:
+        hints, err, dask_arrays = _analyze_callback(callback, registered_arrays, helpers, force)
+    except PrecomputeError as e:
+        if force:
+            logger.warning("analyze_callback: %s (force=True, skipping)", e)
+            return [], []
+        raise
+    if err is not None:
+        if force:
+            logger.warning("analyze_callback: %s (force=True, skipping)", err)
+            return [], dask_arrays
+        raise err
+    return hints, dask_arrays
+
+
 def _analyze_callback(
     callback: Callable,
     registered_arrays: Dict[str, Any],
     helpers: Optional[Dict[str, Callable]],
     force: bool,
-) -> tuple[List[Dict[str, Any]], Optional[PrecomputeError]]:
+) -> tuple[List[Dict[str, Any]], Optional[PrecomputeError], List[Dict[str, Any]]]:
     """Internal worker for :func:`analyze_callback` that never swallows errors.
 
-    Returns ``(hints, last_error)``. The caller decides how to surface the
-    error: ``force=True`` warnings or normal raises.
+    Returns ``(hints, last_error, dask_arrays)``. The caller decides how
+    to surface the error: ``force=True`` warnings or normal raises.
+    ``dask_arrays`` is the ``_BoundaryWalker.dask_arrays`` snapshot --
+    the dask expressions the walker built at each compute boundary,
+    each ``{"array": darr, "kind": ..., "lineno": ...}``. Callers that
+    only need hints can ignore it; chain-folding callers in
+    :mod:`deisa.dask.branch` consume it.
     """
     # 1. Parse callback source
     callback_src = _get_source(callback)
@@ -218,8 +255,12 @@ def _analyze_callback(
     # 6. Materialization takes priority: if any np.array/asarray on a dask
     # array was found, the callback can't be precomputed at all.
     if walker.had_materialization:
-        return [], MaterializationError(
-            "Callback contains a full materialization (e.g. np.array(dask_array)) that defeats precomputation."
+        return (
+            [],
+            MaterializationError(
+                "Callback contains a full materialization (e.g. np.array(dask_array)) that defeats precomputation."
+            ),
+            list(walker.dask_arrays),
         )
 
     dask_arrays = walker.dask_arrays
@@ -243,16 +284,24 @@ def _analyze_callback(
     # 8. Decide what (if anything) to raise.
     if not hints:
         if not had_boundaries:
-            return [], NoComputeBoundaryError(
-                f"Callback {callback.__name__!r} contains dask operations "
-                "but no compute boundaries (.compute(), client.compute(), "
-                "client.submit(), etc.). Cannot determine which arrays to precompute."
+            return (
+                [],
+                NoComputeBoundaryError(
+                    f"Callback {callback.__name__!r} contains dask operations "
+                    "but no compute boundaries (.compute(), client.compute(), "
+                    "client.submit(), etc.). Cannot determine which arrays to precompute."
+                ),
+                list(walker.dask_arrays),
             )
-        return [], NoPrecomputableReductionError(
-            f"Callback {callback.__name__!r} contains compute boundaries but no reductions we can precompute."
+        return (
+            [],
+            NoPrecomputableReductionError(
+                f"Callback {callback.__name__!r} contains compute boundaries but no reductions we can precompute."
+            ),
+            list(walker.dask_arrays),
         )
 
-    return hints, None
+    return hints, None, list(walker.dask_arrays)
 
 
 # ---------------------------------------------------------------------------

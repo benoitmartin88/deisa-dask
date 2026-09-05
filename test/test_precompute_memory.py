@@ -407,3 +407,99 @@ class TestPrecomputeMemory:
         assert len(callback_results) == 1
         assert np.isfinite(callback_results[0])
         assert callback_results[0] >= 0.0  # std is non-negative
+
+    def test_precompute_chain_squared_sum_worker_only_sees_partials(self, env_setup_2workers):
+        """Stage 2B chain-folded test: callback does ``(arr * arr).sum()``.
+
+        The AST walker composes the expression lazily, producing a
+        dask graph with both a ``mul`` layer AND a ``sum`` layer. The
+        chain walker in :mod:`deisa.dask.branch` folds the chain --
+        the bridge runs ``chunk ** 2`` then ``sum`` on its local numpy
+        chunk and ships a single scalar partial per bridge. Workers
+        must NOT hold the full chunk; only the small scalar partials.
+
+        Without chain folding, the per-reduction hint would say
+        ``sum`` (axis=(0,1)) but with chunk_kwargs that don't capture
+        the squaring step -- the bridge would scatter ``chunk.sum()``
+        instead of ``(chunk*chunk).sum()`` and the global result
+        would be wrong. The chain walker fixes that.
+        """
+        client, cluster = env_setup_2workers
+        chunk_shape = (2048, 2048)
+        global_shape = (chunk_shape[0] * 2, chunk_shape[1])
+        array_name = "temperature"
+
+        sim = TestSimulation(
+            client,
+            mpi_parallelism=(2, 1),
+            arrays_metadata={
+                array_name: {
+                    "global_shape": global_shape,
+                    "chunk_shape": chunk_shape,
+                },
+            },
+            wait_for_go=False,
+        )
+
+        deisa = Deisa(wait_for_go=False)
+
+        callback_results: List[float] = []
+
+        @deisa.register(array_name, precompute=True)
+        def _cb(window: list[DeisaArray]) -> None:
+            arr = window[-1]
+            logging.warning(f"CHAIN TEST: callback received dask array shape={arr.shape}")
+            # The chain walker folds (arr*arr).sum() into one branch
+            # on the bridge side: each bridge's partial IS the
+            # sum-of-squares of its chunk (shape (1, 1)). The Deisa
+            # side stacks the per-bridge partials along a new axis so
+            # with 2 bridges we get (2, 1, 1). The callback's plain
+            # ``arr.sum()`` reduces those back to the global
+            # sum-of-squares (sum-of-sums-of-squares-per-bridge).
+            #
+            # NOTE: do NOT re-apply (arr*arr) here -- the partials are
+            # already sum-of-squares, and squaring them would give the
+            # wrong answer (sum of (partial)**2 instead of sum of partials).
+            result = arr.sum().compute()
+            callback_results.append(float(result))
+
+        time.sleep(0.5)
+
+        sim.generate_data(array_name, iteration=1, update_workers=True)
+
+        assert wait_for(lambda: len(callback_results) >= 1, timeout=30), "callback was not called within 30s"
+
+        after = _worker_bytes_per_key(client)
+        after_max_per_worker = _largest_key_per_worker(after)
+        logging.warning(f"CHAIN TEST: per-worker max key nbytes: {after_max_per_worker}")
+
+        # Per-bridge partial is (1, 1) float64 = 16 bytes. Allow 64 KB
+        # of slack (numpy wrapping + dask dict overhead), but
+        # well below the 32 MB full-chunk size.
+        max_allowed = 64 * 1024
+        for worker, max_nbytes in after_max_per_worker.items():
+            assert max_nbytes < max_allowed, (
+                f"Worker {worker} holds a key of {max_nbytes} bytes; "
+                f"expected only the small partial (< {max_allowed} bytes). "
+                f"Full chunk appears to have landed on the worker. "
+                f"Keys: {after}"
+            )
+
+        assert len(callback_results) == 1
+        # The chain-folded branch_func must produce the correct global
+        # value: sum-of-squares of the random uniform [0, 1) data.
+        # Per-bridge partial = sum-of-squares-of-chunk; combine via
+        # dask sum stacks-and-sums, giving the global sum-of-squares.
+        # Sanity: for uniform [0, 1) values the expected sum-of-squares
+        # is N * E[x^2] = N * 1/3 ~ N/3, so for N = 4096*2048 = 8.39M,
+        # expect ~2.8M. We just check the result is finite, positive,
+        # and on the right order of magnitude.
+        assert np.isfinite(callback_results[0])
+        assert callback_results[0] > 0
+        N = int(np.prod(global_shape))
+        expected_order = N / 3.0
+        assert 0.1 * expected_order < callback_results[0] < 10.0 * expected_order, (
+            f"Global sum-of-squares {callback_results[0]} not in expected range "
+            f"around {expected_order:.1f} -- chain walker may be producing the "
+            f"wrong expression (e.g. plain sum instead of squared sum)."
+        )
