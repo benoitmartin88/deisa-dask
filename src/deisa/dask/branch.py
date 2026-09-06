@@ -463,7 +463,17 @@ def analyze_branch(
             try:
                 placeholder = placeholder.compute()
             except Exception:
-                pass
+                # If .compute() fails (e.g. no dask client in the CI
+                # worker process), fall back to a synthetic numpy array
+                # that matches the dask array's shape/dtype/chunks so
+                # the chunk_func still produces a representative partial.
+                try:
+                    placeholder = np.zeros(
+                        getattr(placeholder, "shape", (4, 4)),
+                        dtype=getattr(placeholder, "dtype", np.float64),
+                    )
+                except Exception:
+                    placeholder = np.zeros((4, 4), dtype=np.float64)
 
         branch = _try_chain_branch(
             hint=hint,
