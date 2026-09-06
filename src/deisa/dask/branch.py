@@ -485,12 +485,24 @@ def analyze_branch(
             )
         if branch is None:
             if force:
-                logger.warning("analyze_branch: build failed for %s", hint.get("output_key"))
+                logger.debug(
+                    "analyze_branch: build failed for %s; "
+                    "the length-1 path's build_branch_from_hint raised "
+                    "(most likely the placeholder couldn't be computed "
+                    "or the chunk_func rejected the chunk shape).",
+                    hint.get("output_key"),
+                )
                 continue
             # Both paths returned None -- this shouldn't happen for
             # hints that came out of the analyzer (the length-1 path is
             # supposed to always succeed). Raise defensively.
-            raise RuntimeError(f"analyze_branch: cannot build branch for hint {hint.get('output_key')!r}")
+            raise RuntimeError(
+                f"analyze_branch: cannot build branch for hint {hint.get('output_key')!r}. "
+                f"The chain walker refused (likely cross-array or constant "
+                f"upstream) AND the length-1 fallback's build_branch_from_hint "
+                f"raised. This usually means the chunk_func rejected the "
+                f"placeholder. Inspect with the failing hint's chunk_kwargs."
+            )
         branches.append(branch)
     return branches
 
@@ -570,7 +582,21 @@ def _try_length1_branch(
             array_ndim=array_ndim,
             placeholder=placeholder,
         )
-    except Exception:
+    except Exception as e:
+        # The length-1 path is the last-resort fallback. If it
+        # raises, log enough context to diagnose the failure --
+        # usually the chunk_func rejected the placeholder's shape or
+        # dtype, or the placeholder is itself a dask array (because
+        # .compute() silently failed upstream).
+        logger.debug(
+            "_try_length1_branch: build_branch_from_hint raised for %s "
+            "with chunk_kwargs=%r, array_ndim=%d, placeholder=%r: %s",
+            hint.get("output_key"),
+            hint.get("chunk_kwargs"),
+            array_ndim,
+            type(placeholder).__name__ if placeholder is not None else None,
+            e,
+        )
         return None
 
 
