@@ -951,7 +951,7 @@ class _BoundaryWalker:
             name = func.id
             if name in {"da", "np", "dask_array"}:
                 raise IncompatibleCallbackError(f"Calling {name}() directly is not supported at line {node.lineno}")
-            if name in {"sum", "min", "max", "abs", "round", "len", "int", "float", "bool"}:
+            if name in {"sum", "min", "max", "abs", "round", "len", "int", "float", "bool", "print"}:
                 args = [self._eval(a, scope) for a in node.args]
                 kwargs = self._eval_kwargs(node.keywords, scope)
                 if name == "sum" and args and isinstance(args[0], da.Array):
@@ -964,6 +964,8 @@ class _BoundaryWalker:
                     return len(args[0]) if args else 0
                 if name in {"int", "float", "bool"}:
                     return args[0] if args else 0
+                if name == "print":
+                    return None
                 # round, abs: forward
                 return getattr(args[0] if args else None, name)() if args else None
             if name == "slice":
