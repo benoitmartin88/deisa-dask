@@ -952,7 +952,25 @@ class _BoundaryWalker:
         attr = node.attr
         if isinstance(obj, _Missing):
             return _Missing(f"{obj.name}.{attr}")
-        return getattr(obj, attr)
+        try:
+            return getattr(obj, attr)
+        except AttributeError:
+            # The placeholder is a dask Array and the user's callback
+            # is reading a domain attribute we don't know about
+            # (e.g. ``window[-1].t`` on a DeisaArray wrapper that
+            # hasn't been resolved at registration time). Degrade to
+            # ``_Missing`` so f-string formatting and other open-world
+            # paths can still consume the result. The precompute
+            # analysis continues; the bridge will fall back to the
+            # full-chunk scatter for that callback.
+            logger.debug(
+                "attribute %r not present on %s at line %d; "
+                "treating the access as opaque.",
+                attr,
+                type(obj).__name__,
+                getattr(node, "lineno", -1),
+            )
+            return _Missing(f"<obj>.{attr}")
 
     # -- Calls: this is where compute boundaries are detected --------------
     def _call(self, node: ast.Call, scope: _Scope) -> Any:
