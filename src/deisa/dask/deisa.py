@@ -862,6 +862,7 @@ class Deisa(IDeisa):
         """
         from deisa.dask.branch import analyze_branch
         from deisa.dask.precompute_analyzer import PrecomputeError
+        from deisa.dask.utils import build_deisa_array
 
         # Build a dask array stub matching the registered array's shape/chunks
         # so the symbolic AST walker has something concrete to operate on.
@@ -874,6 +875,22 @@ class Deisa(IDeisa):
             stub = da.zeros(global_shape, chunks=chunks, dtype=np.float64)
         else:
             stub = da.zeros((10, 10), chunks=(5, 5), dtype=np.float64)
+
+        # Wrap the stub in a DeisaArray so the analyzer sees the same
+        # attribute surface as the runtime -- in particular ``.t`` and
+        # ``.timestep``, which the user's callback (and real-world
+        # callbacks like the gyselax diagnostics) read directly. Without
+        # this wrapper, ``window[-1].t`` raises AttributeError on the
+        # raw dask Array placeholder and the registration crashes; the
+        # analyzer would then have to fall back to ``_Missing``
+        # degradation, which loses structural information that the
+        # precompute chain might need.
+        #
+        # The stub itself is never executed -- only its task graph is
+        # read. The ``t=0`` timestep is arbitrary; the AST walker
+        # just needs the attribute to exist so attribute-access
+        # expressions like ``arr.t`` resolve cleanly.
+        stub = build_deisa_array(stub, timestep=0)
 
         try:
             return analyze_branch(
