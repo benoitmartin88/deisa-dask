@@ -519,12 +519,104 @@ class _WindowProxy:
 
 # ---------------------------------------------------------------------------
 # Boundary walker
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------
 # Functions we recognize as materialization (forbid precompute).
 _MATERIALIZING_FUNCS = {"array", "asarray", "save", "savetxt", "savez", "savez_compressed"}
 
 # Subset of dask/np submodules we recognize as returning a dask array.
 _DASK_RECURSE_SUBMODULES = {"fft"}
+
+# -----------------------------------------------------------------------
+# Effect-bearing bare names: calls that the analyzer MUST refuse because
+# they would either hit the dask scheduler (defeating precompute) or
+# perform I/O / mutation (outside the analyzer's purview). Anything
+# not in this set is either resolved as a dask reduction (sum/min/max),
+# a pure builtin, a registered helper, or treated as opaque (_Missing)
+# so analysis can continue.
+#
+# Note: ``compute`` / ``persist`` are not in this set because they are
+# only reached as ``arr.compute()`` -- a method call on a dask Array --
+# not as a bare name. The attribute-call branch already handles them.
+_EFFECT_BEARING_NAMES = frozenset({
+    # Dask control flow that bypasses precompute.
+    "compute",
+    "persist",
+    # I/O and process spawning -- never safe in an analytical walker.
+    "open",
+    "exec",
+    "eval",
+    "compile",
+    "input",
+    # ``getattr`` makes the AST opaque; the attribute-call branch
+    # already resolves ``obj.attr`` statically, so this is redundant
+    # and a common source of dynamic-dispatch bugs.
+    "getattr",
+    # We accept nested helper definitions via ``def``, but a lambda
+    # inside the callback is an opaque expression we cannot resolve.
+    # The user should extract it to a module-level helper.
+})
+
+
+# Pure-Python builtins that are always safe to call: they cannot reach
+# the dask scheduler and they do not mutate outer state. They are
+# resolved locally (no AST walk into their body) and the result is
+# returned to the analysis as a plain Python value.
+#
+# Each entry maps the builtin name to a callable that takes
+# ``(args, kwargs)`` and returns the resolved value. Missing keys
+# fall through to a generic resolver for type-conversion builtins.
+#
+# Pure builtins are tolerant of ``_Missing`` arguments: an opaque
+# argument propagates as ``_Missing`` so the surrounding analysis
+# can continue degrading to the full-chunk path. This is what makes
+# the analyzer open-world -- the user can call any builtin on a
+# sub-expression we couldn't resolve without breaking the analysis.
+def _safe_pure_call(fn, args, kwargs, default=None):
+    """Apply ``fn`` to args/kwargs, propagating ``_Missing`` instead of
+    raising when an argument is opaque. Any exception is caught and
+    returns ``_Missing`` so the analyzer stays open-world."""
+    if any(isinstance(a, _Missing) for a in args) or any(
+        isinstance(v, _Missing) for v in kwargs.values()
+    ):
+        return _Missing(f"{fn.__name__}(...)")
+    try:
+        return fn(*args, **kwargs)
+    except Exception:
+        return _Missing(f"{fn.__name__}(...)")
+
+
+_PURE_BUILTINS: dict = {
+    "len": lambda args, kwargs: _safe_pure_call(
+        lambda x: len(x), args, kwargs, default=0
+    ),
+    "int": lambda args, kwargs: _safe_pure_call(
+        lambda x: int(x), args, kwargs, default=0
+    ),
+    "float": lambda args, kwargs: _safe_pure_call(
+        lambda x: float(x), args, kwargs, default=0.0
+    ),
+    "bool": lambda args, kwargs: _safe_pure_call(
+        lambda x: bool(x), args, kwargs, default=False
+    ),
+    "abs": lambda args, kwargs: _safe_pure_call(
+        lambda x: abs(x), args, kwargs, default=None
+    ),
+    "round": lambda args, kwargs: _safe_pure_call(
+        round, args, kwargs, default=None
+    ),
+    "print": lambda args, kwargs: None,  # void -- always safe
+    "slice": lambda args, kwargs: _safe_pure_call(
+        slice, args, kwargs, default=slice(None)
+    ),
+    "tuple": lambda args, kwargs: _safe_pure_call(
+        lambda x: tuple(x) if isinstance(x, (list, tuple)) else tuple(x) if x is not None else (),
+        args, kwargs, default=()
+    ),
+    "list": lambda args, kwargs: _safe_pure_call(
+        lambda x: list(x) if isinstance(x, (list, tuple)) else list(x) if x is not None else [],
+        args, kwargs, default=[]
+    ),
+}
 
 
 class _BoundaryWalker:
@@ -949,49 +1041,62 @@ class _BoundaryWalker:
         # ---- bare-name calls ----
         if isinstance(func, ast.Name):
             name = func.id
-            if name in {"da", "np", "dask_array"}:
-                raise IncompatibleCallbackError(f"Calling {name}() directly is not supported at line {node.lineno}")
-            if name in {"sum", "min", "max", "abs", "round", "len", "int", "float", "bool", "print"}:
+
+            # 1. Effect-bearing names are always refused with a clear
+            #    error -- they would either hit the scheduler
+            #    (defeating precompute) or perform I/O / mutation
+            #    outside the analyzer's purview.
+            if name in _EFFECT_BEARING_NAMES:
+                raise IncompatibleCallbackError(
+                    f"Calling {name}() at line {node.lineno} is not supported: "
+                    f"this call would bypass precompute or perform side effects "
+                    f"the analyzer cannot reason about."
+                )
+
+            # 2. Dask reduction builtins -- the analyzer detects these
+            #    specifically because the resulting dask Array is the
+            #    target of precompute analysis. They must be called as
+            #    bare names (``sum(arr)``) or as methods (``arr.sum()``)
+            #    on a dask array.
+            if name in {"sum", "min", "max"}:
                 args = [self._eval(a, scope) for a in node.args]
                 kwargs = self._eval_kwargs(node.keywords, scope)
-                if name == "sum" and args and isinstance(args[0], da.Array):
-                    return args[0].sum(**kwargs)
-                if name == "min" and args and isinstance(args[0], da.Array):
-                    return args[0].min(**kwargs)
-                if name == "max" and args and isinstance(args[0], da.Array):
-                    return args[0].max(**kwargs)
-                if name == "len":
-                    return len(args[0]) if args else 0
-                if name in {"int", "float", "bool"}:
-                    return args[0] if args else 0
-                if name == "print":
-                    return None
-                # round, abs: forward
-                return getattr(args[0] if args else None, name)() if args else None
-            if name == "slice":
-                args = [self._eval(a, scope) for a in node.args]
-                return slice(*args)
-            if name == "tuple":
-                args = [self._eval(a, scope) for a in node.args]
-                if len(args) == 1 and isinstance(args[0], (list, tuple)):
-                    return tuple(args[0])
-                return tuple(args)
-            if name == "list":
-                args = [self._eval(a, scope) for a in node.args]
-                if len(args) == 1 and isinstance(args[0], (list, tuple)):
-                    return list(args[0])
-                return list(args)
-            if name == "getattr":
-                raise IncompatibleCallbackError(f"getattr() is not supported at line {node.lineno}")
+                if args and isinstance(args[0], da.Array):
+                    return getattr(args[0], name)(**kwargs)
+                # Non-dask first arg: degrade to a plain Python call so
+                # analysis continues (e.g. ``sum([1, 2, 3])`` in a helper).
+                py_fn = {"sum": sum, "min": min, "max": max}[name]
+                return py_fn(*args, **kwargs) if args else None
 
-            # User-defined helper (same file or registered)
+            # 3. Pure Python builtins -- always safe (cannot reach the
+            #    scheduler, cannot mutate outer state). Resolved
+            #    locally; the result is a plain Python value.
+            if name in _PURE_BUILTINS:
+                args = [self._eval(a, scope) for a in node.args]
+                kwargs = self._eval_kwargs(node.keywords, scope)
+                return _PURE_BUILTINS[name](args, kwargs)
+
+            # 4. User-defined helper (same file or registered). The
+            #    walker descends into the helper's body recursively.
             helper_def = self.source_file.find_function(name)
             if helper_def is not None:
                 return self._call_helper(helper_def, node, scope)
-            raise IncompatibleCallbackError(
-                f"Cannot resolve function {name!r} at line {node.lineno}: "
-                "not defined in source and not a known dask/np op"
+
+            # 5. Unknown bare name -- treat as opaque (_Missing) so
+            #    analysis can continue. This is the **default** for
+            #    anything the analyzer doesn't recognize: logging
+            #    calls, custom modules, etc. The callback may still
+            #    produce a result (the bridge falls back to the full
+            #    chunk scatter path for that callback), but it does
+            #    not fail the registration.
+            logger.debug(
+                "bare-name %r at line %d is opaque to the analyzer; "
+                "the surrounding call is treated as a non-precompute "
+                "boundary.",
+                name,
+                node.lineno,
             )
+            return _Missing(f"{name}(...)")
 
         # obj.method() where obj is a complex expression
         if isinstance(func, ast.Attribute):
