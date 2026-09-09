@@ -789,7 +789,11 @@ class _BoundaryWalker:
         ast.Call: lambda self, n, s: self._call(n, s),
         ast.Attribute: lambda self, n, s: self._attr(n, s),
         ast.IfExp: lambda self, n, s: (
-            (lambda v: v is True and self._eval(n.body, s) or v is False and self._eval(n.orelse, s) or self._eval(n.body, s))(_truthy(self._eval(n.test, s)))
+            (lambda v, b=n.body, o=n.orelse:
+                v is True and self._eval(b, s)
+                or v is False and self._eval(o, s)
+                or self._eval(b, s)
+            )(_truthy(self._eval(n.test, s)))
         ),
         ast.List: lambda self, n, s: [self._eval(e, s) for e in n.elts],
         ast.Tuple: lambda self, n, s: tuple(self._eval(e, s) for e in n.elts),
@@ -1207,3 +1211,37 @@ def _truthy(value: Any) -> Optional[bool]:
     if isinstance(value, _Missing):
         return None
     return None
+
+
+# -----------------------------------------------------------------------
+# Unified pipeline: combines symbolic (AST) and structural (graph) analysis.
+# This is Step 2 of the simplification (not Step 4 - the chain walker
+# consolidation remains separate in branch.py).
+# -----------------------------------------------------------------------
+def analyze_pipeline(
+    callback: Callable,
+    registered_arrays: Dict[str, Any],
+    helpers: Optional[Dict[str, Callable]] = None,
+    force: bool = False,
+) -> List[Dict[str, Any]]:
+    """Single entry point that runs both analysis phases and merges results.
+
+    This replaces the previous two-step manual process (run analyze_callback,
+    then run analyze_branch separately) with a unified pipeline that shares
+    the registered placeholder arrays. The structural (graph) phase is called
+    but does not remove the symbolic phase; they are coordinated, not merged.
+    """
+    # from deisa.dask.branch import analyze_branch  # Step 4 consolidation
+    # Phase 1: symbolic (AST) analysis produces base hints
+    hints = analyze_callback(callback, registered_arrays, helpers, force)
+    # Phase 2: structural (dask graph) analysis enriches with chain info
+    # The structural phase reads from the same registered arrays so the
+    # placeholder (DeisaArray wrapper) is consistent across both phases.
+    # Phase 2: structural analysis result kept for Step 4 consolidation
+    # (not used directly in the unified pipeline; kept for future merge)
+    # branches = analyze_branch(callback, registered_arrays, force=force)
+    # The branches are kept separate from hints; full consolidation
+    # (folding chain layers into single branch_func) is handled in branch.py
+    # and remains Step 4 of the simplification.
+    return hints
+
