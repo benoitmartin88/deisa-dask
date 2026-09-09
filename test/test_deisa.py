@@ -412,6 +412,14 @@ class TestUsingDaskCluster:
             self.check_array("temperature", state, i, expected)
             assert state["map_block"] == i * state["temperature"][-1].npartitions, "map_block function was not called"
 
+    @pytest.mark.filterwarnings("error")
+    @pytest.mark.timeout(30)
+    @pytest.mark.parametrize("temperature_global_grid_size", [(8, 8)])
+    @pytest.mark.parametrize("temperature_window_size", [None, 1, 3])
+    @pytest.mark.parametrize("pressure_global_grid_size", [(8, 8)])
+    @pytest.mark.parametrize("pressure_window_size", [None, 1])
+    @pytest.mark.parametrize("mpi_parallelism", [(2, 2)])
+    @pytest.mark.parametrize("nb_iterations", [1, 10])
     @pytest.mark.parametrize(
         "register_fn",
         [
