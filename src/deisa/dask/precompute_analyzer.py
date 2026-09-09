@@ -786,7 +786,7 @@ class _BoundaryWalker:
         ast.Subscript: lambda self, n, s: self._apply_subscript(
             self._eval(n.value, s), self._slice(n.slice, s)
         ),
-        ast.Call: lambda self, n, s: self._call(n, s),
+        ast.Call: lambda self, n, s: (self._call_map_blocks(n, s) if self._is_map_blocks_call(n) else self._call(n, s)),
         ast.Attribute: lambda self, n, s: self._attr(n, s),
         ast.IfExp: lambda self, n, s: (
             (lambda v, b=n.body, o=n.orelse:
@@ -968,6 +968,20 @@ class _BoundaryWalker:
             return _Missing(f"<obj>.{attr}")
 
     # -- Calls: this is where compute boundaries are detected --------------
+    def _is_map_blocks_call(self, node: ast.Call) -> bool:
+        # Detect ``arr.map_blocks(...)`` method calls for MapBlocks fixtures
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "map_blocks":
+            return True
+        return False
+
+    def _call_map_blocks(self, node: ast.Call, scope: _Scope) -> Any:
+        # .map_blocks produces a new dask array (opaque to reductions);
+        # evaluate the array operand to propagate the dask expression,
+        # then return a synthetic placeholder array.
+        obj = self._eval(node.func.value, scope) if isinstance(node.func, ast.Attribute) else None
+        # Return _Missing for opaque propagation, or a synthetic array if obj is available
+        return obj if obj is not None else _Missing("map_blocks")
+
     def _call(self, node: ast.Call, scope: _Scope) -> Any:
         func = node.func
 

@@ -392,6 +392,33 @@ class TestUsingDaskCluster:
     @pytest.mark.parametrize("pressure_window_size", [None, 1])
     @pytest.mark.parametrize("mpi_parallelism", [(2, 2)])
     @pytest.mark.parametrize("nb_iterations", [1, 10])
+
+    class MapBlocks(RegisterAndCheck):
+        def register_cb(self, state, deisa, expected_window_size: dict[str, int | None]):
+            def map_block_function(block, block_info=None):
+                return np.array([[1]])
+
+            @deisa.register(
+                Window("temperature", size=expected_window_size["temperature"])
+                if expected_window_size["temperature"]
+                else "temperature",
+                exception_handler=self.exception_handler,
+            )
+            def cb(temperature: List[DeisaArray]):
+                meta = np.array([[0]])
+                res = temperature[-1].map_blocks(map_block_function, dtype=int, meta=meta).compute()
+
+                if "map_block" not in state:
+                    state["map_block"] = 0
+
+                state["map_block"] += res.sum()
+                state["temperature"] = temperature
+                state["counter"] += 1
+
+        def check(self, state, i, expected):
+            self.check_array("temperature", state, i, expected)
+            assert state["map_block"] == i * state["temperature"][-1].npartitions, "map_block function was not called"
+
     @pytest.mark.parametrize(
         "register_fn",
         [
@@ -400,14 +427,7 @@ class TestUsingDaskCluster:
             SingleArrayNameDecorator(),
             TwoArrayNameDecorator(),
             ThreeArrayNameDecoratorSlow(),
-            # NOTE: MapBlocks was removed from the parametrize in
-            # 2026-09 with the precompute=True removal. MapBlocks
-            # uses ``map_blocks`` which the AST walker cannot
-            # currently handle -- it raises
-            # IncompatibleCallbackError (force=True catches it,
-            # but in the test fixture's post-Deisa state, the
-            # analysis deadlocks). Re-add when map_blocks is
-            # supported by the analyzer.
+            MapBlocks(),
         ],
     )
     def test_register_callback(
