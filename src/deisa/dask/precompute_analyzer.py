@@ -825,6 +825,14 @@ class _BoundaryWalker:
                 else:
                     parts.append(self._eval(v, scope))
             return "".join(parts)
+        if isinstance(node, ast.Assert):
+            # Assert expressions don't feed the data flow; they're only
+            # runtime checks. Evaluate the test for completeness (it may
+            # reference tracked arrays) but discard the result so the
+            # analysis continues. This avoids the previous behavior where
+            # ``assert`` raised "Unsupported expression: Assert".
+            self._eval(node.test, scope)
+            return None
         if isinstance(node, ast.Starred):
             return self._eval(node.value, scope)
         raise IncompatibleCallbackError(
