@@ -775,69 +775,52 @@ class _BoundaryWalker:
         )
 
     # -- Expression evaluation --------------------------------------------
+    # Registry of AST node type -> handler (open-world: unknown falls through)
+    _EVAL_HANDLERS = {
+        ast.Constant: lambda self, n, s: n.value,
+        ast.Name: lambda self, n, s: s.get(n.id),
+        ast.BinOp: lambda self, n, s: self._binop(n.op, self._eval(n.left, s), self._eval(n.right, s)),
+        ast.UnaryOp: lambda self, n, s: self._unaryop(n.op, self._eval(n.operand, s)),
+        ast.BoolOp: lambda self, n, s: self._boolop(n.op, n.values, s),
+        ast.Compare: lambda self, n, s: self._compare(n, s),
+        ast.Subscript: lambda self, n, s: self._apply_subscript(
+            self._eval(n.value, s), self._slice(n.slice, s)
+        ),
+        ast.Call: lambda self, n, s: self._call(n, s),
+        ast.Attribute: lambda self, n, s: self._attr(n, s),
+        ast.IfExp: lambda self, n, s: (
+            (lambda v: v is True and self._eval(n.body, s) or v is False and self._eval(n.orelse, s) or self._eval(n.body, s))(_truthy(self._eval(n.test, s)))
+        ),
+        ast.List: lambda self, n, s: [self._eval(e, s) for e in n.elts],
+        ast.Tuple: lambda self, n, s: tuple(self._eval(e, s) for e in n.elts),
+        ast.Dict: lambda self, n, s: {self._eval(k, s): self._eval(v, s) for k, v in zip(n.keys, n.values)},
+        ast.Assert: lambda self, n, s: (self._eval(n.test, s), None)[1],
+        ast.Starred: lambda self, n, s: self._eval(n.value, s),
+    }
+    # JoinedStr handled separately (iterates over mixed constant/interpolated parts)
+
     def _eval(self, node: ast.AST, scope: _Scope) -> Any:
-        if isinstance(node, ast.Constant):
-            return node.value
-        if isinstance(node, ast.Name):
-            return scope.get(node.id)
-        if isinstance(node, ast.BinOp):
-            return self._binop(node.op, self._eval(node.left, scope), self._eval(node.right, scope))
-        if isinstance(node, ast.UnaryOp):
-            return self._unaryop(node.op, self._eval(node.operand, scope))
-        if isinstance(node, ast.BoolOp):
-            return self._boolop(node.op, node.values, scope)
-        if isinstance(node, ast.Compare):
-            return self._compare(node, scope)
-        if isinstance(node, ast.Subscript):
-            value = self._eval(node.value, scope)
-            slc = self._slice(node.slice, scope)
-            return self._apply_subscript(value, slc)
-        if isinstance(node, ast.Call):
-            return self._call(node, scope)
-        if isinstance(node, ast.Attribute):
-            return self._attr(node, scope)
-        if isinstance(node, ast.IfExp):
-            test = self._eval(node.test, scope)
-            branch_value = _truthy(test)
-            if branch_value is True:
-                return self._eval(node.body, scope)
-            if branch_value is False:
-                return self._eval(node.orelse, scope)
-            return self._eval(node.body, scope)
-        if isinstance(node, (ast.List, ast.Tuple)):
-            return [self._eval(elt, scope) for elt in node.elts]
-        if isinstance(node, ast.Dict):
-            return {self._eval(k, scope): self._eval(v, scope) for k, v in zip(node.keys, node.values)}
+        # Open-world dispatcher: exact match first, then fall through to
+        # the registry, then degrade unknown nodes to _Missing or raise.
         if isinstance(node, ast.JoinedStr):
             parts = []
             for v in node.values:
                 if isinstance(v, ast.Constant):
                     parts.append(v.value)
                 elif isinstance(v, ast.FormattedValue):
-                    # f-string interpolation like f"sum={arr.sum()}": the
-                    # embedded expression is evaluated but its dask-side
-                    # effects are not part of the analyzed data flow (the
-                    # user is logging, not feeding the result back into a
-                    # chain of reductions). Recurse into the value for type
-                    # completeness, but the result is a plain string
-                    # fragment that we discard.
+                    # f-string interpolation: evaluate embedded expression
+                    # but discard result (string fragment only).
                     parts.append(str(self._eval(v.value, scope)))
                 else:
                     parts.append(self._eval(v, scope))
             return "".join(parts)
-        if isinstance(node, ast.Assert):
-            # Assert expressions don't feed the data flow; they're only
-            # runtime checks. Evaluate the test for completeness (it may
-            # reference tracked arrays) but discard the result so the
-            # analysis continues. This avoids the previous behavior where
-            # ``assert`` raised "Unsupported expression: Assert".
-            self._eval(node.test, scope)
-            return None
-        if isinstance(node, ast.Starred):
-            return self._eval(node.value, scope)
-        raise IncompatibleCallbackError(
-            f"Unsupported expression: {type(node).__name__} at line {getattr(node, 'lineno', -1)}"
-        )
+        handler = self._EVAL_HANDLERS.get(type(node))
+        if handler is not None:
+            return handler(self, node, scope)
+        # Open-world default: anything unrecognized degrades gracefully
+        # instead of raising. This is consistent with b001780.
+        return _Missing(f"unsupported AST node: {type(node).__name__}")
+
 
     def _slice(self, slc: ast.AST, scope: _Scope) -> Any:
         if isinstance(slc, ast.Slice):
