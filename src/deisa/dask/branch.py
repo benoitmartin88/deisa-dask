@@ -40,7 +40,7 @@ reduction's combine aggregator. Stage 3 will fold multi-layer chains
 into length->=2 branches; the data structure below is designed to
 support that without further changes.
 
-The structure mirrors the prior per-reduction hint metadata
+The structure mirrors the prior per-reduction branch metadata
 (``kind`` / ``finalize`` / ``shape`` / ``dtype`` / ``chunk_axis``) so
 the bridge and Deisa-side combine code paths can be refactored to
 consume :class:`BranchSpec` directly without changing semantics.
@@ -92,7 +92,7 @@ class BranchSpec:
         Python callable that, given a numpy chunk, returns the branch's
         per-bridge partial value (a scalar / ndarray / dict). Pickled
         across the bridge process boundary. Currently a length-1
-        callable (``chunk_func`` from the prior hint); Stage 3 may
+        callable (``chunk_func`` from the prior branch); Stage 3 may
         produce multi-callable composites.
     chunk_axis : Optional[Tuple[int, ...]]
         For reductions, the tuple of axes being reduced in the chunk
@@ -186,17 +186,17 @@ def _make_branch_func(chunk_func: Callable, chunk_kwargs: Dict[str, Any]) -> Cal
     return _functools.partial(_branch_func_with_kwargs, _cf=chunk_func, _kw=chunk_kwargs)
 
 
-def build_branch_from_hint(
-    hint: Dict[str, Any],
+def build_branch_from_dict(
+    branch: Dict[str, Any],
     chunk_func: Callable[[Any], Any],
     input_name: str,
     array_ndim: int,
     placeholder: Optional[Any] = None,
 ) -> BranchSpec:
-    """Build a :class:`BranchSpec` from a per-reduction hint dict.
+    """Build a :class:`BranchSpec` from a per-reduction branch dict.
 
     For Stage 2A, the branch_func is the same length-1 chunk_func the
-    hint already carries. The BranchSpec re-exposes the hint's
+    branch already carries. The BranchSpec re-exposes the branch's
     ``kind``/``finalize``/``shape``/``dtype`` metadata in the
     structured form the bridge and Deisa side will consume.
 
@@ -214,12 +214,12 @@ def build_branch_from_hint(
     reduced-axes pattern).
     """
 
-    kind = hint.get("kind", _BRANCH_KIND_SCALAR)
-    finalize = hint.get("finalize")
+    kind = branch.get("kind", _BRANCH_KIND_SCALAR)
+    finalize = branch.get("finalize")
 
-    # Reconstruct chunk_axis from chunk_kwargs['axis']. The hint carries
+    # Reconstruct chunk_axis from chunk_kwargs['axis']. The branch carries
     # ``axis`` as a tuple/list/int; normalise to a tuple of ints.
-    chunk_kwargs = hint.get("chunk_kwargs") or {}
+    chunk_kwargs = branch.get("chunk_kwargs") or {}
     ax = chunk_kwargs.get("axis")
     if isinstance(ax, (list, tuple)):
         chunk_axis = tuple(int(a) for a in ax)
@@ -249,16 +249,16 @@ def build_branch_from_hint(
     branch_func = _make_branch_func(chunk_func, effective_kwargs)
 
     if placeholder is None:
-        # Fallback: best-effort shape from hint metadata. The hint's
+        # Fallback: best-effort shape from branch metadata. The branch's
         # ``shape`` field is not populated by the analyzer; only the
         # bridge records it after running the chunk_func. We try to
         # recover it from ``keepdims`` + ``chunk_axis`` + the chunk's
-        # shape (which the hint doesn't carry either). Without a
+        # shape (which the branch doesn't carry either). Without a
         # placeholder we can't compute shape reliably, so we leave it
         # as ``()`` and let the bridge's run-time inspection overwrite
         # it.
-        partial_shape: Tuple[int, ...] = tuple(hint.get("shape") or ())
-        partial_dtype = str(hint.get("dtype", "float64"))
+        partial_shape: Tuple[int, ...] = tuple(branch.get("shape") or ())
+        partial_dtype = str(branch.get("dtype", "float64"))
     else:
         sample = branch_func(placeholder)
         if isinstance(sample, dict):
@@ -283,7 +283,7 @@ def build_branch_from_hint(
 
     return BranchSpec(
         input_name=input_name,
-        output_key=hint["output_key"],
+        output_key=branch["output_key"],
         output_kind=kind,
         branch_func=branch_func,
         chunk_axis=chunk_axis,
@@ -295,17 +295,17 @@ def build_branch_from_hint(
     )
 
 
-def branch_to_hint(branch: BranchSpec) -> Dict[str, Any]:
-    """Convert a BranchSpec back to the legacy per-reduction hint dict.
+def branch_to_dict(branch: BranchSpec) -> Dict[str, Any]:
+    """Convert a BranchSpec back to the legacy per-reduction branch dict.
 
     Used as a backward-compat shim for callers that haven't migrated
     to BranchSpec yet. The returned dict has the same schema as
-    :func:`deisa.dask.task_hints.extract_reduction_hints` (modulo the
+    :func:`deisa.dask.task_branches.extract_reduction_hints` (modulo the
     addition of ``kind``, ``finalize``, ``chunk_axis``, ``shape``,
     ``dtype``).
 
     For Stage 2A the conversion is lossless because BranchSpec is a
-    superset of the hint fields. Stage 3 will lose information when
+    superset of the branch fields. Stage 3 will lose information when
     folding multi-layer chains.
     """
     import pickle as _pickle
@@ -326,21 +326,21 @@ def branch_to_hint(branch: BranchSpec) -> Dict[str, Any]:
     }
 
 
-def hint_to_branch(
-    hint: Dict[str, Any], input_name: str, array_ndim: int, placeholder: Optional[Any] = None
+def dict_to_branch(
+    branch: Dict[str, Any], input_name: str, array_ndim: int, placeholder: Optional[Any] = None
 ) -> BranchSpec:
-    """Convert a legacy per-reduction hint dict into a BranchSpec.
+    """Convert a legacy per-reduction branch dict into a BranchSpec.
 
-    Inverse of :func:`branch_to_hint`. Used by the bridge to convert
+    Inverse of :func:`branch_to_dict`. Used by the bridge to convert
     legacy stored hints on the HandshakeActor (kept for backward compat
-    with the prior hint-based registration path) into BranchSpec
+    with the prior branch-based registration path) into BranchSpec
     instances.
     """
     import pickle as _pickle
 
-    chunk_func = _pickle.loads(hint["chunk_func_pickle"])
-    return build_branch_from_hint(
-        hint=hint,
+    chunk_func = _pickle.loads(branch["chunk_func_pickle"])
+    return build_branch_from_dict(
+        branch=branch,
         chunk_func=chunk_func,
         input_name=input_name,
         array_ndim=array_ndim,
@@ -356,8 +356,8 @@ def analyze_branch(
     """Walk the callback's dask graph and emit a :class:`BranchSpec` per
     branch.
 
-    Stage 2B implementation: every reduction hint becomes one
-    :class:`BranchSpec`. For each hint, the chain walker (``_walk_chain``)
+    Stage 2B implementation: every reduction branch becomes one
+    :class:`BranchSpec`. For each branch, the chain walker (``_walk_chain``)
     inspects the registered dask array's task graph and, if the
     reduction's chunk-stage has a single-input upstream chain of
     pointwise layers, **folds the chain into one branch** -- the
@@ -366,7 +366,7 @@ def analyze_branch(
     workers to re-run the chunk-stage pointwise chain.
 
     Folding is opportunistic. If ``_walk_chain`` returns ``None`` for a
-    hint (cross-array upstream, scalar constant, non-Blockwise
+    branch (cross-array upstream, scalar constant, non-Blockwise
     upstream, etc.) the branch degrades to the length-1 path: just the
     reduction's chunk_func. That's still a correct optimization -- the
     chain walker only adds coverage, it never removes it.
@@ -436,7 +436,7 @@ def analyze_branch(
             dask_arr_for_chain = candidate
 
     # The chain walker folds multi-layer pointwise chains into one
-    # branch_func. We dedupe chains per-hint: a chain is unique by its
+    # branch_func. We dedupe chains per-branch: a chain is unique by its
     # (agg-layer-name, length). Multiple hints can share the same chain
     # (e.g. ``(arr**2).sum()`` and ``(arr**2).max()``); the walker
     # builds the same branch_func either way. ``_seen_chains`` keeps a
@@ -444,12 +444,12 @@ def analyze_branch(
     _seen_chains: Dict[Tuple[str, int], Any] = {}
 
     branches: List[BranchSpec] = []
-    for hint in hints:
+    for branch in hints:
         try:
-            chunk_func = _pickle.loads(hint["chunk_func_pickle"])
+            chunk_func = _pickle.loads(branch["chunk_func_pickle"])
         except Exception as e:  # pragma: no cover - safety net
             if force:
-                logger.warning("analyze_branch: unpickle failed for %s: %s", hint.get("output_key"), e)
+                logger.warning("analyze_branch: unpickle failed for %s: %s", branch.get("output_key"), e)
                 continue
             raise
 
@@ -476,7 +476,7 @@ def analyze_branch(
                     placeholder = np.zeros((4, 4), dtype=np.float64)
 
         branch = _try_chain_branch(
-            hint=hint,
+            branch=branch,
             chunk_func=chunk_func,
             primary=primary,
             array_ndim=array_ndim,
@@ -487,7 +487,7 @@ def analyze_branch(
         if branch is None:
             # Chain walker refused; fall back to the length-1 path.
             branch = _try_length1_branch(
-                hint=hint,
+                branch=branch,
                 chunk_func=chunk_func,
                 primary=primary,
                 array_ndim=array_ndim,
@@ -497,28 +497,28 @@ def analyze_branch(
             if force:
                 logger.debug(
                     "analyze_branch: build failed for %s; "
-                    "the length-1 path's build_branch_from_hint raised "
+                    "the length-1 path's build_branch_from_dict raised "
                     "(most likely the placeholder couldn't be computed "
                     "or the chunk_func rejected the chunk shape).",
-                    hint.get("output_key"),
+                    branch.get("output_key"),
                 )
                 continue
             # Both paths returned None -- this shouldn't happen for
             # hints that came out of the analyzer (the length-1 path is
             # supposed to always succeed). Raise defensively.
             raise RuntimeError(
-                f"analyze_branch: cannot build branch for hint {hint.get('output_key')!r}. "
+                f"analyze_branch: cannot build branch for branch {branch.get('output_key')!r}. "
                 f"The chain walker refused (likely cross-array or constant "
-                f"upstream) AND the length-1 fallback's build_branch_from_hint "
+                f"upstream) AND the length-1 fallback's build_branch_from_dict "
                 f"raised. This usually means the chunk_func rejected the "
-                f"placeholder. Inspect with the failing hint's chunk_kwargs."
+                f"placeholder. Inspect with the failing branch's chunk_kwargs."
             )
         branches.append(branch)
     return branches
 
 
 def _try_chain_branch(
-    hint: Dict[str, Any],
+    branch: Dict[str, Any],
     chunk_func: Callable,
     primary: str,
     array_ndim: int,
@@ -526,7 +526,7 @@ def _try_chain_branch(
     dask_arr_for_chain: Optional[Any],
     seen_chains: Dict[Tuple[str, int], Any],
 ) -> Optional[BranchSpec]:
-    """Try to fold the hint's reduction into a chain-folded BranchSpec.
+    """Try to fold the branch's reduction into a chain-folded BranchSpec.
 
     Returns ``None`` if the registered array has no dask graph (no
     chain to walk) or if ``_walk_chain`` refuses to fold (cross-array,
@@ -536,7 +536,7 @@ def _try_chain_branch(
     if dask_arr_for_chain is None:
         return None
     graph = dask_arr_for_chain.__dask_graph__()
-    # Find the aggregate layer name from the hint's chunk_kwargs.
+    # Find the aggregate layer name from the branch's chunk_kwargs.
     # ``extract_reduction_hints`` stores the agg-layer name implicitly
     # via the chunk_func's identity; for chain walking we need the
     # explicit aggregate layer name. Walk the graph looking for any
@@ -559,7 +559,7 @@ def _try_chain_branch(
         seen_chains[chain_key] = chain_branch_func
     try:
         return _build_chain_branch(
-            hint=hint,
+            branch=branch,
             chain=chain,
             input_name=primary,
             array_ndim=array_ndim,
@@ -571,22 +571,22 @@ def _try_chain_branch(
 
 
 def _try_length1_branch(
-    hint: Dict[str, Any],
+    branch: Dict[str, Any],
     chunk_func: Callable,
     primary: str,
     array_ndim: int,
     placeholder: Optional[Any],
 ) -> Optional[BranchSpec]:
-    """Build a length-1 BranchSpec from a per-reduction hint.
+    """Build a length-1 BranchSpec from a per-reduction branch.
 
-    The branch_func is the hint's chunk_func wrapped in a
+    The branch_func is the branch's chunk_func wrapped in a
     pickle-friendly closure (``_make_branch_func``) that binds the
     chunk_kwargs (axis, keepdims, dtype, ...). The bridge calls this
     branch_func with just the chunk and no extra kwargs.
     """
     try:
-        return build_branch_from_hint(
-            hint=hint,
+        return build_branch_from_dict(
+            branch=branch,
             chunk_func=chunk_func,
             input_name=primary,
             array_ndim=array_ndim,
@@ -599,10 +599,10 @@ def _try_length1_branch(
         # dtype, or the placeholder is itself a dask array (because
         # .compute() silently failed upstream).
         logger.debug(
-            "_try_length1_branch: build_branch_from_hint raised for %s "
+            "_try_length1_branch: build_branch_from_dict raised for %s "
             "with chunk_kwargs=%r, array_ndim=%d, placeholder=%r: %s",
-            hint.get("output_key"),
-            hint.get("chunk_kwargs"),
+            branch.get("output_key"),
+            branch.get("chunk_kwargs"),
             array_ndim,
             type(placeholder).__name__ if placeholder is not None else None,
             e,
@@ -778,18 +778,18 @@ def _chain_branch_func(chunk, _chain=None):
 
 
 def _build_chain_branch(
-    hint: Dict[str, Any],
+    branch: Dict[str, Any],
     chain: List[Tuple[Callable, dict, int]],
     input_name: str,
     array_ndim: int,
     placeholder: Optional[Any] = None,
     chain_branch_func: Optional[Callable] = None,
 ) -> BranchSpec:
-    """Build a chain-folded :class:`BranchSpec` from a hint and a
+    """Build a chain-folded :class:`BranchSpec` from a branch and a
     layer chain.
 
     The chain's ``branch_func`` is the composition of the layer
-    funcs (root-to-chunk-stage). The hint provides the reduction's
+    funcs (root-to-chunk-stage). The branch provides the reduction's
     ``kind``/``finalize``/``chunk_axis`` metadata; ``keepdims=True``
     is forced for mean/moment (same as the length-1 path).
 
@@ -797,10 +797,10 @@ def _build_chain_branch(
     it directly instead of rebuilding. Otherwise build a fresh
     callable from ``chain``.
     """
-    kind = hint.get("kind", _BRANCH_KIND_SCALAR)
-    finalize = hint.get("finalize")
+    kind = branch.get("kind", _BRANCH_KIND_SCALAR)
+    finalize = branch.get("finalize")
 
-    ck = hint.get("chunk_kwargs") or {}
+    ck = branch.get("chunk_kwargs") or {}
     ax = ck.get("axis")
     if isinstance(ax, (list, tuple)):
         chunk_axis = tuple(int(a) for a in ax)
@@ -817,8 +817,8 @@ def _build_chain_branch(
         chain_branch_func = _build_chain_branch_func(chain)
 
     if placeholder is None:
-        partial_shape: Tuple[int, ...] = tuple(hint.get("shape") or ())
-        partial_dtype = str(hint.get("dtype", "float64"))
+        partial_shape: Tuple[int, ...] = tuple(branch.get("shape") or ())
+        partial_dtype = str(branch.get("dtype", "float64"))
     else:
         sample = chain_branch_func(placeholder)
         if isinstance(sample, dict):
@@ -840,7 +840,7 @@ def _build_chain_branch(
 
     return BranchSpec(
         input_name=input_name,
-        output_key=hint["output_key"],
+        output_key=branch["output_key"],
         output_kind=kind,
         branch_func=chain_branch_func,
         chunk_axis=chunk_axis,
@@ -857,11 +857,11 @@ def extract_reduction_hints_from_callback(
     registered_arrays: Dict[str, Any],
     force: bool = False,
 ) -> List[Dict[str, Any]]:
-    """Wrapper around the legacy analyzer that returns the raw hint list.
+    """Wrapper around the legacy analyzer that returns the raw branch list.
 
     The legacy ``analyze_callback`` does two things: walks the AST to
     detect compute boundaries, then walks the resulting dask graphs to
-    extract reduction hints. We only need the hint list here, but the
+    extract reduction hints. We only need the branch list here, but the
     AST walk is required to find the dask arrays in the first place.
     For Stage 2A we delegate to the legacy entry point and discard the
     AST-walk side effects (it has no externally observable effects

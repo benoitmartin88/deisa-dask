@@ -31,10 +31,10 @@ Extract reduction hints from a dask array's task graph.
 
 Given a dask array whose graph contains reductions (sum, mean, std, var, max,
 min, prod), walk the graph layers to find the aggregate layer and the matching
-chunk layer, then build a hint dict the bridge can execute on a local numpy
+chunk layer, then build a branch dict the bridge can execute on a local numpy
 chunk before scattering.
 
-Hint schema (the contract between the analytics side (precompute analyzer) and
+branch schema (the contract between the analytics side (precompute analyzer) and
 the bridge side (local chunk execution)):
 
 .. code-block:: python
@@ -286,7 +286,7 @@ def _chunk_func_and_kwargs(chunk_layer) -> Optional[tuple]:
 
 
 # ---------------------------------------------------------------------------
-# Hint extraction
+# branch extraction
 # ---------------------------------------------------------------------------
 def _find_chunk_layer(graph, agg_base: str) -> Optional[str]:
     """Locate the chunk layer that feeds the aggregate layer with the given base.
@@ -413,12 +413,12 @@ def _blockwise_upstream_layer_names(layer) -> List[str]:
 
 
 def extract_reduction_hints(darr: da.Array, array_name: str = "f") -> List[Dict[str, Any]]:
-    """Inspect ``darr``'s task graph and return a hint dict per reduction.
+    """Inspect ``darr``'s task graph and return a branch dict per reduction.
 
     - ``:param darr:`` A dask array whose graph contains at least one reduction
       (typically built symbolically by ``deisa.dask.precompute_analyzer``).
     - ``:param array_name:`` Base name for the reduction output keys.
-    - ``:return:`` List of hint dicts matching the schema above.
+    - ``:return:`` List of branch dicts matching the schema above.
 
     Note: this walks the graph but never executes any task; the dask arrays
     used at analysis time are zero-filled placeholders, and we don't run them.
@@ -439,7 +439,7 @@ def extract_reduction_hints(darr: da.Array, array_name: str = "f") -> List[Dict[
     # precompute per-bridge partials. We do this once per dask array
     # (not per aggregate layer) so a single cross-reduction expression
     # produces zero hints rather than zero hints for the inner + a
-    # wrong hint for the outer.
+    # wrong branch for the outer.
     for layer_name in list(graph.layers):
         if not _is_aggregate_layer(layer_name):
             continue
