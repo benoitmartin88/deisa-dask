@@ -419,7 +419,7 @@ class Deisa(IDeisa):
 
             branches = self._analyze_callback_for_branches(callback, array_name, force=force)
             if branches:
-                self.handshake.set_task_hints(array_name, branches)
+                self.handshake.set_task_branches(array_name, branches)
             elif not force:
                 logger.debug(
                     f"_register_callback_impl: callback {callback.__name__!r} produced "
@@ -440,7 +440,7 @@ class Deisa(IDeisa):
                 )
             # else: force=True with no branches -- the analyzer
             # already logged a warning, and we continue without
-            # setting task_hints so the bridge uses the legacy
+            # setting task_branches so the bridge uses the legacy
             # full-chunk scatter path.
 
             # create handler only once per topic
@@ -978,7 +978,7 @@ class Deisa(IDeisa):
         chunks = tuple(meta["chunk_shape"])
         stub = da.zeros(global_shape, chunks=chunks, dtype=np.float64)
 
-        from deisa.dask.task_hints import extract_reduction_hints
+        from deisa.dask.task_branches import extract_reduction_hints
 
         hints: List[Dict[str, Any]] = []
         for op_name in operations:
@@ -997,7 +997,7 @@ class Deisa(IDeisa):
                     break
 
         if hints:
-            self.handshake.set_task_hints(array_name, hints)
+            self.handshake.set_task_branches(array_name, hints)
 
     @staticmethod
     def __get_array_names(*callback_args: CallbackArgs) -> List[str]:

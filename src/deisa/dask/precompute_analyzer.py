@@ -38,7 +38,7 @@ locally on the bridge before the data is scattered.
 The approach is generic: the analyzer never enumerates reduction methods
 (arr.sum, da.sum, etc.). It just builds the dask graph lazily (dask
 operations are not executed) and hands the resulting dask array to
-:func:`deisa.dask.task_hints.extract_reduction_hints`, which walks the
+:func:`deisa.dask.task_branches.extract_reduction_hints`, which walks the
 graph.
 
 Hard contract: **the user's callback is never invoked during analysis.**
@@ -57,7 +57,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 
 import dask.array as da
-from deisa.dask.task_hints import extract_reduction_hints
+from deisa.dask.task_branches import extract_reduction_hints
 
 logger = logging.getLogger(__name__)
 
@@ -135,8 +135,8 @@ def analyze_callback(
       walking the callback's source file.
     - ``:param force:`` If True, skip unresolvable reductions with a warning
       instead of raising.
-    - ``:return:`` List of hint dicts (the schema from
-      :mod:`deisa.dask.task_hints`).
+    - ``:return:`` List of branch dicts (the schema from
+      :mod:`deisa.dask.task_branches`).
     - ``:raises PrecomputeError:`` On any unresolvable reduction (unless ``force=True``).
     """
     try:
