@@ -694,28 +694,19 @@ class Bridge(IBridge):
         - ``:return:`` List of reduction hints (each carrying a pickled chunk
             callable, pickled aggregator, and the dask kwargs to apply).
         """
-        # Check cache first
-        if self._task_branches.get(array_name):
-            return self._task_branches[array_name]
-
-        # If not cached, need to fetch (only sub_comm rank 0 has client)
-        sub_comm = self._array_comms.get(array_name)
-        branches: List[Dict] = []
-
-        if sub_comm is not None and sub_comm is not _COMM_NULL:
-            if sub_comm.Get_rank() == 0 and self.handshake is not None:
-                branches = self.handshake.get_task_branches(array_name)
-                # Broadcast to all ranks in sub_comm
-                sub_comm.bcast(branches, root=0)
-            else:
-                # Receive broadcast
-                branches = sub_comm.bcast(None, root=0)
-
-            # Cache the branches
+        # Retrieve branches directly from handshake actor.
+        # The handshake (created at Deisa init) stores branches via
+        # set_task_branches() during callback registration; fetching
+        # them here (rather than broadcasting per send()) removes
+        # the sub_comm bcast overhead from the critical path.
+        if self.handshake is not None:
+            branches = self.handshake.get_task_branches(array_name)
             if branches:
+                # Cache locally for subsequent sends (avoids repeated handshake reads)
                 self._task_branches[array_name] = branches
-
-        return branches
+                return branches
+        # Fallback: no branches available (legacy full-chunk path)
+        return []
 
     def _scatter_partials(
         self,
