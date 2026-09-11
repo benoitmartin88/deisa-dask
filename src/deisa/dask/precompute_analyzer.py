@@ -413,6 +413,21 @@ class _Missing:
     def __bool__(self) -> bool:
         return False
 
+    def __contains__(self, item: Any) -> bool:
+        # ``_Missing`` behaves like an empty container: ``x in _Missing``
+        # is False and ``x not in _Missing`` is True. Without this,
+        # Python's ``in`` falls back to ``__getitem__`` with ever-increasing
+        # integer indices, which never raises IndexError on a ``_Missing``
+        # and loops forever (RecursionError / hang) on callback code like
+        # ``if "key" not in state:`` where ``state`` is a closure dict that
+        # the analyzer treats as ``_Missing``.
+        return False
+
+    def __iter__(self):
+        # Match the empty-container contract so ``iter(_Missing)`` yields
+        # nothing rather than looping on ``__getitem__``.
+        return iter(())
+
     # Arithmetic: pass through as _Missing
     def _binop(self, other: Any) -> "_Missing":
         return _Missing(f"{self.name}")

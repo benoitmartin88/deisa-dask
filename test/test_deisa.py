@@ -396,6 +396,10 @@ class TestUsingDaskCluster:
                 if expected_window_size["temperature"]
                 else "temperature",
                 exception_handler=self.exception_handler,
+                # map_blocks(...).compute() materializes the array on the
+                # bridge (no chunk-local reduction to precompute), so this
+                # callback uses the legacy full-chunk path.
+                force=True,
             )
             def cb(temperature: List[DeisaArray]):
                 meta = np.array([[0]])

@@ -393,20 +393,34 @@ class Deisa(IDeisa):
         # The method takes the full {name: stub} dict so cross-array callbacks
         # (e.g. cb(temperature, pressure)) are handled in one analysis.
 
-        # Single analysis call for all arrays -- eliminates the loop overhead
+        # ``force=True`` is the explicit opt-out of precompute: skip the
+        # analysis entirely and fall back to the legacy full-chunk scatter
+        # path. This is the documented contract (see ``register``) and what
+        # the test_no_precompute_worker_sees_full_chunk test expects.
+        # Previously, force=True still ran the analysis and (when the
+        # callback had a valid reduction) set branches, silently defeating
+        # the opt-out intent.
         from deisa.dask.precompute_analyzer import NoPrecomputableReductionError
-        branches = self._analyze_callback_for_branches(callback, self.arrays_metadata, force=force)
-        # Note: the method takes the full registered_arrays dict; we pass
-        # arrays_metadata (or registered arrays) here. The bridge distributes
-        # branches per array using the array names embedded in each BranchSpec.
-        # For simplicity in this simplified version, we associate branches
-        # with the first registered array (matching legacy behavior for single-array callbacks).
-        # Multi-array callbacks are handled by the full dict path in the unified pipeline.
-        array_name = array_names[0] if array_names else None
-        if array_name:
-            if branches:
+
+        for array_name in array_names:
+            self._callbacks_by_array.setdefault(array_name, set()).add(callback_id)
+
+        if force:
+            logger.warning(
+                f"_register_callback_impl: callback {callback.__name__!r} registered "
+                f"with force=True -- skipping precompute analysis; the bridge will "
+                f"use the legacy full-chunk scatter path."
+            )
+        else:
+            # Single analysis call for all arrays -- eliminates the loop
+            # overhead. The method takes the full registered_arrays dict; we
+            # pass arrays_metadata here. The bridge distributes branches per
+            # array using the array names embedded in each BranchSpec.
+            branches = self._analyze_callback_for_branches(callback, self.arrays_metadata, force=False)
+            array_name = array_names[0] if array_names else None
+            if array_name and branches:
                 self.handshake.set_task_branches(array_name, branches)
-            elif not force:
+            elif array_name:
                 logger.debug(
                     f"_register_callback_impl: callback {callback.__name__!r} produced "
                     f"no precomputable branches for array '{array_name}'. Without "
@@ -425,15 +439,11 @@ class Deisa(IDeisa):
                     f"on another reduction's output."
                 )
 
-            # create handler only once per topic
-            if array_name not in self._topic_handlers:
-                handler = self._make_topic_handler(array_name)
-                self._topic_handlers[array_name] = handler
-                logger.debug(f"_register_callback_impl: subscribe_topic() {array_name}")
-                self.client.subscribe_topic(array_name, handler)
-
-        for array_name in array_names[1:]:
-            # Additional arrays (for multi-array callbacks): register without re-analyzing
+        # create the topic handler and subscribe for EVERY array in a
+        # callback (both force=True and precompute paths -- with force=True
+        # the bridge still needs the topic subscription to receive data and
+        # fire the callback on the full-chunk path).
+        for array_name in array_names:
             self._callbacks_by_array.setdefault(array_name, set()).add(callback_id)
             if array_name not in self._topic_handlers:
                 handler = self._make_topic_handler(array_name)
@@ -828,7 +838,8 @@ class Deisa(IDeisa):
         # Use da.block to combine blocks
         return da.block(nested)
 
-    def _analyze_callback_for_branches(self, callback: Callable, registered_arrays: Dict[str, Any], force: bool = False):
+    def _analyze_callback_for_branches(
+        self, callback: Callable, registered_arrays: Dict[str, Any], force: bool = False):
         """
         Analyze the callback's source and build a list of :class:`BranchSpec`
         objects describing the chunk-local sub-expressions the bridge can
@@ -858,25 +869,25 @@ class Deisa(IDeisa):
         # so the symbolic AST walker has something concrete to operate on.
         # The chunking does not matter for hint extraction -- we only read
         # the task graph structure, not the data.
-        from deisa.dask.utils import build_deisa_array
         stubs = {}
-        for arr_name, arr_value in registered_arrays.items():
+        for arr_name, _arr_value in registered_arrays.items():
             # Get metadata for this array from arrays_metadata
             # (used for shape/chunks of the placeholder stub)
             meta = self.arrays_metadata.get(arr_name, {})
             global_shape = meta.get("global_shape")
-            chunks = meta.get("chunks")
-            # Build stub only if we have metadata; otherwise use a default
-            if global_shape is not None and chunks is not None:
-                array_stub = da.zeros(global_shape, chunks=chunks, dtype=np.float64)
+            # The metadata exposes ``chunk_shape`` (per-bridge chunk),
+            # not a ``chunks`` tuple. ``da.zeros`` tiles the global shape
+            # into uniform chunks of ``chunk_shape``.
+            chunk_shape = meta.get("chunk_shape")
+            if global_shape is not None and chunk_shape is not None:
+                array_stub = da.zeros(global_shape, chunks=chunk_shape, dtype=np.float64)
             else:
                 # Fallback for arrays without full metadata
-                # (e.g. opaque helpers or dynamically constructed arrays)
+                # (e.g. opaque helpers or dynamically constructed arrays).
                 # The stub's exact size doesn't matter -- only the graph
-                # structure matters for precompute analysis.
-                array_shape = getattr(arr_value, "shape", (10, 10)) if hasattr(getattr(arr_value, "dask", None), "shape") else (10, 10)
-                chunk_size = getattr(arr_value, "chunks", ((5, 5),)) if hasattr(arr_value, "chunks") else ((5, 5),)
-                array_stub = da.zeros(array_shape, chunks=chunk_size, dtype=np.float64)
+                # structure matters for precompute analysis. Shape and
+                # chunks must be consistent (same dimensionality).
+                array_stub = da.zeros((10, 10), chunks=(5, 5), dtype=np.float64)
             # Wrap in DeisaArray so the analyzer sees the full attribute surface
             # (.t, .timestep, dask Array methods) that the callback uses at runtime.
             stubs[arr_name] = build_deisa_array(array_stub, timestep=0)

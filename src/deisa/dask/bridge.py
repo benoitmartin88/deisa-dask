@@ -380,7 +380,6 @@ class Bridge(IBridge):
                 timestep,
                 precomputed=precomputed_meta,
                 precomputed_meta=precomputed_meta,
-                task_branches=branches,
                 branches=branches,  # BranchSpec list
             )
             return
@@ -694,19 +693,33 @@ class Bridge(IBridge):
         - ``:return:`` List of reduction hints (each carrying a pickled chunk
             callable, pickled aggregator, and the dask kwargs to apply).
         """
-        # Retrieve branches directly from handshake actor.
-        # The handshake (created at Deisa init) stores branches via
-        # set_task_branches() during callback registration; fetching
-        # them here (rather than broadcasting per send()) removes
-        # the sub_comm bcast overhead from the critical path.
-        if self.handshake is not None:
-            branches = self.handshake.get_task_branches(array_name)
+        # Check cache first. Branches are fixed after registration; once
+        # fetched (rank 0 reads from the handshake actor and broadcasts to
+        # all ranks in the sub_comm), subsequent sends hit the cache and
+        # never touch the handshake or broadcast -- keeping the send()
+        # critical path fast.
+        if self._task_branches.get(array_name):
+            return self._task_branches[array_name]
+
+        # Cache miss -> rank 0 of the sub_comm reads branches from the
+        # handshake actor (only rank 0 has a client/handshake connection)
+        # and broadcasts to every rank. Branches are set by the analytics
+        # side during register_callback, which happens after bridge setup,
+        # so they are only available here (first send), not in __init__.
+        sub_comm = self._array_comms.get(array_name)
+        branches: List[Dict] = []
+
+        if sub_comm is not None and sub_comm is not _COMM_NULL:
+            if sub_comm.Get_rank() == 0 and self.handshake is not None:
+                branches = self.handshake.get_task_branches(array_name)
+                sub_comm.bcast(branches, root=0)
+            else:
+                branches = sub_comm.bcast(None, root=0)
+
             if branches:
-                # Cache locally for subsequent sends (avoids repeated handshake reads)
                 self._task_branches[array_name] = branches
-                return branches
-        # Fallback: no branches available (legacy full-chunk path)
-        return []
+
+        return branches
 
     def _scatter_partials(
         self,

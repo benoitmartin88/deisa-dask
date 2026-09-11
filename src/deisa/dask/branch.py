@@ -444,12 +444,12 @@ def analyze_branch(
     _seen_chains: Dict[Tuple[str, int], Any] = {}
 
     branches: List[BranchSpec] = []
-    for branch in hints:
+    for branch_dict in hints:
         try:
-            chunk_func = _pickle.loads(branch["chunk_func_pickle"])
+            chunk_func = _pickle.loads(branch_dict["chunk_func_pickle"])
         except Exception as e:  # pragma: no cover - safety net
             if force:
-                logger.warning("analyze_branch: unpickle failed for %s: %s", branch.get("output_key"), e)
+                logger.warning("analyze_branch: unpickle failed for %s: %s", branch_dict.get("output_key"), e)
                 continue
             raise
 
@@ -476,7 +476,7 @@ def analyze_branch(
                     placeholder = np.zeros((4, 4), dtype=np.float64)
 
         branch = _try_chain_branch(
-            branch=branch,
+            branch=branch_dict,
             chunk_func=chunk_func,
             primary=primary,
             array_ndim=array_ndim,
@@ -485,9 +485,10 @@ def analyze_branch(
             seen_chains=_seen_chains,
         )
         if branch is None:
-            # Chain walker refused; fall back to the length-1 path.
+            # Chain walker refused; fall back to the length-1 path,
+            # passing the ORIGINAL branch dict (not the None result).
             branch = _try_length1_branch(
-                branch=branch,
+                branch=branch_dict,
                 chunk_func=chunk_func,
                 primary=primary,
                 array_ndim=array_ndim,
@@ -500,14 +501,14 @@ def analyze_branch(
                     "the length-1 path's build_branch_from_dict raised "
                     "(most likely the placeholder couldn't be computed "
                     "or the chunk_func rejected the chunk shape).",
-                    branch.get("output_key"),
+                    branch_dict.get("output_key"),
                 )
                 continue
             # Both paths returned None -- this shouldn't happen for
             # hints that came out of the analyzer (the length-1 path is
             # supposed to always succeed). Raise defensively.
             raise RuntimeError(
-                f"analyze_branch: cannot build branch for branch {branch.get('output_key')!r}. "
+                f"analyze_branch: cannot build branch for branch {branch_dict.get('output_key')!r}. "
                 f"The chain walker refused (likely cross-array or constant "
                 f"upstream) AND the length-1 fallback's build_branch_from_dict "
                 f"raised. This usually means the chunk_func rejected the "
