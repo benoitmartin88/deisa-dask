@@ -364,7 +364,7 @@ class Bridge(IBridge):
                 f"[{self.id}] send() precompute-active: scattering {len(partials)} partials "
                 f"instead of full chunk shape={chunk.shape}"
             )
-            partial_res = self._scatter_partials(partials, task_branches, array_name, workers=workers)
+            partial_res = self._scatter_partials(partials, branches, array_name, workers=workers)
             res = partial_res["future-info"]
             precomputed_meta = partial_res["precomputed"]
         else:
@@ -380,8 +380,8 @@ class Bridge(IBridge):
                 timestep,
                 precomputed=precomputed_meta,
                 precomputed_meta=precomputed_meta,
-                task_branches=task_branches,
-                branches=task_branches,  # BranchSpec list; legacy hints also accepted
+                task_branches=branches,
+                branches=branches,  # BranchSpec list
             )
             return
 
@@ -431,7 +431,7 @@ class Bridge(IBridge):
             # objects carry ``chunk_axis`` directly; legacy hint dicts
             # require going through ``_extract_chunk_axis_from_hint``.
             chunk_axis_by_key: Dict[str, Optional[Tuple[int, ...]]] = {}
-            for b in task_branches:
+            for b in branches:
                 if isinstance(b, BranchSpec):
                     chunk_axis_by_key[b.output_key] = b.chunk_axis
                 else:
@@ -501,7 +501,7 @@ class Bridge(IBridge):
         timestep: int,
         precomputed: Optional[Dict] = None,
         precomputed_meta: Optional[Dict[str, Dict]] = None,
-        task_branches: Optional[List[Dict]] = None,
+        branches: Optional[List[Dict]] = None,
         branches: Optional[List[Any]] = None,
     ):
         """
@@ -552,8 +552,8 @@ class Bridge(IBridge):
                     else:
                         # Legacy hint dict.
                         chunk_axis_by_key[b["output_key"]] = _extract_chunk_axis_from_hint(b)
-            elif task_branches:
-                for h in task_branches:
+            elif branches:
+                for h in branches:
                     chunk_axis_by_key[h["output_key"]] = _extract_chunk_axis_from_hint(h)
             futures_payload = [
                 {
