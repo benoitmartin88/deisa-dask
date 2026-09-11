@@ -392,10 +392,6 @@ class Deisa(IDeisa):
         # Analyze all registered arrays together (single pass, not per-array loop)
         # The method takes the full {name: stub} dict so cross-array callbacks
         # (e.g. cb(temperature, pressure)) are handled in one analysis.
-        registered_stubs = {}
-        for array_name in array_names:
-            self._callbacks_by_array.setdefault(array_name, set()).add(callback_id)
-            # Note: stub building moved to _analyze_callback_for_branches
 
         # Single analysis call for all arrays -- eliminates the loop overhead
         from deisa.dask.precompute_analyzer import NoPrecomputableReductionError
