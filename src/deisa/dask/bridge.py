@@ -341,7 +341,7 @@ class Bridge(IBridge):
         # 1-d arrays) compared to the full chunk -- the goal of precompute is
         # to ship only the partials to the worker, never the full chunk.
         branches = self._get_task_branches(array_name)
-        partials = self._execute_operations_on_chunk(array_name, chunk, task_branches)
+        partials = self._execute_operations_on_chunk(array_name, chunk, branches)
 
         # Determine communicator from cached sub-comms (from comm.Split())
         sub_comm = self._array_comms.get(array_name)
