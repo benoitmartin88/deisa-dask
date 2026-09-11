@@ -501,7 +501,6 @@ class Bridge(IBridge):
         timestep: int,
         precomputed: Optional[Dict] = None,
         precomputed_meta: Optional[Dict[str, Dict]] = None,
-        branches: Optional[List[Dict]] = None,
         branches: Optional[List[Any]] = None,
     ):
         """
