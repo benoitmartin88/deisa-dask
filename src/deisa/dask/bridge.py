@@ -705,7 +705,7 @@ class Bridge(IBridge):
 
         if sub_comm is not None and sub_comm is not _COMM_NULL:
             if sub_comm.Get_rank() == 0 and self.handshake is not None:
-                hints = self.handshake.get_task_branches(array_name)
+                branches = self.handshake.get_task_branches(array_name)
                 # Broadcast to all ranks in sub_comm
                 sub_comm.bcast(branches, root=0)
             else:
