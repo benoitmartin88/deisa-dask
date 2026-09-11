@@ -122,7 +122,7 @@ class Bridge(IBridge):
         self.client: Optional[Client] = None
         self._array_comms: Dict[str, Any] = {}  # array_name -> sub-comm (from comm.Split)
         self._handshake_metadata = None
-        self._task_hints: Dict[str, List[Dict]] = {}  # array_name -> hints for local execution
+        self._task_branches: Dict[str, List[Dict]] = {}  # array_name -> branches for local execution
 
         if self.id == 0:
             # only id 0 has a real dask client
@@ -230,7 +230,7 @@ class Bridge(IBridge):
                 self.handshake = Handshake(self.client)
 
             # Store empty hints initially - they will be fetched on first send()
-            self._task_hints[array_name] = []
+            self._task_branches[array_name] = []
 
             logger.debug(
                 f"[{self.id}] _setup_array_comms: "
@@ -340,8 +340,8 @@ class Bridge(IBridge):
         # bridge-process numpy chunk. The resulting partials are tiny (scalar /
         # 1-d arrays) compared to the full chunk -- the goal of precompute is
         # to ship only the partials to the worker, never the full chunk.
-        task_hints = self._get_task_hints(array_name)
-        partials = self._execute_operations_on_chunk(array_name, chunk, task_hints)
+        branches = self._get_task_branches(array_name)
+        partials = self._execute_operations_on_chunk(array_name, chunk, task_branches)
 
         # Determine communicator from cached sub-comms (from comm.Split())
         sub_comm = self._array_comms.get(array_name)
@@ -364,7 +364,7 @@ class Bridge(IBridge):
                 f"[{self.id}] send() precompute-active: scattering {len(partials)} partials "
                 f"instead of full chunk shape={chunk.shape}"
             )
-            partial_res = self._scatter_partials(partials, task_hints, array_name, workers=workers)
+            partial_res = self._scatter_partials(partials, task_branches, array_name, workers=workers)
             res = partial_res["future-info"]
             precomputed_meta = partial_res["precomputed"]
         else:
@@ -380,8 +380,8 @@ class Bridge(IBridge):
                 timestep,
                 precomputed=precomputed_meta,
                 precomputed_meta=precomputed_meta,
-                task_hints=task_hints,
-                branches=task_hints,  # BranchSpec list; legacy hints also accepted
+                task_branches=task_branches,
+                branches=task_branches,  # BranchSpec list; legacy hints also accepted
             )
             return
 
@@ -431,7 +431,7 @@ class Bridge(IBridge):
             # objects carry ``chunk_axis`` directly; legacy hint dicts
             # require going through ``_extract_chunk_axis_from_hint``.
             chunk_axis_by_key: Dict[str, Optional[Tuple[int, ...]]] = {}
-            for b in task_hints:
+            for b in task_branches:
                 if isinstance(b, BranchSpec):
                     chunk_axis_by_key[b.output_key] = b.chunk_axis
                 else:
@@ -501,7 +501,7 @@ class Bridge(IBridge):
         timestep: int,
         precomputed: Optional[Dict] = None,
         precomputed_meta: Optional[Dict[str, Dict]] = None,
-        task_hints: Optional[List[Dict]] = None,
+        task_branches: Optional[List[Dict]] = None,
         branches: Optional[List[Any]] = None,
     ):
         """
@@ -552,8 +552,8 @@ class Bridge(IBridge):
                     else:
                         # Legacy hint dict.
                         chunk_axis_by_key[b["output_key"]] = _extract_chunk_axis_from_hint(b)
-            elif task_hints:
-                for h in task_hints:
+            elif task_branches:
+                for h in task_branches:
                     chunk_axis_by_key[h["output_key"]] = _extract_chunk_axis_from_hint(h)
             futures_payload = [
                 {
@@ -684,11 +684,11 @@ class Bridge(IBridge):
             out = list(out.values())[0]
         return out
 
-    def _get_task_hints(self, array_name: str) -> List[Dict]:
+    def _get_task_branches(self, array_name: str) -> List[Dict]:
         """
         Retrieve stored task hints for an array.
 
-        Hints are fetched from HandshakeActor on sub_comm rank 0 and broadcast to all ranks.
+        Branches are fetched from HandshakeActor on sub_comm rank 0 and broadcast to all ranks.
         If no hints are available, this method returns an empty list (no precomputation).
 
         - ``:param array_name:`` The array name to get hints for.
@@ -696,27 +696,27 @@ class Bridge(IBridge):
             callable, pickled aggregator, and the dask kwargs to apply).
         """
         # Check cache first
-        if self._task_hints.get(array_name):
-            return self._task_hints[array_name]
+        if self._task_branches.get(array_name):
+            return self._task_branches[array_name]
 
         # If not cached, need to fetch (only sub_comm rank 0 has client)
         sub_comm = self._array_comms.get(array_name)
-        hints: List[Dict] = []
+        branches: List[Dict] = []
 
         if sub_comm is not None and sub_comm is not _COMM_NULL:
             if sub_comm.Get_rank() == 0 and self.handshake is not None:
-                hints = self.handshake.get_task_hints(array_name)
+                hints = self.handshake.get_task_branches(array_name)
                 # Broadcast to all ranks in sub_comm
-                sub_comm.bcast(hints, root=0)
+                sub_comm.bcast(branches, root=0)
             else:
                 # Receive broadcast
-                hints = sub_comm.bcast(None, root=0)
+                branches = sub_comm.bcast(None, root=0)
 
-            # Cache the hints
-            if hints:
-                self._task_hints[array_name] = hints
+            # Cache the branches
+            if branches:
+                self._task_branches[array_name] = branches
 
-        return hints
+        return branches
 
     def _scatter_partials(
         self,
