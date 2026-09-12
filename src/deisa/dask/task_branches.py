@@ -58,7 +58,7 @@ from __future__ import annotations
 
 import logging
 import pickle
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import dask.array as da
 
@@ -168,6 +168,36 @@ def _is_task(value: Any) -> bool:
     if isinstance(value, tuple):
         return False
     return hasattr(value, "func") and hasattr(value, "args") and hasattr(value, "kwargs")
+
+
+def _blockwise_indices_inputs(layer) -> Optional[Tuple[List[str], int, bool]]:
+    """Parse a new-style Blockwise layer's ``indices``.
+
+    Returns ``(array_input_names, array_input_count, has_non_array_input)``,
+    or ``None`` if the layer has no ``indices`` (not a new-style Blockwise).
+    ``array_input_count`` counts the number of array-input references (so a
+    self-referential op like ``arr * arr`` yields count 2); ``names`` contains
+    one entry per array input. ``has_non_array_input`` is True when a scalar
+    constant (non-string-first-element index key) is present.
+
+    This is the shared primitive behind both
+    :func:`_blockwise_upstream_layer_names` (names only) and
+    :func:`deisa.dask.branch._find_single_upstream` (single distinct
+    upstream + array-input count + constant rejection), so the Blockwise
+    index-walking logic lives in one place.
+    """
+    if not (hasattr(layer, "indices") and layer.indices):
+        return None
+    names: List[str] = []
+    array_input_count = 0
+    has_non_array_input = False
+    for in_key in layer.indices:
+        if isinstance(in_key, (list, tuple)) and len(in_key) >= 1 and isinstance(in_key[0], str):
+            names.append(in_key[0])
+            array_input_count += 1
+        else:
+            has_non_array_input = True
+    return names, array_input_count, has_non_array_input
 
 
 def _layer_first_task(layer) -> Optional[Any]:
@@ -288,8 +318,13 @@ def _chunk_func_and_kwargs(chunk_layer) -> Optional[tuple]:
 # ---------------------------------------------------------------------------
 # branch extraction
 # ---------------------------------------------------------------------------
-def _find_chunk_layer(graph, agg_base: str) -> Optional[str]:
+def _find_chunk_layer(graph, agg_base: str, exact: bool = False) -> Optional[str]:
     """Locate the chunk layer that feeds the aggregate layer with the given base.
+
+    ``exact=False`` (hint extraction) matches candidate chunk base names
+    (including the dedicated mean/max/min chunk/aggregate pairs) and layers
+    whose name starts with a candidate base. ``exact=True`` (chain folding)
+    requires a chunk layer whose stripped base equals ``agg_base`` exactly.
 
     Returns ``None`` if no matching chunk layer exists.
     """
@@ -298,6 +333,11 @@ def _find_chunk_layer(graph, agg_base: str) -> Optional[str]:
         if _is_aggregate_layer(layer_name) or _is_sqrt_layer(layer_name):
             continue
         layer_base = _strip_hash(layer_name)
+        if exact:
+            # Chain folding: only an exact base match is foldable.
+            if layer_base == agg_base:
+                return layer_name
+            continue
         if layer_base in candidates:
             return layer_name
         # Also accept names that start with the base (e.g. ``sum-``)
@@ -375,15 +415,10 @@ def _blockwise_upstream_layer_names(layer) -> List[str]:
     layer's task. Falls back to scanning the first task's args if the
     layer isn't a Blockwise.
     """
-    # New-style Blockwise: ``layer.indices`` is a mapping from output
-    # coordinate -> input coordinate where each input coordinate is a
-    # tuple ``(layer_name, block_index)`` (for Blockwise deps) or a
-    # tuple containing a constant.
-    if hasattr(layer, "indices") and layer.indices:
-        names = []
-        for in_key in layer.indices:
-            if isinstance(in_key, (list, tuple)) and len(in_key) >= 1 and isinstance(in_key[0], str):
-                names.append(in_key[0])
+    # New-style Blockwise: share the index-walking with _find_single_upstream.
+    parsed = _blockwise_indices_inputs(layer)
+    if parsed is not None:
+        names, _count, _has_non_array = parsed
         return names
     # Legacy-style: scan the first task's args for layer-name strings.
     names = []
