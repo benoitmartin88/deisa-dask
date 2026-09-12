@@ -57,6 +57,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from deisa.dask.task_branches import _blockwise_indices_inputs, _find_chunk_layer, _is_aggregate_layer
+
 logger = logging.getLogger(__name__)
 
 
@@ -573,7 +575,7 @@ def _find_primary_aggregate(graph) -> Optional[str]:
     to the length-1 path for the rest.
     """
     for layer_name in graph.layers:
-        if "-aggregate-" in layer_name:
+        if _is_aggregate_layer(layer_name):
             return layer_name
     return None
 
@@ -595,7 +597,7 @@ def _walk_chain(graph, agg_name: str) -> Optional[List[Tuple[Callable, dict, int
     """
     if "-aggregate-" not in agg_name:
         return None
-    chunk_layer_name = _find_chunk_layer(graph, agg_name.split("-aggregate-", 1)[0])
+    chunk_layer_name = _find_chunk_layer(graph, agg_name.split("-aggregate-", 1)[0], exact=True)
     if chunk_layer_name is None:
         return None
     chain: List[Tuple[Callable, dict, int]] = []
@@ -624,22 +626,6 @@ def _walk_chain(graph, agg_name: str) -> Optional[List[Tuple[Callable, dict, int
     return chain
 
 
-def _find_chunk_layer(graph, agg_base: str) -> Optional[str]:
-    """Find the chunk-stage layer whose name matches ``agg_base``.
-
-    The existing ``extract_reduction_hints`` has a richer version of
-    this that also handles ``-`` suffix variants; for chain folding we
-    only need the exact-base match.
-    """
-    for layer_name in graph.layers:
-        if "-aggregate-" in layer_name:
-            continue
-        layer_base = layer_name.rsplit("-", 1)[0] if "-" in layer_name else layer_name
-        if layer_base == agg_base:
-            return layer_name
-    return None
-
-
 def _extract_layer_func(layer) -> Tuple[Optional[Callable], dict]:
     """Pull the first task's ``func`` and ``kwargs`` out of a Blockwise
     layer. Returns ``(None, {})`` if the layer has no task-shaped values.
@@ -658,25 +644,17 @@ def _find_single_upstream(layer) -> Optional[Tuple[str, int]]:
     chunk-local). Returns ``None`` if the layer reads from multiple
     distinct array upstreams (cross-array, can't fold) or contains
     scalar constants (deferred to a later commit).
+
+    Uses the shared Blockwise index-walking primitive
+    :func:`deisa.dask.task_branches._blockwise_indices_inputs` so the
+    ``layer.indices`` parsing lives in one place.
     """
-    if not hasattr(layer, "indices") or not layer.indices:
+    parsed = _blockwise_indices_inputs(layer)
+    if parsed is None:
+        # Not a new-style Blockwise (no indices) / empty indices.
         return None
-    in_keys = list(layer.indices)
-    if len(in_keys) == 0:
-        return None
-    upstream_names = set()
-    array_input_count = 0
-    has_non_array_input = False
-    for in_key in in_keys:
-        # An ``in_key`` is an "array input" only if it has a string
-        # first element (dask layer names are strings; constants
-        # like ``(2, None)`` have a non-string first element).
-        if isinstance(in_key, (list, tuple)) and len(in_key) >= 1 and isinstance(in_key[0], str):
-            upstream_names.add(in_key[0])
-            array_input_count += 1
-        else:
-            # Scalar constant or other non-array input.
-            has_non_array_input = True
+    names, array_input_count, has_non_array_input = parsed
+    upstream_names = set(names)
     if not upstream_names or len(upstream_names) > 1:
         return None
     if has_non_array_input:
