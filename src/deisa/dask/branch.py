@@ -295,59 +295,6 @@ def build_branch_from_dict(
     )
 
 
-def branch_to_dict(branch: BranchSpec) -> Dict[str, Any]:
-    """Convert a BranchSpec back to the legacy per-reduction branch dict.
-
-    Used as a backward-compat shim for callers that haven't migrated
-    to BranchSpec yet. The returned dict has the same schema as
-    :func:`deisa.dask.task_branches.extract_reduction_hints` (modulo the
-    addition of ``kind``, ``finalize``, ``chunk_axis``, ``shape``,
-    ``dtype``).
-
-    For Stage 2A the conversion is lossless because BranchSpec is a
-    superset of the branch fields. Stage 3 will lose information when
-    folding multi-layer chains.
-    """
-    import pickle as _pickle
-
-    return {
-        "output_key": branch.output_key,
-        "op_name": branch.output_key.split("-")[-1] if "-" in branch.output_key else branch.output_key,
-        "kind": branch.output_kind,
-        "chunk_func_pickle": _pickle.dumps(branch.branch_func),
-        "agg_pickle": b"",  # unused in the precompute path; placeholder for back-compat
-        "agg_dep_structures": [],
-        "agg_keys": [],
-        "finalize": branch.finalize,
-        "chunk_kwargs": {"axis": branch.chunk_axis} if branch.chunk_axis else {},
-        "shape": branch.partial_shape,
-        "dtype": branch.partial_dtype,
-        "keywords": {},
-    }
-
-
-def dict_to_branch(
-    branch: Dict[str, Any], input_name: str, array_ndim: int, placeholder: Optional[Any] = None
-) -> BranchSpec:
-    """Convert a legacy per-reduction branch dict into a BranchSpec.
-
-    Inverse of :func:`branch_to_dict`. Used by the bridge to convert
-    legacy stored hints on the HandshakeActor (kept for backward compat
-    with the prior branch-based registration path) into BranchSpec
-    instances.
-    """
-    import pickle as _pickle
-
-    chunk_func = _pickle.loads(branch["chunk_func_pickle"])
-    return build_branch_from_dict(
-        branch=branch,
-        chunk_func=chunk_func,
-        input_name=input_name,
-        array_ndim=array_ndim,
-        placeholder=placeholder,
-    )
-
-
 def analyze_branch(
     callback: Callable,
     registered_arrays: Dict[str, Any],
