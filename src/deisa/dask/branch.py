@@ -339,25 +339,28 @@ def analyze_branch(
     """
     import pickle as _pickle
 
-    hints = extract_reduction_hints_from_callback(callback, registered_arrays, force=force)
-    if not hints:
-        return []
+    # Single AST walk: analyze_callback_with_dask_arrays returns BOTH the
+    # reduction hints AND the walker's dask_arrays in one pass. (Calling
+    # analyze_callback and analyze_callback_with_dask_arrays separately
+    # would parse + walk the callback's AST twice.) The dask_arrays are the
+    # dask expressions the walker built at each compute boundary (e.g.
+    # ``(arr*arr).sum()``) -- the registered placeholders' graphs only have
+    # the root layer, not the chain, so the chain walker needs these.
+    from deisa.dask.precompute_analyzer import analyze_callback_with_dask_arrays
 
-    # The chain walker needs the **AST walker's** dask_arrays -- the
-    # dask expressions the walker built during symbolic evaluation
-    # (e.g. ``(arr*arr).sum()``). The registered placeholders' graphs
-    # only contain the root ``zeros_like`` layer; the chain layer(s)
-    # are added when the walker composes the expression. Run the AST
-    # walker explicitly so we have both the hints AND the dask_arrays
-    # from the same walk.
-    walker_dask_arrays: List[Dict[str, Any]] = []
     try:
-        walker_dask_arrays = extract_dask_arrays_from_callback(callback, registered_arrays, force=force)
+        hints, walker_dask_arrays = analyze_callback_with_dask_arrays(
+            callback, registered_arrays, force=force
+        )
     except Exception:
         if not force:
             raise
-        # force=True: fall through with empty walker_dask_arrays; the
+        # force=True: fall through with empty hints/dask_arrays; the
         # length-1 fallback still works.
+        hints, walker_dask_arrays = [], []
+
+    if not hints:
+        return []
 
     # Pick the registered-array name and ndim to attach to branches.
     primary = next(iter(registered_arrays)) if registered_arrays else "f"
@@ -798,56 +801,3 @@ def _build_chain_branch(
         output_shape=output_shape,
         output_dtype=output_dtype,
     )
-
-
-def extract_reduction_hints_from_callback(
-    callback: Callable,
-    registered_arrays: Dict[str, Any],
-    force: bool = False,
-) -> List[Dict[str, Any]]:
-    """Wrapper around the legacy analyzer that returns the raw branch list.
-
-    The legacy ``analyze_callback`` does two things: walks the AST to
-    detect compute boundaries, then walks the resulting dask graphs to
-    extract reduction hints. We only need the branch list here, but the
-    AST walk is required to find the dask arrays in the first place.
-    For Stage 2A we delegate to the legacy entry point and discard the
-    AST-walk side effects (it has no externally observable effects
-    beyond emitting the hints).
-    """
-    from deisa.dask.precompute_analyzer import analyze_callback
-
-    try:
-        hints = analyze_callback(callback, registered_arrays, force=force)
-    except Exception:
-        if force:
-            logger.warning("analyze_branch: analyze_callback failed; force=True, returning empty")
-            return []
-        raise
-    return hints
-
-
-def extract_dask_arrays_from_callback(
-    callback: Callable,
-    registered_arrays: Dict[str, Any],
-    force: bool = False,
-) -> List[Dict[str, Any]]:
-    """Return the AST walker's dask_arrays list for a callback.
-
-    Each entry is ``{"array": darr, "kind": ..., "lineno": ...}`` where
-    ``darr`` is the dask expression the walker built at a compute
-    boundary (e.g. ``(arr*arr).sum()``). The chain walker in
-    :func:`_walk_chain` needs these expressions' graphs (not the
-    registered placeholders' graphs) because the placeholders only
-    have the root layer, not the chain.
-    """
-    from deisa.dask.precompute_analyzer import analyze_callback_with_dask_arrays
-
-    try:
-        _hints, dask_arrays = analyze_callback_with_dask_arrays(callback, registered_arrays, force=force)
-    except Exception:
-        if force:
-            logger.warning("analyze_branch: AST walk failed; force=True, returning empty dask_arrays")
-            return []
-        raise
-    return dask_arrays
