@@ -28,7 +28,6 @@
 # =============================================================================
 import asyncio
 import logging
-import pickle
 import sys
 import uuid
 import zlib
@@ -58,26 +57,6 @@ try:
     _UNDEFINED = MPI.UNDEFINED
 except ImportError:
     _UNDEFINED = 2147483647
-
-
-def _extract_chunk_axis_from_hint(hint: Optional[Dict]) -> Optional[Tuple[int, ...]]:
-    """Pull the chunk_func's reduction-axes tuple out of a task hint.
-
-    Dask stores the axes being reduced in ``chunk_kwargs['axis']`` (either
-    a single int for one axis, or a tuple for several). For our precompute
-    topic event we need to ship this to the Deisa side so the combine's
-    output shape and agg ``axis`` are computed correctly. Returns
-    ``None`` when the hint is missing or has no ``axis`` kwarg.
-    """
-    if hint is None:
-        return None
-    ck = hint.get("chunk_kwargs") or {}
-    ax = ck.get("axis")
-    if isinstance(ax, (list, tuple)):
-        return tuple(int(a) for a in ax)
-    if ax is not None:
-        return (int(ax),)
-    return None
 
 
 class Bridge(IBridge):
@@ -123,6 +102,10 @@ class Bridge(IBridge):
         self._array_comms: Dict[str, Any] = {}  # array_name -> sub-comm (from comm.Split)
         self._handshake_metadata = None
         self._task_branches: Dict[str, List[Dict]] = {}  # array_name -> branches for local execution
+        self._chunk_axis_by_key: Dict[str, Dict[str, Optional[Tuple[int, ...]]]] = {}
+        #  ^ array_name -> output_key -> chunk_axis (derived once from branches; static)
+        self._branch_by_key: Dict[str, Dict[str, Any]] = {}
+        #  ^ array_name -> output_key -> branch (BranchSpec)
 
         if self.id == 0:
             # only id 0 has a real dask client
@@ -429,13 +412,9 @@ class Bridge(IBridge):
             # Build a per-output_key chunk_axis lookup. BranchSpec
             # objects carry ``chunk_axis`` directly; legacy hint dicts
             # require going through ``_extract_chunk_axis_from_hint``.
-            chunk_axis_by_key: Dict[str, Optional[Tuple[int, ...]]] = {}
-            for b in branches:
-                if isinstance(b, BranchSpec):
-                    chunk_axis_by_key[b.output_key] = b.chunk_axis
-                else:
-                    # Legacy hint dict.
-                    chunk_axis_by_key[b["output_key"]] = _extract_chunk_axis_from_hint(b)
+            # Cached per array (static after registration) so it is not
+            # rebuilt on every send().
+            chunk_axis_by_key = self._get_chunk_axis_by_key(array_name, branches)
             futures_payload: List[Dict[str, Any]]
             if all_partials_meta:
                 # Precompute path: emit one entry per (bridge, reduction).
@@ -536,23 +515,10 @@ class Bridge(IBridge):
         # partial (with its reduced shape); on the legacy path, emit one entry
         # pointing at the full chunk.
         if precomputed_meta:
-            # Build a per-output_key lookup for chunk_axis. Prefer
-            # BranchSpec objects (the new wire format) over legacy
-            # hint dicts; both expose ``output_key`` and a way to get
-            # the chunk axis. BranchSpec carries ``chunk_axis``
-            # directly; the legacy hint requires going through
-            # ``_extract_chunk_axis_from_hint``.
-            chunk_axis_by_key: Dict[str, Optional[Tuple[int, ...]]] = {}
-            if branches:
-                for b in branches:
-                    if isinstance(b, BranchSpec):
-                        chunk_axis_by_key[b.output_key] = b.chunk_axis
-                    else:
-                        # Legacy hint dict.
-                        chunk_axis_by_key[b["output_key"]] = _extract_chunk_axis_from_hint(b)
-            elif branches:
-                for h in branches:
-                    chunk_axis_by_key[h["output_key"]] = _extract_chunk_axis_from_hint(h)
+            # BranchSpec carries the reduction's ``chunk_axis`` directly.
+            # The per-output_key lookup is cached per array (static after
+            # registration), so it is not rebuilt on every send.
+            chunk_axis_by_key = self._get_chunk_axis_by_key(array_name, branches or [])
             futures_payload = [
                 {
                     "future": info["future"],
@@ -721,10 +687,44 @@ class Bridge(IBridge):
 
         return branches
 
+    def _get_chunk_axis_by_key(self, array_name: str, branches: List) -> Dict[str, Optional[Tuple[int, ...]]]:
+        """Return the ``output_key -> chunk_axis`` map for an array, building
+        and caching it on first use.
+
+        The chunk_axis of each reduction depends only on the branches, which
+        are static after registration. Building it fresh on every ``send()``
+        is wasted work on the critical path; cache it once per array.
+        """
+        cached = self._chunk_axis_by_key.get(array_name)
+        if cached is not None:
+            return cached
+
+        build: Dict[str, Optional[Tuple[int, ...]]] = {}
+        for b in branches:
+            build[b.output_key] = b.chunk_axis
+
+        self._chunk_axis_by_key[array_name] = build
+        return build
+
+    def _get_branch_by_key(self, array_name: str, branches: List[Any]) -> Dict[str, Any]:
+        """Return the ``output_key -> branch`` lookup for an array, building
+        and caching it on first use.
+
+        Branches are static after registration, so the indexed map is not
+        rebuilt on every ``send()``.
+        """
+        cached = self._branch_by_key.get(array_name)
+        if cached is not None:
+            return cached
+
+        indexed = {b.output_key: b for b in branches}
+        self._branch_by_key[array_name] = indexed
+        return indexed
+
     def _scatter_partials(
         self,
         partials: Dict[str, Any],
-        branches: List[Any],  # List[BranchSpec] or List[dict] (legacy hints)
+        branches: List[Any],  # List[BranchSpec]
         array_name: str,
         workers: List[str],
     ) -> Dict[str, Any]:
@@ -766,89 +766,24 @@ class Bridge(IBridge):
         target_worker = workers[0]
 
         # Index branches by output_key for fast lookup. BranchSpec
-        # carries the per-reduction metadata directly, so the loop
-        # body doesn't need to inspect the partial value (legacy code
-        # did ``isinstance(value, dict)`` and then peek at ``total``/
-        # ``M`` -- the analyzer already recorded that in
-        # ``branch.partial_shape``/``branch.partial_dtype``).
-        #
-        # Backward-compat: ``branches`` may be a list of legacy hint
-        # dicts (from the pre-BranchSpec registration path). We
-        # dispatch on element type -- BranchSpec items get their
-        # fields used directly; dict items get a small dict-lookup
-        # shim that mirrors the legacy behaviour.
-        if branches and not isinstance(branches[0], BranchSpec):
-            # Convert each legacy hint dict to a duck-typed
-            # BranchSpec-like accessor. Avoids importing the dataclass
-            # machinery just for a couple of fields.
-            class _DictBranch:
-                __slots__ = ("output_key", "output_kind", "finalize", "partial_shape", "partial_dtype")
-
-                def __init__(self, h):
-                    self.output_key = h["output_key"]
-                    self.output_kind = h.get("kind", "scalar")
-                    self.finalize = h.get("finalize")
-                    # Legacy hints don't carry shape/dtype; leave as
-                    # None and let the loop fall back to value inspection.
-                    self.partial_shape = h.get("shape")
-                    self.partial_dtype = h.get("dtype")
-
-            branches = [_DictBranch(h) for h in branches]
-        branch_by_key = {b.output_key: b for b in branches}
+        # carries the per-reduction metadata directly (``partial_shape`` /
+        # ``partial_dtype`` / ``output_kind`` / ``finalize`` recorded by the
+        # analyzer), so the loop doesn't inspect the partial value. Cached
+        # per array (static after registration).
+        branch_by_key = self._get_branch_by_key(array_name, branches)
 
         payload: Dict[str, Any] = {}
         shape_dtype: Dict[str, Dict[str, Any]] = {}
         for output_key, value in partials.items():
             branch = branch_by_key.get(output_key)
             if branch is None:
-                # Backward-compat: legacy hint path produced dicts here.
-                # We don't have shape/dtype metadata, so inspect the
-                # value as the old code did.
-                if isinstance(value, dict):
-                    if "total" in value:
-                        rep = np.asarray(value["total"])
-                    elif "M" in value:
-                        rep = np.asarray(value["M"])
-                    else:
-                        rep = np.asarray(next(iter(value.values())))
-                    red_shape = tuple(rep.shape)
-                    red_dtype = str(rep.dtype)
-                    kind = "mean" if "total" in value else "moment"
-                else:
-                    arr = np.asarray(value)
-                    red_shape = tuple(arr.shape)
-                    red_dtype = str(arr.dtype)
-                    kind = "scalar"
-                finalize = None
-            else:
-                kind = branch.output_kind
-                finalize = branch.finalize
-                red_shape = branch.partial_shape
-                red_dtype = branch.partial_dtype
-                # Backward-compat: legacy hint dicts (and any future
-                # branch that didn't record shape/dtype at the
-                # analyzer side) have ``partial_shape`` and
-                # ``partial_dtype`` set to None. Fall back to
-                # inspecting the actual partial value -- the
-                # same heuristic the pre-BranchSpec code used.
-                if red_shape is None or red_dtype is None:
-                    if isinstance(value, dict):
-                        if "total" in value:
-                            rep = np.asarray(value["total"])
-                        elif "M" in value:
-                            rep = np.asarray(value["M"])
-                        else:
-                            rep = np.asarray(next(iter(value.values())))
-                        red_shape = tuple(rep.shape)
-                        red_dtype = str(rep.dtype)
-                        # ``kind`` may also be missing on legacy
-                        # hints; default to dict-shape.
-                        if branch.output_kind == "scalar":
-                            kind = "mean" if "total" in value else "moment"
-                    else:
-                        arr = np.asarray(value)
-                        red_shape = tuple(arr.shape)
-                        red_dtype = str(arr.dtype)
+                # Every partial comes from a branch (they are built together
+                # in _execute_operations_on_chunk), so a miss is a bug.
+                raise KeyError(f"no branch found for precomputed output_key {output_key!r}")
+            kind = branch.output_kind
+            finalize = branch.finalize
+            red_shape = branch.partial_shape
+            red_dtype = branch.partial_dtype
             key = f"{KEY_PREFIX}{array_name}-partial-{output_key}-{uuid.uuid4().hex}"
             payload[key] = value
             shape_dtype[output_key] = {
@@ -907,29 +842,8 @@ class Bridge(IBridge):
             ``analyze_branch``.
         - ``:return:`` Dict of partial results keyed by output_key.
         """
-        from deisa.dask.branch import BranchSpec
-
         partials = {}
         for branch in branches:
-            if not isinstance(branch, BranchSpec):
-                # Backward compat: legacy hint dicts are still produced
-                # by ``_analyze_callback_for_operations``. Convert on
-                # the fly using the same kwargs logic the legacy path
-                # used.
-                output_key = branch["output_key"]
-                kind = branch.get("kind", "scalar")
-                try:
-                    chunk_func = pickle.loads(branch["chunk_func_pickle"])
-                    chunk_kwargs = dict(branch.get("chunk_kwargs", {}) or {})
-                    if kind in ("mean", "moment"):
-                        chunk_kwargs["keepdims"] = True
-                    partial = chunk_func(chunk, **chunk_kwargs)
-                except Exception as e:
-                    logger.warning(f"[{self.id}] _execute_operations_on_chunk: could not execute {output_key}: {e}")
-                    continue
-                partials[output_key] = partial
-                continue
-
             output_key = branch.output_key
             try:
                 partial = branch.branch_func(chunk)
