@@ -410,10 +410,9 @@ class Bridge(IBridge):
             # reaches the workers.
             #
             # Build a per-output_key chunk_axis lookup. BranchSpec
-            # objects carry ``chunk_axis`` directly; legacy hint dicts
-            # require going through ``_extract_chunk_axis_from_hint``.
-            # Cached per array (static after registration) so it is not
-            # rebuilt on every send().
+            # objects carry ``chunk_axis`` directly. Cached per array
+            # (static after registration) so it is not rebuilt on every
+            # send().
             chunk_axis_by_key = self._get_chunk_axis_by_key(array_name, branches)
             futures_payload: List[Dict[str, Any]]
             if all_partials_meta:

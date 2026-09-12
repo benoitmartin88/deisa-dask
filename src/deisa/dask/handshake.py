@@ -51,7 +51,6 @@ class Handshake:
             self.nb_bridges = 0
             self.arrays_metadata = {}
             self.bridges_ready = False
-            self.analytics_ready = False
             self.feedback_queue_size = 1024
             self.timestep: Optional[int] = None
             self.task_branches = {}  # array_name -> List[Dict] for bridge-local execution
