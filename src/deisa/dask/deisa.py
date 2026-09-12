@@ -870,10 +870,11 @@ class Deisa(IDeisa):
         # The chunking does not matter for hint extraction -- we only read
         # the task graph structure, not the data.
         stubs = {}
-        for arr_name, _arr_value in registered_arrays.items():
-            # Get metadata for this array from arrays_metadata
-            # (used for shape/chunks of the placeholder stub)
-            meta = self.arrays_metadata.get(arr_name, {})
+        for arr_name in registered_arrays:
+            # Get metadata for this array from registered_arrays
+            # (which is arrays_metadata), used for shape/chunks of the
+            # placeholder stub.
+            meta = registered_arrays.get(arr_name, {})
             global_shape = meta.get("global_shape")
             # The metadata exposes ``chunk_shape`` (per-bridge chunk),
             # not a ``chunks`` tuple. ``da.zeros`` tiles the global shape
