@@ -50,6 +50,7 @@ from deisa.dask.precompute_analyzer import (
     MaterializationError,
     NoComputeBoundaryError,
     NoPrecomputableReductionError,
+    UnsupportedReductionError,
     analyze_callback,
 )
 
@@ -92,30 +93,104 @@ def test_compute_direct_reduction(op_name: str) -> None:
     assert hints[0]["op_name"] == op_name
 
 
-def test_compute_with_axis_kwarg_int() -> None:
-    arr = _simple_stub()
-    src = """
+@pytest.mark.parametrize(
+    "source,expected_hint_keys,expected_axis",
+    [
+        pytest.param(
+            """\
+        def callback(arr):
+            result = arr[2:5].sum()
+            result.compute()""",
+            ["f-sum"],
+            None,
+            id="sliced_reduction",
+        ),
+        pytest.param(
+            """\
+        def callback(arr):
+            result = arr[:, 0].sum()
+            result.compute()""",
+            ["f-sum"],
+            None,
+            id="column_slice_reduction",
+        ),
+        pytest.param(
+            """\
+        def callback(arr):
+            result = (arr ** 2).sum()
+            result.compute()""",
+            ["f-sum"],
+            None,
+            id="expression_pow",
+        ),
+        pytest.param(
+            """\
+        def callback(arr):
+            result = da.sum(arr)
+            result.compute()""",
+            ["f-sum"],
+            None,
+            id="dask_module_sum",
+        ),
+        pytest.param(
+            """\
         def callback(arr):
             result = arr.sum(axis=0)
-            result.compute()
-        """
-    cb = _make_function("callback", src)
-    hints = analyze_callback(cb, {"f": arr})
-    assert len(hints) == 1
-    assert hints[0]["keywords"].get("axis") == 0
-
-
-def test_compute_with_axis_kwarg_tuple() -> None:
-    arr = _simple_stub()
-    src = """
+            result.compute()""",
+            ["f-sum"],
+            0,
+            id="axis_kwarg_int",
+        ),
+        pytest.param(
+            """\
         def callback(arr):
             result = arr.sum(axis=(0, 1))
-            result.compute()
-        """
+            result.compute()""",
+            ["f-sum"],
+            (0, 1),
+            id="axis_kwarg_tuple",
+        ),
+    ],
+)
+def test_compute_single_array_hints(source, expected_hint_keys, expected_axis) -> None:
+    arr = _simple_stub()
+    src = textwrap.dedent(source)
     cb = _make_function("callback", src)
     hints = analyze_callback(cb, {"f": arr})
-    assert len(hints) == 1
-    assert hints[0]["keywords"].get("axis") == (0, 1)
+    assert _hint_keys(hints) == expected_hint_keys
+    if expected_axis is not None:
+        assert len(hints) == 1
+        assert hints[0]["keywords"].get("axis") == expected_axis
+
+
+@pytest.mark.parametrize(
+    "source,expected_hint_key",
+    [
+        pytest.param(
+            """\
+        def callback(arr_a, arr_b):
+            result = (arr_a - arr_b).max()
+            result.compute()""",
+            "a-max",
+            id="sub",
+        ),
+        pytest.param(
+            """\
+        def callback(arr_a, arr_b):
+            result = (arr_a * arr_b).sum()
+            result.compute()""",
+            "a-sum",
+            id="mul",
+        ),
+    ],
+)
+def test_compute_two_array_hints(source, expected_hint_key) -> None:
+    a = _simple_stub()
+    b = _simple_stub()
+    src = textwrap.dedent(source)
+    cb = _make_function("callback", src)
+    hints = analyze_callback(cb, {"a": a, "b": b})
+    assert _hint_keys(hints) == [expected_hint_key]
 
 
 def test_compute_multiple_reductions() -> None:
@@ -132,82 +207,6 @@ def test_compute_multiple_reductions() -> None:
     cb = _make_function("callback", src)
     hints = analyze_callback(cb, {"f": arr})
     assert _hint_keys(hints) == ["f-max", "f-mean", "f-sum"]
-
-
-def test_compute_sliced_reduction() -> None:
-    arr = _simple_stub()
-    src = """
-        def callback(arr):
-            result = arr[2:5].sum()
-            result.compute()
-        """
-    cb = _make_function("callback", src)
-    hints = analyze_callback(cb, {"f": arr})
-    assert _hint_keys(hints) == ["f-sum"]
-
-
-def test_compute_column_slice_reduction() -> None:
-    arr = _simple_stub()
-    src = """
-        def callback(arr):
-            result = arr[:, 0].sum()
-            result.compute()
-        """
-    cb = _make_function("callback", src)
-    hints = analyze_callback(cb, {"f": arr})
-    assert _hint_keys(hints) == ["f-sum"]
-
-
-def test_compute_expression_sub() -> None:
-    a = _simple_stub()
-    b = _simple_stub()
-    src = """
-        def callback(arr_a, arr_b):
-            result = (arr_a - arr_b).max()
-            result.compute()
-        """
-    cb = _make_function("callback", src)
-    hints = analyze_callback(cb, {"a": a, "b": b})
-    # The first registered array is the primary name
-    assert _hint_keys(hints) == ["a-max"]
-
-
-def test_compute_expression_pow() -> None:
-    arr = _simple_stub()
-    src = """
-        def callback(arr):
-            result = (arr ** 2).sum()
-            result.compute()
-        """
-    cb = _make_function("callback", src)
-    hints = analyze_callback(cb, {"f": arr})
-    assert _hint_keys(hints) == ["f-sum"]
-
-
-def test_compute_expression_mul() -> None:
-    a = _simple_stub()
-    b = _simple_stub()
-    src = """
-        def callback(arr_a, arr_b):
-            result = (arr_a * arr_b).sum()
-            result.compute()
-        """
-    cb = _make_function("callback", src)
-    hints = analyze_callback(cb, {"a": a, "b": b})
-    assert _hint_keys(hints) == ["a-sum"]
-
-
-def test_compute_dask_module_sum() -> None:
-    """``da.sum(arr)`` module-style reduction should be detected."""
-    arr = _simple_stub()
-    src = """
-        def callback(arr):
-            result = da.sum(arr)
-            result.compute()
-        """
-    cb = _make_function("callback", src)
-    hints = analyze_callback(cb, {"f": arr})
-    assert _hint_keys(hints) == ["f-sum"]
 
 
 def test_compute_helper_same_file() -> None:
@@ -321,28 +320,39 @@ def test_client_compute_inside_helper() -> None:
 # ---------------------------------------------------------------------------
 # Materialization (errors)
 # ---------------------------------------------------------------------------
-def test_np_array_raises_materialization() -> None:
-    arr = _simple_stub()
-    src = """
+@pytest.mark.parametrize(
+    "source,arg_key",
+    [
+        pytest.param(
+            """\
         def callback(arr):
             full = np.array(arr)
-            full.compute()
-        """
-    cb = _make_function("callback", src)
-    with pytest.raises(MaterializationError):
-        analyze_callback(cb, {"f": arr})
-
-
-def test_np_asarray_raises_materialization() -> None:
-    arr = _simple_stub()
-    src = """
+            full.compute()""",
+            "f",
+            id="np_array",
+        ),
+        pytest.param(
+            """\
         def callback(arr):
             full = np.asarray(arr)
-            full.compute()
-        """
+            full.compute()""",
+            "f",
+            id="np_asarray",
+        ),
+        pytest.param(
+            """\
+        def callback(arr):
+            full = np.array(arr[0])""",
+            "fdistribu_offline",
+            id="offline_compression",
+        ),
+    ],
+)
+def test_materialization_error(source, arg_key) -> None:
+    src = textwrap.dedent(source)
     cb = _make_function("callback", src)
     with pytest.raises(MaterializationError):
-        analyze_callback(cb, {"f": arr})
+        analyze_callback(cb, {arg_key: _simple_stub()})
 
 
 # ---------------------------------------------------------------------------
@@ -361,26 +371,27 @@ def test_compute_fft_only_raises_no_precomputable_reduction() -> None:
         analyze_callback(cb, {"f": arr})
 
 
-def test_compute_no_boundary_raises_no_compute_boundary() -> None:
-    """A callback with dask operations but no compute boundary should raise NoComputeBoundaryError."""
-    arr = _simple_stub()
-    src = """
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param(
+            """\
         def callback(arr):
             result = arr.sum()
-            # result not computed - no boundary
-        """
-    cb = _make_function("callback", src)
-    with pytest.raises(NoComputeBoundaryError):
-        analyze_callback(cb, {"f": arr})
-
-
-def test_callback_with_no_dask_raises_no_compute_boundary() -> None:
-    """A callback with no dask at all should raise NoComputeBoundaryError."""
-    arr = _simple_stub()
-    src = """
+            # result not computed - no boundary""",
+            id="no_boundary",
+        ),
+        pytest.param(
+            """\
         def callback(arr):
-            x = 1 + 2
-        """
+            x = 1 + 2""",
+            id="no_dask",
+        ),
+    ],
+)
+def test_no_compute_boundary_error(source) -> None:
+    arr = _simple_stub()
+    src = textwrap.dedent(source)
     cb = _make_function("callback", src)
     with pytest.raises(NoComputeBoundaryError):
         analyze_callback(cb, {"f": arr})
@@ -418,38 +429,57 @@ def test_dynamic_loop_raises_incompatible_callback() -> None:
 # ---------------------------------------------------------------------------
 # force=True
 # ---------------------------------------------------------------------------
-def test_force_skips_with_warning(caplog) -> None:
-    """``force=True`` returns [] and logs a warning instead of raising."""
-    arr = da.zeros((10, 10), chunks=(10, 10), dtype=np.float64)
-    src = """
+@pytest.mark.parametrize(
+    "source,arr_factory,check_warning",
+    [
+        pytest.param(
+            """\
         def callback(arr):
             phi = da.fft.fft2(arr)
-            phi.compute()
-        """
-    cb = _make_function("callback", src)
-    with caplog.at_level("WARNING"):
-        hints = analyze_callback(cb, {"f": arr}, force=True)
-    # No reductions to precompute
-    assert hints == []
-    # At least one warning emitted
-    assert any(
-        "precompute" in str(rec.message).lower() or "reduc" in str(rec.message).lower() for rec in caplog.records
-    )
-
-
-def test_force_swallows_incompatible_callback(caplog) -> None:
-    """``force=True`` swallows IncompatibleCallbackError too."""
-    arr = _simple_stub()
-    src = """
+            phi.compute()""",
+            lambda: da.zeros((10, 10), chunks=(10, 10), dtype=np.float64),
+            True,
+            id="fft_no_reductions",
+        ),
+        pytest.param(
+            """\
         def callback(arr):
             op = 'sum'
             result = getattr(arr, op)()
-            result.compute()
-        """
+            result.compute()""",
+            _simple_stub,
+            False,
+            id="incompatible_getattr",
+        ),
+        pytest.param(
+            """\
+        def callback(arr):
+            return (arr - arr.mean()).sum().compute()""",
+            _simple_stub,
+            True,
+            id="cross_reduction_refusal",
+        ),
+    ],
+)
+def test_force_true_returns_empty(source, arr_factory, caplog, check_warning) -> None:
+    """``force=True`` returns [] and logs a warning instead of raising.
+
+    The user is explicitly opting out of the precompute safety net: the
+    analyzer swallows the refusal and returns zero hints, which the
+    registration layer turns into a legacy full-chunk scatter (or raises,
+    depending on the registration-time policy).
+    """
+    arr = arr_factory()
+    src = textwrap.dedent(source)
     cb = _make_function("callback", src)
     with caplog.at_level("WARNING"):
         hints = analyze_callback(cb, {"f": arr}, force=True)
     assert hints == []
+    if check_warning:
+        # At least one warning emitted about the refusal.
+        assert any(
+            "precompute" in str(rec.message).lower() or "reduc" in str(rec.message).lower() for rec in caplog.records
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -519,122 +549,68 @@ def test_gysela_measure_helper_loop() -> None:
     assert sum_count >= 5
 
 
-def test_offline_compression_raises_materialization() -> None:
-    """Gysela's compute_offline_compression uses np.array(...)."""
-    arr = _simple_stub()
-    src = """
-        def callback(arr):
-            full = np.array(arr[0])
-        """
-    cb = _make_function("callback", src)
-    with pytest.raises(MaterializationError):
-        analyze_callback(cb, {"fdistribu_offline": arr})
-
-
 # ---------------------------------------------------------------------------
 # Cross-reduction refusal (multi-reduction branches)
 # ---------------------------------------------------------------------------
-def test_cross_reduction_raises_unsupported_reduction_error() -> None:
-    """``(arr - arr.mean()).sum()`` must raise, NOT silently produce wrong hints.
-
-    The naive per-reduction hint extraction emits two hints:
-    - f-mean: arr.mean() -> per-bridge {n, total}
-    - f-sum:  (arr - mean).sum() -> per-bridge (chunk - chunk.mean()).sum()
-
-    The f-sum hint is WRONG in multi-bridge setups because the bridge
-    computes (chunk - chunk.mean()).sum() locally -- but the correct
-    expression requires the GLOBAL mean, which lives across bridges.
-    Per-bridge, (chunk - chunk.mean()).sum() is always 0, so the
-    global answer is always 0 regardless of input data.
-
-    We refuse the whole expression. With force=True the analyzer
-    swallows the error and returns no hints (so the user gets the
-    legacy full-chunk scatter path if they explicitly opt out).
-    """
-    arr = _simple_stub()
-    src = """
+@pytest.mark.parametrize(
+    "source,helper_src,check_msg",
+    [
+        pytest.param(
+            """\
         def callback(arr):
-            return (arr - arr.mean()).sum().compute()
-        """
-    cb = _make_function("callback", src)
-    from deisa.dask.precompute_analyzer import UnsupportedReductionError
-
-    with pytest.raises(UnsupportedReductionError) as exc_info:
-        analyze_callback(cb, {"f": arr})
-    # The error message must name the offending reduction and the
-    # cross-reduction dependency so the user can fix the callback.
-    msg = str(exc_info.value).lower()
-    assert "sum" in msg  # the outer reduction
-    assert "mean" in msg  # the inner reduction it depends on
-    assert "bridge" in msg or "global" in msg or "all bridges" in msg
-
-
-def test_cross_reduction_nested() -> None:
-    """Three-deep nested reductions must also be caught.
-
-    ``(arr - arr.mean().sum()).sum()``: the outer sum depends on
-    ``arr.mean().sum()`` (a sum of a mean), which itself depends on
-    arr. The walker follows the chain all the way back to the inner
-    aggregate and refuses.
-    """
-    arr = _simple_stub()
-    src = """
+            return (arr - arr.mean()).sum().compute()""",
+            None,
+            True,
+            id="simple_cross",
+        ),
+        pytest.param(
+            """\
         def callback(arr):
-            return (arr - arr.mean().sum()).sum().compute()
-        """
-    cb = _make_function("callback", src)
-    from deisa.dask.precompute_analyzer import UnsupportedReductionError
-
-    with pytest.raises(UnsupportedReductionError):
-        analyze_callback(cb, {"f": arr})
-
-
-def test_cross_reduction_in_helper() -> None:
-    """Cross-reduction inside a same-file helper is caught the same way.
-
-    Mirrors the gysela diagnostic patterns where ``measure()`` and
-    ``density()`` helpers may compose reductions. The analyzer walks
-    helper bodies, so a cross-reduction dependency in a helper also
-    triggers the refusal.
-    """
-    arr = _simple_stub()
-    src = """
+            return (arr - arr.mean().sum()).sum().compute()""",
+            None,
+            False,
+            id="nested_cross",
+        ),
+        pytest.param(
+            """\
         def callback(arr):
             return drift(arr).compute()
 
         def drift(arr):
-            return (arr - arr.mean()).sum()
-        """
-    cb = _make_function("callback", src)
-    helpers = {"drift": _make_function("drift", src)}
-    from deisa.dask.precompute_analyzer import UnsupportedReductionError
+            return (arr - arr.mean()).sum()""",
+            """\
+        def drift(arr):
+            return (arr - arr.mean()).sum()""",
+            False,
+            id="helper_cross",
+        ),
+    ],
+)
+def test_unsupported_reduction_error(source, helper_src, check_msg) -> None:
+    """A reduction depending on another reduction's aggregate must be refused.
 
-    with pytest.raises(UnsupportedReductionError):
-        analyze_callback(cb, {"f": arr}, helpers=helpers)
-
-
-def test_cross_reduction_force_true_returns_no_hints(caplog) -> None:
-    """``force=True`` swallows the refusal with a warning.
-
-    With force=True the user is explicitly opting out of the
-    precompute safety net. The analyzer logs a warning and returns
-    zero hints, which the registration layer turns into a
-    legacy full-chunk scatter (or raises -- depending on the
-    registration-time policy).
+    The naive per-reduction hint extraction would emit both an ``f-mean`` and
+    an ``f-sum`` hint, but ``f-sum`` is WRONG in multi-bridge setups: the
+    bridge would compute ``(chunk - chunk.mean()).sum()`` locally, which is
+    always 0. We refuse the whole expression (or with ``force=True`` the
+    analyzer swallows it and returns no hints, so the user gets the legacy
+    full-chunk scatter path if they explicitly opt out).
     """
     arr = _simple_stub()
-    src = """
-        def callback(arr):
-            return (arr - arr.mean()).sum().compute()
-        """
+    src = textwrap.dedent(source)
     cb = _make_function("callback", src)
-    with caplog.at_level("WARNING"):
-        hints = analyze_callback(cb, {"f": arr}, force=True)
-    assert hints == []
-    # A warning was emitted about the refusal.
-    assert any(
-        "unsupported" in str(rec.message).lower() or "reduc" in str(rec.message).lower() for rec in caplog.records
-    )
+    helpers = None
+    if helper_src is not None:
+        helpers = {"drift": _make_function("drift", textwrap.dedent(helper_src))}
+    with pytest.raises(UnsupportedReductionError) as exc:
+        analyze_callback(cb, {"f": arr}, helpers=helpers)
+    if check_msg:
+        # The error message must name the offending reduction and the
+        # cross-reduction dependency so the user can fix the callback.
+        msg = str(exc.value).lower()
+        assert "sum" in msg  # the outer reduction
+        assert "mean" in msg  # the inner reduction it depends on
+        assert "bridge" in msg or "global" in msg or "all bridges" in msg
 
 
 def test_independent_reductions_not_refused() -> None:
