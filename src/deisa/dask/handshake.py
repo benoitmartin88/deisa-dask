@@ -27,10 +27,11 @@
 # POSSIBILITY OF SUCH DAMAGE.
 # =============================================================================
 import logging
-from typing import Optional
+from typing import List, Optional
 
 from distributed import Client, Event, Future, get_client
 
+from deisa.dask.branch import BranchSpec
 from deisa.dask.constants import KEY_PREFIX
 from deisa.dask.utils import _get_actor
 
@@ -90,7 +91,7 @@ class Handshake:
             logger.debug(f"set_task_branches(): array_name={array_name}, hints={hints}")
             self.task_branches[array_name] = hints
 
-        def get_task_branches(self, array_name: str) -> list | Future:
+        def get_task_branches(self, array_name: str) -> List[BranchSpec] | Future:
             return self.task_branches.get(array_name, [])
 
         def get_task_branches_dict(self) -> dict | Future:
@@ -149,7 +150,7 @@ class Handshake:
         assert self.__handshake_actor is not None
         self.__handshake_actor.set_task_branches(array_name, hints)
 
-    def get_task_branches(self, array_name: str) -> list:
+    def get_task_branches(self, array_name: str) -> List[BranchSpec]:
         assert self.__handshake_actor is not None
         return self.__handshake_actor.get_task_branches(array_name).result()
 
