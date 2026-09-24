@@ -300,7 +300,7 @@ def build_branch_from_dict(
 def analyze_branch(
     callback: Callable,
     registered_arrays: Dict[str, Any],
-    force: bool = False,
+    precompute: bool = True,
 ) -> List[BranchSpec]:
     """Walk the callback's dask graph and emit a :class:`BranchSpec` per
     branch.
@@ -329,9 +329,9 @@ def analyze_branch(
         registered array. Dask arrays become the roots of the task
         graph walk; non-dask values are treated as opaque helpers
         (their attributes may be read for opaque-resolvable branches).
-    force : bool
-        If True, skip unresolvable reductions with a warning instead of
-        raising. Matches :func:`analyze_callback`'s ``force`` semantics.
+    precompute : bool
+        If False, skip unresolvable reductions with a warning instead of
+        raising. Matches :func:`analyze_callback`'s ``precompute`` semantics.
 
     Returns
     -------
@@ -352,12 +352,12 @@ def analyze_branch(
 
     try:
         hints, walker_dask_arrays = analyze_callback_with_dask_arrays(
-            callback, registered_arrays, force=force
+            callback, registered_arrays, precompute=precompute
         )
     except Exception:
-        if not force:
+        if precompute:
             raise
-        # force=True: fall through with empty hints/dask_arrays; the
+        # precompute=False: fall through with empty hints/dask_arrays; the
         # length-1 fallback still works.
         hints, walker_dask_arrays = [], []
 
@@ -400,7 +400,7 @@ def analyze_branch(
         try:
             chunk_func = _pickle.loads(branch_dict["chunk_func_pickle"])
         except Exception as e:  # pragma: no cover - safety net
-            if force:
+            if not precompute:
                 logger.warning("analyze_branch: unpickle failed for %s: %s", branch_dict.get("output_key"), e)
                 continue
             raise
@@ -447,7 +447,7 @@ def analyze_branch(
                 placeholder=placeholder,
             )
         if branch is None:
-            if force:
+            if not precompute:
                 logger.debug(
                     "analyze_branch: build failed for %s; "
                     "the length-1 path's build_branch_from_dict raised "
