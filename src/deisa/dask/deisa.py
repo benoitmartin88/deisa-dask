@@ -251,7 +251,7 @@ class Deisa(IDeisa):
         *callback_args: CallbackArgs,
         exception_handler: IDeisa.ExceptionHandler = __default_exception_handler,
         when: Literal["AND", "OR"] = "AND",
-        force: bool = False,
+        precompute: bool = True,
     ) -> Callable:
         """
         Registers a callback function with specific arguments, exception handling, and conditional execution criteria.
@@ -272,11 +272,11 @@ class Deisa(IDeisa):
 
         Every callback is automatically analyzed for dask reduction operations
         (sum, mean, std, var, max, min, prod) which are executed locally on
-        each bridge before scatter to reduce network transfer. There is no
-        opt-in: the optimization is always attempted, and any callback that
+        each bridge before scatter to reduce network transfer. Precompute
+        analysis is always attempted (the default), and any callback that
         cannot be precomputed (no reductions, or a reduction that depends on
         another reduction's output) raises at registration time. Use
-        ``force=True`` to skip the analysis with a warning and fall back to
+        ``precompute=False`` to skip the analysis with a warning and fall back to
         the legacy full-chunk scatter path.
 
         - ``:param callback_args:`` Variable-length arguments representing callback-specific parameters.
@@ -284,8 +284,8 @@ class Deisa(IDeisa):
              Defaults to ``__default_exception_handler``.
         - ``:param when:`` Specifies the conditional logic for triggering the callback. Can be 'AND' or 'OR'.
              Defaults to 'AND'.
-        - ``:param force:`` If True, skip precompute analysis with a warning and use the
-             legacy full-chunk scatter path. Defaults to False (analysis is required).
+        - ``:param precompute:`` If False, skip precompute analysis with a warning and use the
+             legacy full-chunk scatter path. Defaults to True (analysis is required).
         - ``:return:`` A callable that wraps the provided callback with the configured parameters and logic.
         - ``:rtype:`` Callable
         """
@@ -296,7 +296,7 @@ class Deisa(IDeisa):
                 *callback_args,
                 exception_handler=exception_handler,
                 when=when,
-                force=force,
+                precompute=precompute,
             )
 
         return decorator
@@ -307,7 +307,7 @@ class Deisa(IDeisa):
         *callback_args: CallbackArgs,
         exception_handler: IDeisa.ExceptionHandler = __default_exception_handler,
         when: Literal["AND", "OR"] = "AND",
-        force: bool = False,
+        precompute: bool = True,
     ) -> Callable:
         """
         Registers a callback function with specific arguments, exception handling, and conditional execution criteria.
@@ -330,7 +330,7 @@ class Deisa(IDeisa):
         - ``:param callback_args:``  Variable-length arguments representing callback-specific parameters.
         - ``:param exception_handler:``  Optional exception handler to manage errors during callback execution.
         - ``:param when:``  Specifies the conditional logic for triggering the callback. Can be 'AND' or 'OR'.
-        - ``:param force:``  If True, skip precompute analysis with a warning and
+        - ``:param precompute:``  If False, skip precompute analysis with a warning and
              use the legacy full-chunk scatter path.
         - ``:return:``  A callable that wraps the provided callback with the configured parameters and logic.
         """
@@ -349,7 +349,7 @@ class Deisa(IDeisa):
                 raise TypeError("callback_args must be str or tuple")
 
         callback_id = self._register_callback_impl(
-            callback, parsed, exception_handler=exception_handler, when=when, force=force
+            callback, parsed, exception_handler=exception_handler, when=when, precompute=precompute
         )
         callback.callback_id = callback_id
         return callback
@@ -360,7 +360,7 @@ class Deisa(IDeisa):
         parsed: List[Window],
         exception_handler: IDeisa.ExceptionHandler,
         when: Literal["AND", "OR"],
-        force: bool = False,
+        precompute: bool = True,
     ) -> Callback_id:
 
         if when not in ("AND", "OR"):
@@ -393,22 +393,22 @@ class Deisa(IDeisa):
         # The method takes the full {name: stub} dict so cross-array callbacks
         # (e.g. cb(temperature, pressure)) are handled in one analysis.
 
-        # ``force=True`` is the explicit opt-out of precompute: skip the
+        # ``precompute=False`` is the explicit opt-out of precompute: skip the
         # analysis entirely and fall back to the legacy full-chunk scatter
         # path. This is the documented contract (see ``register``) and what
         # the test_no_precompute_worker_sees_full_chunk test expects.
-        # Previously, force=True still ran the analysis and (when the
-        # callback had a valid reduction) set branches, silently defeating
-        # the opt-out intent.
+        # Previously, an explicit opt-out (``force=True``) still ran the
+        # analysis and (when the callback had a valid reduction) set branches,
+        # silently defeating the opt-out intent.
         from deisa.dask.precompute_analyzer import NoPrecomputableReductionError
 
         for array_name in array_names:
             self._callbacks_by_array.setdefault(array_name, set()).add(callback_id)
 
-        if force:
+        if not precompute:
             logger.warning(
                 f"_register_callback_impl: callback {callback.__name__!r} registered "
-                f"with force=True -- skipping precompute analysis; the bridge will "
+                f"with precompute=False -- skipping precompute analysis; the bridge will "
                 f"use the legacy full-chunk scatter path."
             )
         else:
@@ -416,7 +416,7 @@ class Deisa(IDeisa):
             # overhead. The method takes the full registered_arrays dict; we
             # pass arrays_metadata here. The bridge distributes branches per
             # array using the array names embedded in each BranchSpec.
-            branches = self._analyze_callback_for_branches(callback, self.arrays_metadata, force=False)
+            branches = self._analyze_callback_for_branches(callback, self.arrays_metadata, precompute=True)
             array_name = array_names[0] if array_names else None
             if array_name and branches:
                 self.handshake.set_task_branches(array_name, branches)
@@ -426,7 +426,7 @@ class Deisa(IDeisa):
                     f"no precomputable branches for array '{array_name}'. Without "
                     f"branches, the bridge will fall back to scattering the FULL "
                     f"chunk to the dask workers -- this is the behavior the "
-                    f"precompute optimization is designed to avoid. Set force=True "
+                    f"precompute optimization is designed to avoid. Set precompute=False "
                     f"and catch the exception if the full-chunk path is acceptable."
                 )
                 raise NoPrecomputableReductionError(
@@ -440,9 +440,9 @@ class Deisa(IDeisa):
                 )
 
         # create the topic handler and subscribe for EVERY array in a
-        # callback (both force=True and precompute paths -- with force=True
-        # the bridge still needs the topic subscription to receive data and
-        # fire the callback on the full-chunk path).
+        # callback (both precompute=True and precompute=False paths -- with
+        # precompute=False the bridge still needs the topic subscription to
+        # receive data and fire the callback on the full-chunk path).
         for array_name in array_names:
             self._callbacks_by_array.setdefault(array_name, set()).add(callback_id)
             if array_name not in self._topic_handlers:
@@ -839,7 +839,7 @@ class Deisa(IDeisa):
         return da.block(nested)
 
     def _analyze_callback_for_branches(
-        self, callback: Callable, registered_arrays: Dict[str, Any], force: bool = False):
+        self, callback: Callable, registered_arrays: Dict[str, Any], precompute: bool = True):
         """
         Analyze the callback's source and build a list of :class:`BranchSpec`
         objects describing the chunk-local sub-expressions the bridge can
@@ -856,8 +856,8 @@ class Deisa(IDeisa):
 
         - ``:param callback:`` The callback function to analyze.
         - ``:param registered_arrays:`` Mapping of array name -> dask array (or placeholder) for all registered arrays.
-        - ``:param force:`` If True, log warnings instead of raising on
-             analysis errors. Defaults to False.
+        - ``:param precompute:`` If False, log warnings instead of raising on
+             analysis errors. Defaults to True.
         - ``:return:`` List of BranchSpec objects (empty if analysis fails
              or no reductions are detected).
         """
@@ -897,17 +897,17 @@ class Deisa(IDeisa):
             return analyze_branch(
                 callback,
                 registered_arrays=stubs,
-                force=force,
+                precompute=precompute,
             )
         except PrecomputeError:
             # Cross-reduction, opaque parameter, etc. -- propagate so
             # the caller learns the analysis was unable to deliver a
-            # hint. force=True cases are handled inside analyze_branch
+            # hint. precompute=False cases are handled inside analyze_branch
             # (which logs warnings instead of raising), so by the time
-            # we get here force=False was set and we must propagate.
+            # we get here precompute=True was set and we must propagate.
             raise
         except Exception as e:
-            if force:
+            if not precompute:
                 logger.debug(f"_analyze_callback_for_branches: Analysis failed: {e}")
                 return []
             raise

@@ -500,7 +500,7 @@ def extract_reduction_hints(darr: da.Array, array_name: str = "f") -> List[Dict[
                 f"requires data from ALL bridges (not just this bridge's chunk). "
                 f"Redesign the callback to use a single reduction (e.g. split the "
                 f"expression into two callbacks, or pre-compute the inner reduction "
-                f"in a separate step). With ``force=True``, the legacy full-chunk "
+                f"in a separate step). With ``precompute=False``, the legacy full-chunk "
                 f"scatter path runs and dask computes the expression correctly on "
                 f"the workers (at the cost of placing the full chunk on workers)."
             )

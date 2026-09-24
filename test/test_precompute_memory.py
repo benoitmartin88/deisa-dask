@@ -254,12 +254,12 @@ class TestPrecomputeMemory:
 
         callback_results: List[float] = []
 
-        @deisa.register(array_name, force=True)
-        # NOTE: force=True opts out of precompute and falls back to the
+        @deisa.register(array_name, precompute=False)
+        # NOTE: precompute=False opts out of precompute and falls back to the
         # legacy full-chunk scatter path. The callback has a reduction
-        # (``arr.sum()``), so without force=True it would be precomputed.
+        # (``arr.sum()``), so without precompute=False it would be precomputed.
         # This control test confirms the memory harness can detect the
-        # full chunk on workers when force=True is used.
+        # full chunk on workers when precompute=False is used.
         def _cb(window: list[DeisaArray]) -> None:
             arr = window[-1]
             logging.warning(f"NO-PRECOMPUTE TEST: callback received shape={arr.shape}")

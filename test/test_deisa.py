@@ -294,7 +294,7 @@ class TestUsingDaskCluster:
                 if expected_window_size["temperature"]
                 else "temperature",
                 exception_handler=self.exception_handler,
-                force=True,
+                precompute=False,
             )
 
         def check(self, state, i, expected):
@@ -316,7 +316,7 @@ class TestUsingDaskCluster:
                 if expected_window_size["pressure"]
                 else "pressure",
                 exception_handler=self.exception_handler,
-                force=True,
+                precompute=False,
             )
 
         def check(self, state, i, expected):
@@ -330,7 +330,7 @@ class TestUsingDaskCluster:
                 if expected_window_size["temperature"]
                 else "temperature",
                 exception_handler=self.exception_handler,
-                force=True,
+                precompute=False,
             )
             def cb(temperature: List[DeisaArray]):
                 state["temperature"] = temperature
@@ -349,7 +349,7 @@ class TestUsingDaskCluster:
                 if expected_window_size["pressure"]
                 else "pressure",
                 exception_handler=self.exception_handler,
-                force=True,
+                precompute=False,
             )
             def cb(temperature: List[DeisaArray], pressure: List[DeisaArray]):
                 state["temperature"] = temperature
@@ -371,7 +371,7 @@ class TestUsingDaskCluster:
                 else "pressure",
                 "density",
                 exception_handler=self.exception_handler,
-                force=True,
+                precompute=False,
             )
             def cb(temperature: List[DeisaArray], pressure: List[DeisaArray], density: List[DeisaArray]):
                 state["temperature"] = temperature
@@ -399,7 +399,7 @@ class TestUsingDaskCluster:
                 # map_blocks(...).compute() materializes the array on the
                 # bridge (no chunk-local reduction to precompute), so this
                 # callback uses the legacy full-chunk path.
-                force=True,
+                precompute=False,
             )
             def cb(temperature: List[DeisaArray]):
                 meta = np.array([[0]])
@@ -568,7 +568,7 @@ class TestUsingDaskCluster:
             raise RuntimeError("Throw from user exception handler.")
 
         # default exception_handler
-        callback_id = deisa.register_callback(window_callback, "my_array", force=True)
+        callback_id = deisa.register_callback(window_callback, "my_array", precompute=False)
         assert callback_id is not None, "callback was not registered"
         time.sleep(0.5)
         sim.generate_data("my_array", iteration=1)
@@ -578,7 +578,7 @@ class TestUsingDaskCluster:
         # custom error handler
         deisa.unregister_callback(callback_id)
         callback_id = deisa.register_callback(
-            window_callback, "my_array", exception_handler=custom_exception_handler, force=True
+            window_callback, "my_array", exception_handler=custom_exception_handler, precompute=False
         )
         assert callback_id is not None, "callback was not registered"
         time.sleep(0.5)
@@ -589,7 +589,7 @@ class TestUsingDaskCluster:
         # custom error handler that throws
         deisa.unregister_callback(callback_id)
         callback_id = deisa.register_callback(
-            window_callback, "my_array", exception_handler=custom_exception_handler_raise, force=True
+            window_callback, "my_array", exception_handler=custom_exception_handler_raise, precompute=False
         )
         assert callback_id is not None, "callback was not registered"
         time.sleep(0.5)
@@ -632,7 +632,7 @@ class TestUsingDaskCluster:
 
         context = {"counter": 0, "exception_handler": 0}
 
-        @deisa.register("my_array", force=True)
+        @deisa.register("my_array", precompute=False)
         def window_callback(my_array: list[DeisaArray]):
             print(f"hello from window_callback. iteration={my_array[-1].t}", flush=True)
             context["counter"] += 1
@@ -655,7 +655,9 @@ class TestUsingDaskCluster:
 
         # custom error handler
         deisa.unregister_callback(window_callback)
-        deisa.register_callback(window_callback, "my_array", exception_handler=custom_exception_handler, force=True)
+        deisa.register_callback(
+            window_callback, "my_array", exception_handler=custom_exception_handler, precompute=False
+        )
         # assert window_callback.callback_id is not None, "callback was not registered"
         assert "my_array" in deisa._callbacks_by_array, "callback was not registered for my_array"
         assert len(deisa._callbacks_by_array["my_array"]) == 1, "expected exactly one callback registered"
@@ -667,7 +669,7 @@ class TestUsingDaskCluster:
         # custom error handler that throws
         deisa.unregister_callback(window_callback)
         deisa.register_callback(
-            window_callback, "my_array", exception_handler=custom_exception_handler_raise, force=True
+            window_callback, "my_array", exception_handler=custom_exception_handler_raise, precompute=False
         )
         # assert window_callback.callback_id is not None, "callback was not registered"
         assert "my_array" in deisa._callbacks_by_array, "callback was not registered for my_array"
@@ -756,7 +758,7 @@ class TestUsingDaskCluster:
             context["counter"] += 1
             deisa.set("hello", "world", timestep=window[-1].t)
 
-        deisa.register_callback(window_callback, Window("my_array", size=1), force=True)
+        deisa.register_callback(window_callback, Window("my_array", size=1), precompute=False)
         sim.generate_data("my_array", iteration=1)
         assert wait_for(lambda: context["counter"] == 1)
         assert wait_for(lambda: sim.bridges[0].get("hello", timestep=1) == "world")
@@ -858,7 +860,7 @@ class TestUsingDaskCluster:
         # Record iterations at which the callback actually fires
         called_iterations = []
 
-        @deisa.register("x", "y", force=True)
+        @deisa.register("x", "y", precompute=False)
         def cb(x_arrays, y_arrays):
             x_t = x_arrays[-1].timestep
             y_t = y_arrays[-1].timestep

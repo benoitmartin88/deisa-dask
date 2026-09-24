@@ -120,7 +120,7 @@ def analyze_callback(
     callback: Callable,
     registered_arrays: Dict[str, Any],
     helpers: Optional[Dict[str, Callable]] = None,
-    force: bool = False,
+    precompute: bool = True,
 ) -> List[Dict[str, Any]]:
     """Analyze the callback's source to find all reducible operations.
 
@@ -133,23 +133,23 @@ def analyze_callback(
       for helper functions defined in another module (or to disambiguate
       same-file helpers). Helpers not listed here are also resolved by
       walking the callback's source file.
-    - ``:param force:`` If True, skip unresolvable reductions with a warning
-      instead of raising.
+    - ``:param precompute:`` If False, skip unresolvable reductions with a
+      warning instead of raising.
     - ``:return:`` List of branch dicts (the schema from
       :mod:`deisa.dask.task_branches`).
-    - ``:raises PrecomputeError:`` On any unresolvable reduction (unless ``force=True``).
+    - ``:raises PrecomputeError:`` On any unresolvable reduction (unless ``precompute=False``).
     """
     try:
-        hints, err, _dask_arrays = _analyze_callback(callback, registered_arrays, helpers, force)
+        hints, err, _dask_arrays = _analyze_callback(callback, registered_arrays, helpers, precompute)
     except PrecomputeError as e:
-        if force:
-            logger.warning("analyze_callback: %s (force=True, skipping)", e)
+        if not precompute:
+            logger.warning("analyze_callback: %s (precompute=False, skipping)", e)
             return []
         raise
 
     if err is not None:
-        if force:
-            logger.warning("analyze_callback: %s (force=True, skipping)", err)
+        if not precompute:
+            logger.warning("analyze_callback: %s (precompute=False, skipping)", err)
             return []
         raise err
 
@@ -160,7 +160,7 @@ def analyze_callback_with_dask_arrays(
     callback: Callable,
     registered_arrays: Dict[str, Any],
     helpers: Optional[Dict[str, Callable]] = None,
-    force: bool = False,
+    precompute: bool = True,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Variant of :func:`analyze_callback` that also returns the
     AST walker's ``dask_arrays``.
@@ -174,15 +174,15 @@ def analyze_callback_with_dask_arrays(
     the root layer, not the chain.
     """
     try:
-        hints, err, dask_arrays = _analyze_callback(callback, registered_arrays, helpers, force)
+        hints, err, dask_arrays = _analyze_callback(callback, registered_arrays, helpers, precompute)
     except PrecomputeError as e:
-        if force:
-            logger.warning("analyze_callback: %s (force=True, skipping)", e)
+        if not precompute:
+            logger.warning("analyze_callback: %s (precompute=False, skipping)", e)
             return [], []
         raise
     if err is not None:
-        if force:
-            logger.warning("analyze_callback: %s (force=True, skipping)", err)
+        if not precompute:
+            logger.warning("analyze_callback: %s (precompute=False, skipping)", err)
             return [], dask_arrays
         raise err
     return hints, dask_arrays
@@ -192,12 +192,12 @@ def _analyze_callback(
     callback: Callable,
     registered_arrays: Dict[str, Any],
     helpers: Optional[Dict[str, Callable]],
-    force: bool,
+    precompute: bool,
 ) -> tuple[List[Dict[str, Any]], Optional[PrecomputeError], List[Dict[str, Any]]]:
     """Internal worker for :func:`analyze_callback` that never swallows errors.
 
     Returns ``(hints, last_error, dask_arrays)``. The caller decides how
-    to surface the error: ``force=True`` warnings or normal raises.
+    to surface the error: ``precompute=False`` warnings or normal raises.
     ``dask_arrays`` is the ``_BoundaryWalker.dask_arrays`` snapshot --
     the dask expressions the walker built at each compute boundary,
     each ``{"array": darr, "kind": ..., "lineno": ...}``. Callers that
@@ -281,8 +281,8 @@ def _analyze_callback(
             # signal we MUST propagate to the caller. The precompute
             # path cannot produce correct per-bridge partials for an
             # expression whose reduction depends on another
-            # reduction's output. Force=False users get an error
-            # here; force=True users get it handled by analyze_branch.
+            # reduction's output. Precompute=True users get an error
+            # here; precompute=False users get it handled by analyze_branch.
             raise
         except Exception as e:  # pragma: no cover - safety net
             logger.debug("extract_reduction_hints failed: %s", e)
