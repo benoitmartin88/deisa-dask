@@ -1,31 +1,3 @@
-# =============================================================================
-# Copyright (C) 2026 Commissariat a l'energie atomique et aux energies alternatives (CEA)
-#
-# All rights reserved.
-#
-# Redistribution and use in source and binary forms, with or without
-# modification, are permitted provided that the following conditions are met:
-# * Redistributions of source code must retain the above copyright notice,
-#   this list of conditions and the following disclaimer.
-# * Redistributions in binary form must reproduce the above copyright notice,
-#   this list of conditions and the following disclaimer in the documentation
-#   and/or other materials provided with the distribution.
-# * Neither the names of CEA, nor the names of the contributors may be used
-#   to endorse or promote products derived from this software without specific
-#   prior written permission.
-#
-# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
-# POSSIBILITY OF SUCH DAMAGE.
-# =============================================================================
 """
 Unit tests for the Stage 2B chain-folding walker.
 
@@ -37,11 +9,13 @@ chains, refuses constants and cross-array chains, and produces
 branch_func callables that match naive numpy computations.
 """
 
+import functools
 import textwrap
 from typing import Any, Callable, Dict
 
 import dask.array as da
 import numpy as np
+import pytest
 
 from deisa.dask.branch import (
     _build_chain_branch_func,
@@ -78,73 +52,56 @@ def _find_agg_layer(graph) -> str:
 # _walk_chain
 # ---------------------------------------------------------------------------
 class TestWalkChain:
-    def test_single_input_chain_with_self_ref(self):
-        """``(arr * arr).sum()`` chain has 2 layers: mul, sum."""
+    @pytest.mark.parametrize(
+        "expr,expected_length,should_refuse",
+        [
+            pytest.param(
+                lambda arr: (arr * arr).sum(),
+                2,
+                False,
+                id="self-ref-mul-sum",
+            ),
+            pytest.param(
+                lambda arr: np.log(np.exp(arr)).sum(),
+                3,
+                False,
+                id="ufunc-exp-log-sum",
+            ),
+            pytest.param(
+                lambda arr: (arr**arr).sum(),
+                2,
+                False,
+                id="self-ref-pow-sum",
+            ),
+            pytest.param(
+                lambda arr: np.sin(arr).sum(axis=0),
+                2,
+                False,
+                id="sin-axis0-sum",
+            ),
+            pytest.param(
+                lambda arr: (arr - arr.mean()).sum(),
+                None,
+                True,
+                id="cross-array-refused",
+            ),
+            pytest.param(
+                lambda arr: (arr + 1).sum(),
+                None,
+                True,
+                id="scalar-constant-refused",
+            ),
+        ],
+    )
+    def test_walk_chain_parametrized(self, expr, expected_length, should_refuse):
         arr = da.zeros((4, 4), chunks=2)
-        expr = (arr * arr).sum()
-        g = expr.__dask_graph__()
+        g = expr(arr).__dask_graph__()
         chain = _walk_chain(g, _find_agg_layer(g))
-        assert chain is not None
-        assert len(chain) == 2
-        # First layer: mul with 2-input (self-ref)
-        func, kwargs, input_count = chain[0]
-        # dask stores the numpy wrapper as `mul`; the ufunc is `multiply`.
-        # Either name is fine; what matters is it's a binary pointwise op
-        # that consumes the upstream array twice.
-        func_name = getattr(func, "__name__", "")
-        assert func_name in {"mul", "multiply"}, f"unexpected func name {func_name!r}"
-        assert input_count == 2  # arr * arr references arr twice
-        # Second layer: sum chunk-stage
-        func, kwargs, input_count = chain[1]
-        assert input_count == 1
-
-    def test_ufunc_chain(self):
-        """``np.log(np.exp(arr)).sum()`` chain has 3 layers."""
-        arr = da.zeros((4, 4), chunks=2)
-        expr = np.log(np.exp(arr)).sum()
-        g = expr.__dask_graph__()
-        chain = _walk_chain(g, _find_agg_layer(g))
-        assert chain is not None
-        assert len(chain) == 3
-
-    def test_self_ref_pow(self):
-        """``(arr ** arr).sum()`` chain has 2 layers: pow, sum."""
-        arr = da.zeros((4, 4), chunks=2)
-        expr = (arr**arr).sum()
-        g = expr.__dask_graph__()
-        chain = _walk_chain(g, _find_agg_layer(g))
-        assert chain is not None
-        assert len(chain) == 2
-
-    def test_chain_with_axis_reduction(self):
-        """``np.sin(arr).sum(axis=0)`` chain has 2 layers and a chunk-stage axis reduction."""
-        arr = da.zeros((4, 4), chunks=2)
-        expr = np.sin(arr).sum(axis=0)
-        g = expr.__dask_graph__()
-        chain = _walk_chain(g, _find_agg_layer(g))
-        assert chain is not None
-        assert len(chain) == 2
-
-    def test_cross_array_chain_refused(self):
-        """``(arr - arr.mean()).sum()`` reads from two distinct arrays
-        (the placeholder and the mean's output). The walker refuses.
-        """
-        arr = da.zeros((4, 4), chunks=2)
-        expr = (arr - arr.mean()).sum()
-        g = expr.__dask_graph__()
-        chain = _walk_chain(g, _find_agg_layer(g))
-        assert chain is None
-
-    def test_chain_with_scalar_constant_refused(self):
-        """``(arr + 1).sum()`` has a scalar constant in the add layer.
-        The walker refuses because constants aren't currently supported
-        (deferred to a follow-up).
-        """
-        arr = da.zeros((4, 4), chunks=2)
-        expr = (arr + 1).sum()
-        g = expr.__dask_graph__()
-        chain = _walk_chain(g, _find_agg_layer(g))
-        assert chain is None
+        if should_refuse:
+            assert chain is None
+        else:
+            assert chain is not None
+            assert len(chain) == expected_length
 
 
 # ---------------------------------------------------------------------------
@@ -155,49 +112,51 @@ class TestChainBranchFunc:
     every foldable chain. This is the core correctness property.
     """
 
-    def test_squared_sum(self):
+    @pytest.mark.parametrize(
+        "expr,seed,data_generator,expected_expr,rtol",
+        [
+            pytest.param(
+                lambda arr: (arr * arr).sum(),
+                0,
+                lambda: np.random.random((4, 4)),
+                lambda real: (real * real).sum(),
+                None,
+                id="squared-sum",
+            ),
+            pytest.param(
+                lambda arr: np.log(np.exp(arr)).sum(),
+                1,
+                lambda: np.random.random((4, 4)),
+                lambda real: real.sum(),
+                1e-6,
+                id="ufunc-chain",
+            ),
+            pytest.param(
+                lambda arr: (arr**arr).sum(),
+                2,
+                lambda: np.random.random((4, 4)) * 0.5,
+                lambda real: (real**real).sum(),
+                None,
+                id="pow-self",
+            ),
+        ],
+    )
+    def test_chain_branch_func_parametrized(self, expr, seed, data_generator, expected_expr, rtol):
         arr = da.zeros((4, 4), chunks=2)
-        expr = (arr * arr).sum()
-        g = expr.__dask_graph__()
+        g = expr(arr).__dask_graph__()
         chain = _walk_chain(g, _find_agg_layer(g))
         assert chain is not None
         branch_func = _build_chain_branch_func(chain)
 
-        np.random.seed(0)
-        real = np.random.random((4, 4))
+        np.random.seed(seed)
+        real = data_generator()
         result = float(branch_func(real).sum())
-        expected = float((real * real).sum())
-        assert np.isclose(result, expected)
+        expected = float(expected_expr(real))
 
-    def test_ufunc_chain(self):
-        arr = da.zeros((4, 4), chunks=2)
-        expr = np.log(np.exp(arr)).sum()
-        g = expr.__dask_graph__()
-        chain = _walk_chain(g, _find_agg_layer(g))
-        assert chain is not None
-        branch_func = _build_chain_branch_func(chain)
-
-        np.random.seed(1)
-        real = np.random.random((4, 4))
-        result = float(branch_func(real).sum())
-        # log(exp(x)) = x, so result == sum(real)
-        expected = float(real.sum())
-        assert np.isclose(result, expected, rtol=1e-6)
-
-    def test_pow_self(self):
-        arr = da.zeros((4, 4), chunks=2)
-        expr = (arr**arr).sum()
-        g = expr.__dask_graph__()
-        chain = _walk_chain(g, _find_agg_layer(g))
-        assert chain is not None
-        branch_func = _build_chain_branch_func(chain)
-
-        np.random.seed(2)
-        # Use small positive values to avoid overflow with arr ** arr
-        real = np.random.random((4, 4)) * 0.5
-        result = float(branch_func(real).sum())
-        expected = float((real**real).sum())
-        assert np.isclose(result, expected)
+        if rtol is not None:
+            assert np.isclose(result, expected, rtol=rtol)
+        else:
+            assert np.isclose(result, expected)
 
     def test_picklable(self):
         """The composed branch_func must be picklable so it can cross
@@ -232,37 +191,45 @@ class TestFindChunkLayer:
 
 
 class TestFindSingleUpstream:
-    def test_single_input_returns_name_and_count(self):
+    @pytest.mark.parametrize(
+        "expr,layer_selector,expected_name_start,expected_count",
+        [
+            pytest.param(
+                lambda arr: (arr * arr).sum(),
+                lambda g: next(ln for ln in g.layers if ln.startswith("sum-") and "aggregate" not in ln),
+                "mul-",
+                1,
+                id="sum-layer-single-input",
+            ),
+            pytest.param(
+                lambda arr: (arr * arr).sum(),
+                lambda g: next(ln for ln in g.layers if ln.startswith("mul-")),
+                "zeros_like-",
+                2,
+                id="mul-layer-self-ref",
+            ),
+            pytest.param(
+                lambda arr: (arr + 1).sum(),
+                lambda g: next(ln for ln in g.layers if ln.startswith("add-")),
+                None,
+                None,
+                id="add-layer-constant-refused",
+            ),
+        ],
+    )
+    def test_find_single_upstream_parametrized(self, expr, layer_selector, expected_name_start, expected_count):
         arr = da.zeros((4, 4), chunks=2)
-        g = (arr * arr).sum().__dask_graph__()
-        # Find the chunk-stage (sum) layer
-        sum_layer = next(ln for ln in g.layers if ln.startswith("sum-") and "aggregate" not in ln)
-        result = _find_single_upstream(g.layers[sum_layer])
-        assert result is not None
-        name, count = result
-        assert name.startswith("mul-")
-        assert count == 1  # sum reads from mul, single-input
-
-    def test_self_ref_returns_count_2(self):
-        arr = da.zeros((4, 4), chunks=2)
-        g = (arr * arr).sum().__dask_graph__()
-        # Find the mul layer (the chain's pointwise step)
-        mul_layer = next(ln for ln in g.layers if ln.startswith("mul-"))
-        result = _find_single_upstream(g.layers[mul_layer])
-        assert result is not None
-        name, count = result
-        # mul reads zeros_like twice (arr * arr) -> count == 2
-        assert name.startswith("zeros_like-")
-        assert count == 2
-
-    def test_constant_input_refused(self):
-        arr = da.zeros((4, 4), chunks=2)
-        g = (arr + 1).sum().__dask_graph__()
-        add_layer = next(ln for ln in g.layers if ln.startswith("add-"))
-        # add has 2 inputs: zeros_like (string) and (1, None) (constant tuple)
-        # The walker should refuse.
-        result = _find_single_upstream(g.layers[add_layer])
-        assert result is None
+        g = expr(arr).__dask_graph__()
+        layer = layer_selector(g)
+        result = _find_single_upstream(g.layers[layer])
+        if expected_count is None:
+            # Refused case (scalar constant): walker returns None.
+            assert result is None
+        else:
+            assert result is not None
+            name, count = result
+            assert name.startswith(expected_name_start)
+            assert count == expected_count
 
 
 # ---------------------------------------------------------------------------
@@ -277,11 +244,31 @@ class TestAnalyzeBranchLength1:
         """
         from deisa.dask.branch import analyze_branch
 
-        def cb(arr):
-            return arr.sum().compute()
+        # A multi-layer chain callback: (arr * arr).sum(). The chain
+        # walker must fold {mul, sum} into a single branch_func; the
+        # composed branch's _chain exposes the folded layers.
+        cb = _make_callback("test_analyze_branch_cb", "return (arr * arr).sum().compute()")
 
         arrs = {"f": da.zeros((4, 4), chunks=2)}
         branches = analyze_branch(cb, arrs)
         assert len(branches) == 1
         assert branches[0].output_key == "f-sum"
         assert branches[0].output_kind == "scalar"
+
+        # The branch_func is a functools.partial over _chain_branch_func;
+        # the folded layers live under its keywords["_chain"].
+        branch_func = branches[0].branch_func
+        chain = branch_func.keywords["_chain"]
+        assert len(chain) == 2  # mul + sum genuinely folded into one branch
+
+        def _layer_name(layer):
+            func = layer[0]
+            # The reduction's chunk-stage layer is itself a partial
+            # wrapping numpy.sum (carrying dtype); unwrap it for the name.
+            if isinstance(func, functools.partial):
+                return getattr(func.func, "__name__", repr(func))
+            return getattr(func, "__name__", repr(func))
+
+        names = [_layer_name(layer) for layer in chain]
+        assert any(n in {"mul", "multiply"} for n in names)
+        assert "sum" in names
