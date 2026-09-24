@@ -101,7 +101,7 @@ class Bridge(IBridge):
         self.client: Optional[Client] = None
         self._array_comms: Dict[str, Any] = {}  # array_name -> sub-comm (from comm.Split)
         self._handshake_metadata = None
-        self._task_branches: Dict[str, List[Dict]] = {}  # array_name -> branches for local execution
+        self._task_branches: Dict[str, List[BranchSpec]] = {}  # array_name -> branches for local execution
         self._chunk_axis_by_key: Dict[str, Dict[str, Optional[Tuple[int, ...]]]] = {}
         #  ^ array_name -> output_key -> chunk_axis (derived once from branches; static)
         self._branch_by_key: Dict[str, Dict[str, Any]] = {}
@@ -478,7 +478,7 @@ class Bridge(IBridge):
         timestep: int,
         precomputed: Optional[Dict] = None,
         precomputed_meta: Optional[Dict[str, Dict]] = None,
-        branches: Optional[List[Any]] = None,
+        branches: Optional[List[BranchSpec]] = None,
     ):
         """
         Handle single-bridge array send without collective.
@@ -647,7 +647,7 @@ class Bridge(IBridge):
             out = list(out.values())[0]
         return out
 
-    def _get_task_branches(self, array_name: str) -> List[Dict]:
+    def _get_task_branches(self, array_name: str) -> List[BranchSpec]:
         """
         Retrieve stored task hints for an array.
 
@@ -672,7 +672,7 @@ class Bridge(IBridge):
         # side during register_callback, which happens after bridge setup,
         # so they are only available here (first send), not in __init__.
         sub_comm = self._array_comms.get(array_name)
-        branches: List[Dict] = []
+        branches: List[BranchSpec] = []
 
         if sub_comm is not None and sub_comm is not _COMM_NULL:
             if sub_comm.Get_rank() == 0 and self.handshake is not None:
@@ -686,7 +686,9 @@ class Bridge(IBridge):
 
         return branches
 
-    def _get_chunk_axis_by_key(self, array_name: str, branches: List) -> Dict[str, Optional[Tuple[int, ...]]]:
+    def _get_chunk_axis_by_key(
+        self, array_name: str, branches: List[BranchSpec]
+    ) -> Dict[str, Optional[Tuple[int, ...]]]:
         """Return the ``output_key -> chunk_axis`` map for an array, building
         and caching it on first use.
 
@@ -705,7 +707,7 @@ class Bridge(IBridge):
         self._chunk_axis_by_key[array_name] = build
         return build
 
-    def _get_branch_by_key(self, array_name: str, branches: List[Any]) -> Dict[str, Any]:
+    def _get_branch_by_key(self, array_name: str, branches: List[BranchSpec]) -> Dict[str, Any]:
         """Return the ``output_key -> branch`` lookup for an array, building
         and caching it on first use.
 
@@ -723,7 +725,7 @@ class Bridge(IBridge):
     def _scatter_partials(
         self,
         partials: Dict[str, Any],
-        branches: List[Any],  # List[BranchSpec]
+        branches: List[BranchSpec],  # List[BranchSpec]
         array_name: str,
         workers: List[str],
     ) -> Dict[str, Any]:
