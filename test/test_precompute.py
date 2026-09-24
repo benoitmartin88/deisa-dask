@@ -427,7 +427,7 @@ def test_dynamic_loop_raises_incompatible_callback() -> None:
 
 
 # ---------------------------------------------------------------------------
-# force=True
+# precompute=False
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize(
     "source,arr_factory,check_warning",
@@ -461,8 +461,8 @@ def test_dynamic_loop_raises_incompatible_callback() -> None:
         ),
     ],
 )
-def test_force_true_returns_empty(source, arr_factory, caplog, check_warning) -> None:
-    """``force=True`` returns [] and logs a warning instead of raising.
+def test_precompute_false_returns_empty(source, arr_factory, caplog, check_warning) -> None:
+    """``precompute=False`` returns [] and logs a warning instead of raising.
 
     The user is explicitly opting out of the precompute safety net: the
     analyzer swallows the refusal and returns zero hints, which the
@@ -473,7 +473,7 @@ def test_force_true_returns_empty(source, arr_factory, caplog, check_warning) ->
     src = textwrap.dedent(source)
     cb = _make_function("callback", src)
     with caplog.at_level("WARNING"):
-        hints = analyze_callback(cb, {"f": arr}, force=True)
+        hints = analyze_callback(cb, {"f": arr}, precompute=False)
     assert hints == []
     if check_warning:
         # At least one warning emitted about the refusal.
@@ -592,7 +592,7 @@ def test_unsupported_reduction_error(source, helper_src, check_msg) -> None:
     The naive per-reduction hint extraction would emit both an ``f-mean`` and
     an ``f-sum`` hint, but ``f-sum`` is WRONG in multi-bridge setups: the
     bridge would compute ``(chunk - chunk.mean()).sum()`` locally, which is
-    always 0. We refuse the whole expression (or with ``force=True`` the
+    always 0. We refuse the whole expression (or with ``precompute=False`` the
     analyzer swallows it and returns no hints, so the user gets the legacy
     full-chunk scatter path if they explicitly opt out).
     """
