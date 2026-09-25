@@ -87,7 +87,7 @@ def test_compute_direct_reduction(op_name: str) -> None:
             result.compute()
         """
     cb = _make_function("callback", src)
-    hints = analyze_callback(cb, {"f": arr})
+    hints, _ = analyze_callback(cb, {"f": arr})
     assert len(hints) == 1
     assert hints[0]["output_key"] == f"f-{op_name}"
     assert hints[0]["op_name"] == op_name
@@ -156,7 +156,7 @@ def test_compute_single_array_hints(source, expected_hint_keys, expected_axis) -
     arr = _simple_stub()
     src = textwrap.dedent(source)
     cb = _make_function("callback", src)
-    hints = analyze_callback(cb, {"f": arr})
+    hints, _ = analyze_callback(cb, {"f": arr})
     assert _hint_keys(hints) == expected_hint_keys
     if expected_axis is not None:
         assert len(hints) == 1
@@ -189,7 +189,7 @@ def test_compute_two_array_hints(source, expected_hint_key) -> None:
     b = _simple_stub()
     src = textwrap.dedent(source)
     cb = _make_function("callback", src)
-    hints = analyze_callback(cb, {"a": a, "b": b})
+    hints, _ = analyze_callback(cb, {"a": a, "b": b})
     assert _hint_keys(hints) == [expected_hint_key]
 
 
@@ -205,7 +205,7 @@ def test_compute_multiple_reductions() -> None:
             mx.compute()
         """
     cb = _make_function("callback", src)
-    hints = analyze_callback(cb, {"f": arr})
+    hints, _ = analyze_callback(cb, {"f": arr})
     assert _hint_keys(hints) == ["f-max", "f-mean", "f-sum"]
 
 
@@ -221,7 +221,7 @@ def test_compute_helper_same_file() -> None:
         """
     cb = _make_function("callback", src)
     helpers = {"density": _make_function("density", src)}
-    hints = analyze_callback(cb, {"f": arr}, helpers=helpers)
+    hints, _ = analyze_callback(cb, {"f": arr}, helpers=helpers)
     assert _hint_keys(hints) == ["f-sum"]
 
 
@@ -236,7 +236,7 @@ def test_compute_loop_static_range() -> None:
                 m.compute()
         """
     cb = _make_function("callback", src)
-    hints = analyze_callback(cb, {"f": arr})
+    hints, _ = analyze_callback(cb, {"f": arr})
     # Loop unrolls statically; we get at least one reduction hint
     assert any(h["op_name"] == "sum" for h in hints)
 
@@ -250,7 +250,7 @@ def test_compute_window_subscript_negative_one() -> None:
             result.compute()
         """
     cb = _make_function("callback", src)
-    hints = analyze_callback(cb, {"f": arr})
+    hints, _ = analyze_callback(cb, {"f": arr})
     assert _hint_keys(hints) == ["f-sum"]
 
 
@@ -266,7 +266,7 @@ def test_client_compute_single_array() -> None:
             client.compute(da.sum(arr))
         """
     cb = _make_function("callback", src)
-    hints = analyze_callback(cb, {"f": arr, "client": client_stub})
+    hints, _ = analyze_callback(cb, {"f": arr, "client": client_stub})
     assert _hint_keys(hints) == ["f-sum"]
 
 
@@ -283,7 +283,7 @@ def test_client_compute_list_of_arrays() -> None:
             ])
         """
     cb = _make_function("callback", src)
-    hints = analyze_callback(cb, {"f": arr, "client": client_stub})
+    hints, _ = analyze_callback(cb, {"f": arr, "client": client_stub})
     assert _hint_keys(hints) == ["f-max", "f-mean", "f-sum"]
 
 
@@ -296,7 +296,7 @@ def test_client_submit_with_dask_array() -> None:
             client.submit(float, da.sum(arr))
         """
     cb = _make_function("callback", src)
-    hints = analyze_callback(cb, {"f": arr, "client": client_stub})
+    hints, _ = analyze_callback(cb, {"f": arr, "client": client_stub})
     assert _hint_keys(hints) == ["f-sum"]
 
 
@@ -313,7 +313,7 @@ def test_client_compute_inside_helper() -> None:
         """
     cb = _make_function("callback", src)
     helpers = {"measure": _make_function("measure", src)}
-    hints = analyze_callback(cb, {"f": arr, "client": client_stub}, helpers=helpers)
+    hints, _ = analyze_callback(cb, {"f": arr, "client": client_stub}, helpers=helpers)
     assert _hint_keys(hints) == ["f-sum"]
 
 
@@ -473,7 +473,7 @@ def test_precompute_false_returns_empty(source, arr_factory, caplog, check_warni
     src = textwrap.dedent(source)
     cb = _make_function("callback", src)
     with caplog.at_level("WARNING"):
-        hints = analyze_callback(cb, {"f": arr}, precompute=False)
+        hints, _ = analyze_callback(cb, {"f": arr}, precompute=False)
     assert hints == []
     if check_warning:
         # At least one warning emitted about the refusal.
@@ -500,7 +500,7 @@ def test_gysela_density_helper() -> None:
         """
     cb = _make_function("callback", src)
     helpers = {"density": _make_function("density", src)}
-    hints = analyze_callback(cb, {"f": arr, "grid": grid_obj, "client": client_stub}, helpers=helpers)
+    hints, _ = analyze_callback(cb, {"f": arr, "grid": grid_obj, "client": client_stub}, helpers=helpers)
     assert _hint_keys(hints) == ["f-sum"]
 
 
@@ -536,7 +536,7 @@ def test_gysela_measure_helper_loop() -> None:
         """
     cb = _make_function("callback", src)
     helpers = {"measure": _make_function("measure", src)}
-    hints = analyze_callback(
+    hints, _ = analyze_callback(
         cb,
         {"fdistribu": fdistribu, "grid": grid_obj, "Nsp": 4, "client": client_stub},
         helpers=helpers,
@@ -628,7 +628,7 @@ def test_independent_reductions_not_refused() -> None:
             b = arr.mean().compute()
         """
     cb = _make_function("callback", src)
-    hints = analyze_callback(cb, {"f": arr})
+    hints, _ = analyze_callback(cb, {"f": arr})
     # Both reductions detected -- the walker does not refuse.
     op_names = _op_names(hints)
     assert "sum" in op_names

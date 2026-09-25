@@ -57,7 +57,7 @@ import numpy as np
 import dask.array as da
 from dask import delayed
 from dask.array.reductions import mean_agg, moment_agg
-from deisa.dask.precompute_analyzer import PrecomputeError, analyze_callback_with_dask_arrays
+from deisa.dask.precompute_analyzer import PrecomputeError, analyze_callback
 from deisa.dask.task_branches import _blockwise_indices_inputs, _find_chunk_layer, _is_aggregate_layer
 from deisa.dask.utils import build_deisa_array
 
@@ -405,16 +405,15 @@ def _analyze_branch(callback: Callable, registered_arrays: Dict[str, Any], preco
         One BranchSpec per detected reduction. Empty list if the callback contains no chunk-local precomputable
         operations.
     """
-    # Single AST walk: analyze_callback_with_dask_arrays returns BOTH the reduction hints AND the walker's dask_arrays
-    # in one pass. (Calling analyze_callback and analyze_callback_with_dask_arrays separately would parse + walk the
-    # callback's AST twice.) The dask_arrays are the dask expressions the walker built at each compute boundary (e.g.
-    # ``(arr*arr).sum()``). The registered placeholders' graphs only have the root layer, not the chain, so the chain
-    # walker needs these.
+    # Single AST walk: analyze_callback returns BOTH the reduction hints AND the
+    # walker's dask_arrays in one pass. (Calling the hints-extraction and the
+    # walker separately would parse + walk the callback's AST twice.) The
+    # dask_arrays are the dask expressions the walker built at each compute
+    # boundary (e.g. ``(arr*arr).sum()``). The registered placeholders' graphs
+    # only have the root layer, not the chain, so the chain walker needs these.
 
     try:
-        hints, walker_dask_arrays = analyze_callback_with_dask_arrays(
-            callback, registered_arrays, precompute=precompute
-        )
+        hints, walker_dask_arrays = analyze_callback(callback, registered_arrays, precompute=precompute)
     except Exception:
         if precompute:
             raise
