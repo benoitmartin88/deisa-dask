@@ -242,7 +242,7 @@ class TestAnalyzeBranchLength1:
         per-reduction path. The chain walker folds multi-layer chains
         into a single branch_func.
         """
-        from deisa.dask.branch import analyze_branch
+        from deisa.dask.branch import _analyze_branch
 
         # A multi-layer chain callback: (arr * arr).sum(). The chain
         # walker must fold {mul, sum} into a single branch_func; the
@@ -250,7 +250,7 @@ class TestAnalyzeBranchLength1:
         cb = _make_callback("test_analyze_branch_cb", "return (arr * arr).sum().compute()")
 
         arrs = {"f": da.zeros((4, 4), chunks=2)}
-        branches = analyze_branch(cb, arrs)
+        branches = _analyze_branch(cb, arrs)
         assert len(branches) == 1
         assert branches[0].output_key == "f-sum"
         assert branches[0].output_kind == "scalar"

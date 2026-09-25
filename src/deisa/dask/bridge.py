@@ -101,11 +101,13 @@ class Bridge(IBridge):
         self.client: Optional[Client] = None
         self._array_comms: Dict[str, Any] = {}  # array_name -> sub-comm (from comm.Split)
         self._handshake_metadata = None
-        self._task_branches: Dict[str, List[BranchSpec]] = {}  # array_name -> branches for local execution
+
+        # array_name -> branches for local execution
+        self._task_branches: Dict[str, List[BranchSpec]] = {}
+        #  array_name -> output_key -> chunk_axis (derived once from branches; static)
         self._chunk_axis_by_key: Dict[str, Dict[str, Optional[Tuple[int, ...]]]] = {}
-        #  ^ array_name -> output_key -> chunk_axis (derived once from branches; static)
+        #  array_name -> output_key -> branch (BranchSpec)
         self._branch_by_key: Dict[str, Dict[str, Any]] = {}
-        #  ^ array_name -> output_key -> branch (BranchSpec)
 
         if self.id == 0:
             # only id 0 has a real dask client
@@ -319,9 +321,8 @@ class Bridge(IBridge):
 
         assert len(workers) == 1, "worker list should be of length 1."
 
-        # Fetch task hints and execute reduction operations locally on the
-        # bridge-process numpy chunk. The resulting partials are tiny (scalar /
-        # 1-d arrays) compared to the full chunk -- the goal of precompute is
+        # Fetch task hints and execute reduction operations locally on the bridge-process numpy chunk.
+        # The resulting partials are tiny (scalar / 1-d arrays) compared to the full chunk. The goal of precompute is
         # to ship only the partials to the worker, never the full chunk.
         branches = self._get_task_branches(array_name)
         partials = self._execute_operations_on_chunk(array_name, chunk, branches)
@@ -335,12 +336,10 @@ class Bridge(IBridge):
             return
 
         # Decide what to ship to workers:
-        # - If precompute produced partials for this callback: scatter ONLY the
-        #   partials (tiny). The full chunk stays on the bridge process and
-        #   never enters worker memory.
-        # - Otherwise (no reductions detected): fall back to the legacy path
-        #   and scatter the full chunk, preserving backward compatibility for
-        #   callbacks that don't return lazy dask reductions.
+        # - If precompute produced partials for this callback: scatter ONLY the partials (tiny).
+        #   The full chunk stays on the bridge process and never enters worker memory.
+        # - Otherwise (no reductions detected): fall back to the legacy path and scatter the full chunk, preserving
+        #   backward compatibility for callbacks that don't return lazy dask reductions.
         precomputed_meta: Dict[str, Dict[str, Any]] = {}
         if partials:
             logger.debug(
@@ -403,28 +402,21 @@ class Bridge(IBridge):
             # TODO: id=0 can use a queue
             self.client._send_to_scheduler({"op": "client-desires-keys", "keys": keys, "client": CLIENT_KEY})
 
-            # Build the topic event. When precompute is active, `futures` lists
-            # one entry per (bridge, reduction) pair, each entry pointing to the
-            # partial's reduced shape and dtype. The Deisa side reconstructs the
-            # dask graph from these small partials -- the full chunk never
-            # reaches the workers.
+            # Build the topic event. When precompute is active, `futures` lists one entry per (bridge, reduction) pair.
+            # Each entry pointing to the partial's reduced shape and dtype. The Deisa side reconstructs the dask graph
+            # from these small partials. The full chunk never reaches the workers.
             #
-            # Build a per-output_key chunk_axis lookup. BranchSpec
-            # objects carry ``chunk_axis`` directly. Cached per array
-            # (static after registration) so it is not rebuilt on every
-            # send().
+            # Build a per-output_key chunk_axis lookup. BranchSpec objects carry ``chunk_axis`` directly.
+            # Cached per array (static after registration) so it is not rebuilt on every send().
             chunk_axis_by_key = self._get_chunk_axis_by_key(array_name, branches)
             futures_payload: List[Dict[str, Any]]
             if all_partials_meta:
-                # Precompute path: emit one entry per (bridge, reduction).
-                # ``chunk_position`` here is the MPI coords of the bridge
-                # that contributed this partial, so the Deisa side can
-                # rebuild the nested list structure that ``mean_agg`` /
-                # ``moment_agg`` expect (matching the chunk-grid layout).
-                # ``chunk_axis`` is the chunk_func's reduction axes tuple
-                # (the chunk_kwargs ``axis``), used by the topic handler
-                # to compute the combine's output shape and pass the
-                # correct ``axis`` to ``mean_agg`` / ``moment_agg``.
+                # Precompute path: emit one entry per (bridge, reduction). ``chunk_position`` here is the MPI coords of
+                # the bridge that contributed this partial, so the Deisa side can rebuild the nested list structure
+                # that ``mean_agg`` / ``moment_agg`` expect (matching the chunk-grid layout).
+                # ``chunk_axis`` is the chunk_func's reduction axes tuple (the chunk_kwargs ``axis``), used by the
+                # topic handler to compute the combine's output shape and pass the correct ``axis`` to
+                # ``mean_agg`` / ``moment_agg``.
                 futures_payload = []
                 for bridge_idx, partial_meta in enumerate(all_partials_meta):
                     for output_key, p_info in partial_meta.items():
@@ -442,8 +434,8 @@ class Bridge(IBridge):
                             }
                         )
             else:
-                # Legacy path: emit one entry per bridge with the full-chunk
-                # shape, same as before the precompute feature.
+                # Legacy path: emit one entry per bridge with the full-chunk shape, same as before the precompute
+                # feature.
                 futures_payload = [
                     {
                         "future": d["future-info"]["future"][0]
@@ -483,16 +475,15 @@ class Bridge(IBridge):
         """
         Handle single-bridge array send without collective.
 
-        For arrays that exist on only one bridge, we skip the gather() entirely
-        and directly update the Dask scheduler.
+        For arrays that exist on only one bridge, we skip the gather() entirely and directly update the Dask scheduler.
 
         - ``:param array_name:`` The array name being sent.
         - ``:param res:`` The scatter result (legacy: dict with a single ``future``;
             precompute: dict with a list ``future`` of all partial keys).
         - ``:param chunk:`` The numpy ndarray data chunk (kept for legacy shape/dtype).
         - ``:param timestep:`` The current timestep.
-        - ``:param precomputed:`` Optional precomputed values dict (legacy key,
-            kept for API stability; prefer ``precomputed_meta``).
+        - ``:param precomputed:`` Optional precomputed values dict (legacy key, kept for API stability;
+            prefer ``precomputed_meta``).
         - ``:param precomputed_meta:`` Per-partial scatter metadata
             (``{output_key: {"future", "shape", "dtype"}}``); only set on the
             precompute path. When provided, the topic event's ``futures`` list
@@ -503,20 +494,19 @@ class Bridge(IBridge):
         who_has = res["who_has"]
         nbytes = res["nbytes"]
 
-        # On the precompute path, ``res["future"]`` is a list of partial keys
-        # (one per reduction). On the legacy path, it's a single future key.
+        # On the precompute path, ``res["future"]`` is a list of partial keys (one per reduction).
+        # On the non-precompute path, it's a single future key.
         future_keys = res["future"] if isinstance(res["future"], list) else [res["future"]]
 
         self.client.sync(self.client.scheduler.update_data, who_has=who_has, nbytes=nbytes)
         self.client._send_to_scheduler({"op": "client-desires-keys", "keys": future_keys, "client": CLIENT_KEY})
 
-        # Build the topic event. On the precompute path, emit one entry per
-        # partial (with its reduced shape); on the legacy path, emit one entry
-        # pointing at the full chunk.
+        # Build the topic event. On the precompute path, emit one entry per partial (with its reduced shape).
+        # On the non-precompute path, emit one entry pointing at the full chunk.
         if precomputed_meta:
             # BranchSpec carries the reduction's ``chunk_axis`` directly.
-            # The per-output_key lookup is cached per array (static after
-            # registration), so it is not rebuilt on every send.
+            # The per-output_key lookup is cached per array (static after registration), so it is not rebuilt on every
+            # send.
             chunk_axis_by_key = self._get_chunk_axis_by_key(array_name, branches or [])
             futures_payload = [
                 {
@@ -658,19 +648,16 @@ class Bridge(IBridge):
         - ``:return:`` List of reduction hints (each carrying a pickled chunk
             callable, pickled aggregator, and the dask kwargs to apply).
         """
-        # Check cache first. Branches are fixed after registration; once
-        # fetched (rank 0 reads from the handshake actor and broadcasts to
-        # all ranks in the sub_comm), subsequent sends hit the cache and
-        # never touch the handshake or broadcast -- keeping the send()
-        # critical path fast.
+        # Check cache first. Branches are fixed after registration. Once fetched (rank 0 reads from the handshake actor
+        # and broadcasts to all ranks in the sub_comm), subsequent sends hit the cache and never touch the handshake or
+        # broadcast, keeping the send() critical path fast.
         if self._task_branches.get(array_name):
             return self._task_branches[array_name]
 
-        # Cache miss -> rank 0 of the sub_comm reads branches from the
-        # handshake actor (only rank 0 has a client/handshake connection)
-        # and broadcasts to every rank. Branches are set by the analytics
-        # side during register_callback, which happens after bridge setup,
-        # so they are only available here (first send), not in __init__.
+        # Cache miss -> rank 0 of the sub_comm reads branches from the handshake actor (only rank 0 has a
+        # client/handshake connection) and broadcasts to every rank. Branches are set by the analytics side during
+        # register_callback, which happens after bridge setup, so they are only available here (first send),
+        # not in __init__.
         sub_comm = self._array_comms.get(array_name)
         branches: List[BranchSpec] = []
 
@@ -689,12 +676,10 @@ class Bridge(IBridge):
     def _get_chunk_axis_by_key(
         self, array_name: str, branches: List[BranchSpec]
     ) -> Dict[str, Optional[Tuple[int, ...]]]:
-        """Return the ``output_key -> chunk_axis`` map for an array, building
-        and caching it on first use.
+        """Return the ``output_key -> chunk_axis`` map for an array, building and caching it on first use.
 
-        The chunk_axis of each reduction depends only on the branches, which
-        are static after registration. Building it fresh on every ``send()``
-        is wasted work on the critical path; cache it once per array.
+        The chunk_axis of each reduction depends only on the branches, which are static after registration.
+        Building it fresh on every ``send()`` is wasted work on the critical path. Cache it once per array.
         """
         cached = self._chunk_axis_by_key.get(array_name)
         if cached is not None:
@@ -708,11 +693,9 @@ class Bridge(IBridge):
         return build
 
     def _get_branch_by_key(self, array_name: str, branches: List[BranchSpec]) -> Dict[str, Any]:
-        """Return the ``output_key -> branch`` lookup for an array, building
-        and caching it on first use.
+        """Return the ``output_key -> branch`` lookup for an array, building and caching it on first use.
 
-        Branches are static after registration, so the indexed map is not
-        rebuilt on every ``send()``.
+        Branches are static after registration, so the indexed map is not rebuilt on every ``send()``.
         """
         cached = self._branch_by_key.get(array_name)
         if cached is not None:
@@ -732,45 +715,35 @@ class Bridge(IBridge):
         """
         Scatter precomputed reduction partials to a worker instead of the full chunk.
 
-        Each partial value is the local result of running the branch's
-        chunk-stage callable on the bridge's numpy chunk. Two flavors:
-
-        - ``"scalar"`` partials (sum/prod/max/min): plain scalars or numpy
-          arrays. Shipped as one future key per reduction.
-        - ``"mean"`` partials (mean): a ``{"n": x, "total": y}`` dict from
-          dask's ``mean_chunk``. Shipped as one future key whose value is
-          the whole dict; the Deisa-side combine resolves the dicts and
+        Each partial value is the local result of running the branch's chunk-stage callable on the bridge's numpy chunk.
+        Two flavors:
+        - ``"scalar"`` partials (sum/prod/max/min): plain scalars or numpy arrays. Shipped as one future key per
+          reduction.
+        - ``"mean"`` partials (mean): a ``{"n": x, "total": y}`` dict from dask's ``mean_chunk``.
+          Shipped as one future key whose value is the whole dict; the Deisa-side combine resolves the dicts and
           calls ``mean_agg`` over them.
-        - ``"moment"`` partials (var/std): a ``{"n": x, "total": y, "M": z}``
-          dict from dask's ``moment_chunk``. Same dict-blob handling as
-          mean, but the combine calls ``moment_agg`` (and sqrt for std).
+        - ``"moment"`` partials (var/std): a ``{"n": x, "total": y, "M": z}`` dict from dask's ``moment_chunk``.
+          Same dict-blob handling as mean, but the combine calls ``moment_agg`` (and sqrt for std).
 
         Returns a dict shaped like the legacy ``_better_scatter`` result
-        (``{"future": [...], "who_has": {...}, "nbytes": {...}}``) plus a
-        ``precomputed`` entry mapping each ``output_key`` to its scatter
-        metadata (``{future, kind, shape, dtype, finalize}``) so the topic
-        handler can reconstruct the right dask graph.
+        (``{"future": [...], "who_has": {...}, "nbytes": {...}}``) plus a ``precomputed`` entry mapping each
+        ``output_key`` to its scatter metadata (``{future, kind, shape, dtype, finalize}``) so the topic handler can
+        reconstruct the right dask graph.
 
-        - ``:param partials:`` Mapping of ``output_key`` -> partial value
-            produced by :meth:`_execute_operations_on_chunk`.
-        - ``:param branches:`` The :class:`BranchSpec` objects the
-            bridge used to compute the partials. Carry per-reduction
-            ``kind``/``finalize``/``partial_shape``/``partial_dtype``
-            metadata.
+        - ``:param partials:`` Mapping of ``output_key`` -> partial value produced by _execute_operations_on_chunk`.
+        - ``:param branches:`` The :class:`BranchSpec` objects the bridge used to compute the partials.
+            Carry per-reduction ``kind``/``finalize``/``partial_shape``/``partial_dtype`` metadata.
         - ``:param array_name:`` Array name (used for key prefixing).
         - ``:param workers:`` Single-element list of worker names to scatter to.
-        - ``:return:`` Dict with ``future-info`` (legacy-shape scatter result
-            containing all partials' keys) and ``precomputed`` (per-partial
-            metadata for the topic handler).
+        - ``:return:`` Dict with ``future-info`` (legacy-shape scatter result  containing all partials' keys)
+            and ``precomputed`` (per-partial metadata for the topic handler).
         """
         assert len(workers) == 1, "_scatter_partials expects a single target worker"
         target_worker = workers[0]
 
-        # Index branches by output_key for fast lookup. BranchSpec
-        # carries the per-reduction metadata directly (``partial_shape`` /
-        # ``partial_dtype`` / ``output_kind`` / ``finalize`` recorded by the
-        # analyzer), so the loop doesn't inspect the partial value. Cached
-        # per array (static after registration).
+        # Index branches by output_key for fast lookup. BranchSpec carries the per-reduction metadata directly
+        # (``partial_shape`` / ``partial_dtype`` / ``output_kind`` / ``finalize`` recorded by the analyzer), so the
+        # loop doesn't inspect the partial value. Cached per array (static after registration).
         branch_by_key = self._get_branch_by_key(array_name, branches)
 
         payload: Dict[str, Any] = {}
@@ -778,8 +751,7 @@ class Bridge(IBridge):
         for output_key, value in partials.items():
             branch = branch_by_key.get(output_key)
             if branch is None:
-                # Every partial comes from a branch (they are built together
-                # in _execute_operations_on_chunk), so a miss is a bug.
+                # Every partial comes from a branch (they are built together in _execute_operations_on_chunk).
                 raise KeyError(f"no branch found for precomputed output_key {output_key!r}")
             kind = branch.output_kind
             finalize = branch.finalize
@@ -799,9 +771,8 @@ class Bridge(IBridge):
         payload2 = valmap(to_serialize, payload)
 
         # Use scatter_to_workers directly so we get the (who_has, nbytes) pair.
-        # Mirrors the legacy ``_better_scatter`` pattern: client.sync when a
-        # Client is available, asyncio.run otherwise (rank-0 only has the
-        # Client; non-rank-0 bridges run the scatter from a fresh event loop).
+        # Mirrors the legacy ``_better_scatter`` pattern: client.sync when a Client is available, asyncio.run otherwise
+        # (rank-0 only has the Client; non-rank-0 bridges run the scatter from a fresh event loop).
         if self.client is not None:
             _, who_has, nbytes = self.client.sync(self._scatter_to_workers_async, target_worker, payload2)
         else:
@@ -826,21 +797,16 @@ class Bridge(IBridge):
         self, array_name: str, chunk: np.ndarray, branches: List["BranchSpec"]
     ) -> Dict[str, Any]:
         """
-        Execute branch chunk-stage callables locally on the bridge's
-        numpy chunk before scattering.
+        Execute branch chunk-stage callables locally on the bridge's numpy chunk before scattering.
 
-        Each branch in ``branches`` is a :class:`BranchSpec` whose
-        ``branch_func`` is a pickle-able Python callable that takes a
-        numpy chunk and returns the per-bridge partial (a scalar,
-        ndarray, or dict for mean/moment). The closure inside
-        ``branch_func`` already binds the analyzer's chunk kwargs
-        (axis, keepdims, dtype, ...), so the call here is
-        ``branch_func(chunk)`` with no extra arguments.
+        Each branch in ``branches`` is a :class:`BranchSpec` whose ``branch_func`` is a pickle-able Python callable
+        that takes a numpy chunk and returns the per-bridge partial (a scalar, ndarray, or dict for mean/moment).
+        The closure inside ``branch_func`` already binds the analyzer's chunk kwargs (axis, keepdims, dtype, ...),
+        so the call here is ``branch_func(chunk)`` with no extra arguments.
 
         - ``:param array_name:`` The array name being processed.
         - ``:param chunk:`` The numpy ndarray data chunk.
-        - ``:param branches:`` List of :class:`BranchSpec` from
-            ``analyze_branch``.
+        - ``:param branches:`` List of :class:`BranchSpec` from ``analyze_branch``.
         - ``:return:`` Dict of partial results keyed by output_key.
         """
         partials = {}
@@ -855,12 +821,3 @@ class Bridge(IBridge):
 
         logger.debug(f"[{self.id}] _execute_operations_on_chunk: {partials}")
         return partials
-
-    # NOTE: pre-v2 architecture used a centralized ``_combine_reduction_partials``
-    # on rank 0 to combine partials across bridges before scattering. That
-    # approach was replaced in PR #4 by the per-bridge partial-scatter: each
-    # bridge now ships its own raw partial to a worker, and the second-stage
-    # combine (e.g. summing per-bridge scalar partials for ``arr.sum()``) is
-    # expressed naturally by the dask graph the Deisa side builds from the
-    # partials. Keeping the old combiner here is unnecessary and would defeat
-    # the wire/worker-memory savings the optimization is meant to deliver.
