@@ -142,22 +142,19 @@ class Deisa(IDeisa):
         ``@deisa.register(Window("arr1", 2), Window("arr2", 5), "arr3")``  # window size 2 for arr1 and 5 for arr2,
                                                                              default window size for arr3
 
-        Every callback is automatically analyzed for dask reduction operations
-        (sum, mean, std, var, max, min, prod) which are executed locally on
-        each bridge before scatter to reduce network transfer. Precompute
-        analysis is always attempted (the default), and any callback that
-        cannot be precomputed (no reductions, or a reduction that depends on
-        another reduction's output) raises at registration time. Use
-        ``precompute=False`` to skip the analysis with a warning and fall back to
-        the legacy full-chunk scatter path.
+        Every callback is automatically analyzed for dask reduction operations (sum, mean, std, var, max, min, prod)
+        which are executed locally on each bridge before scatter to reduce network transfer. Precompute analysis
+        is always attempted (the default), and any callback that cannot be precomputed (no reductions, or a reduction
+        that depends on another reduction's output) raises at registration time. Use ``precompute=False`` to skip
+        the analysis with a warning and fall back to the legacy full-chunk scatter path.
 
         - ``:param callback_args:`` Variable-length arguments representing callback-specific parameters.
         - ``:param exception_handler:`` Optional exception handler to manage errors during callback execution.
              Defaults to ``__default_exception_handler``.
         - ``:param when:`` Specifies the conditional logic for triggering the callback. Can be 'AND' or 'OR'.
              Defaults to 'AND'.
-        - ``:param precompute:`` If False, skip precompute analysis with a warning and use the
-             legacy full-chunk scatter path. Defaults to True (analysis is required).
+        - ``:param precompute:`` If False, skip precompute analysis with a warning and use the full-chunk scatter path.
+             Defaults to True (analysis is required).
         - ``:return:`` A callable that wraps the provided callback with the configured parameters and logic.
         - ``:rtype:`` Callable
         """

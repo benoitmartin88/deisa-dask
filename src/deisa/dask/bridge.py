@@ -59,43 +59,6 @@ except ImportError:
     _UNDEFINED = 2147483647
 
 
-def _build_futures_payload(
-    meta: Mapping[str, Mapping[str, Any]],
-    chunk_axis_by_key: Mapping[str, Any],
-    chunk_position: Any,
-) -> List[Dict[str, Any]]:
-    """Build per-reduction ``futures`` entries for a precompute topic event.
-
-    One entry per reduction in ``meta`` (``{output_key: {future, shape, dtype,
-    kind?, finalize?}}``), carrying the partial's reduced shape/dtype, the
-    reduction's ``chunk_axis`` and the caller-provided ``chunk_position``.
-    Shared by :meth:`Bridge.send` (multi-bridge gather) and
-    :meth:`Bridge._direct_send` (single-bridge fast path) so both emit
-    byte-identical payloads. ``chunk_axis_by_key`` is the cached per-array
-    ``output_key -> chunk_axis`` map from :meth:`Bridge._get_chunk_axis_by_key`.
-
-    - ``:param meta:`` Per-reduction precompute metadata
-        (``{output_key: {"future", "shape", "dtype", "kind"?, "finalize"?}}``).
-    - ``:param chunk_axis_by_key:`` Cached ``output_key -> chunk_axis`` map.
-    - ``:param chunk_position:`` The MPI coordinates of the bridge that
-        contributed this partial (used to rebuild the nested chunk-grid layout).
-    - ``:return:`` The ``futures`` payload list for the topic event.
-    """
-    return [
-        {
-            "future": info["future"],
-            "shape": info["shape"],
-            "dtype": info["dtype"],
-            "kind": info.get("kind", "scalar"),
-            "finalize": info.get("finalize"),
-            "chunk_position": chunk_position,
-            "chunk_axis": chunk_axis_by_key.get(output_key),
-            "output_key": output_key,
-        }
-        for output_key, info in meta.items()
-    ]
-
-
 class Bridge(IBridge):
     def __init__(self, comm: ICommunicator, arrays_metadata: Dict[str, Dict], *args, **kwargs):
         """
@@ -362,7 +325,7 @@ class Bridge(IBridge):
         # The resulting partials are tiny (scalar / 1-d arrays) compared to the full chunk. The goal of precompute is
         # to ship only the partials to the worker, never the full chunk.
         branches = self._get_task_branches(array_name)
-        partials = self._execute_operations_on_chunk(array_name, chunk, branches)
+        partials = self._execute_operations_on_chunk(chunk, branches)
 
         # Determine communicator from cached sub-comms (from comm.Split())
         sub_comm = self._array_comms.get(array_name)
@@ -398,7 +361,7 @@ class Bridge(IBridge):
                 chunk,
                 timestep,
                 precomputed_meta=precomputed_meta,
-                branches=branches,  # BranchSpec list
+                branches=branches,
             )
             return
 
@@ -517,12 +480,11 @@ class Bridge(IBridge):
         """
         assert self.client is not None, "client cannot be None for single-bridge send."
 
-        who_has = res["who_has"]
-        nbytes = res["nbytes"]
-
         # On the precompute path, ``res["future"]`` is a list of partial keys (one per reduction).
         # On the non-precompute path, it's a single future key.
         future_keys = res["future"] if isinstance(res["future"], list) else [res["future"]]
+        who_has = res["who_has"]
+        nbytes = res["nbytes"]
 
         self.client.sync(self.client.scheduler.update_data, who_has=who_has, nbytes=nbytes)
         self.client._send_to_scheduler({"op": "client-desires-keys", "keys": future_keys, "client": CLIENT_KEY})
@@ -734,7 +696,7 @@ class Bridge(IBridge):
         Scatter precomputed reduction partials to a worker instead of the full chunk.
 
         Each partial value is the local result of running the branch's chunk-stage callable on the bridge's numpy chunk.
-        Two flavors:
+        Three flavors:
         - ``"scalar"`` partials (sum/prod/max/min): plain scalars or numpy arrays. Shipped as one future key per
           reduction.
         - ``"mean"`` partials (mean): a ``{"n": x, "total": y}`` dict from dask's ``mean_chunk``.
@@ -811,9 +773,7 @@ class Bridge(IBridge):
         _, who_has, nbytes = await scatter_to_workers([worker], data)
         return True, who_has, nbytes
 
-    def _execute_operations_on_chunk(
-        self, array_name: str, chunk: np.ndarray, branches: List["BranchSpec"]
-    ) -> Dict[str, Any]:
+    def _execute_operations_on_chunk(self, chunk: np.ndarray, branches: List["BranchSpec"]) -> Dict[str, Any]:
         """
         Execute branch chunk-stage callables locally on the bridge's numpy chunk before scattering.
 
@@ -839,3 +799,40 @@ class Bridge(IBridge):
 
         logger.debug(f"[{self.id}] _execute_operations_on_chunk: {partials}")
         return partials
+
+
+def _build_futures_payload(
+    meta: Mapping[str, Mapping[str, Any]],
+    chunk_axis_by_key: Mapping[str, Any],
+    chunk_position: Any,
+) -> List[Dict[str, Any]]:
+    """Build per-reduction ``futures`` entries for a precompute topic event.
+
+    One entry per reduction in ``meta`` (``{output_key: {future, shape, dtype,
+    kind?, finalize?}}``), carrying the partial's reduced shape/dtype, the
+    reduction's ``chunk_axis`` and the caller-provided ``chunk_position``.
+    Shared by :meth:`Bridge.send` (multi-bridge gather) and
+    :meth:`Bridge._direct_send` (single-bridge fast path) so both emit
+    byte-identical payloads. ``chunk_axis_by_key`` is the cached per-array
+    ``output_key -> chunk_axis`` map from :meth:`Bridge._get_chunk_axis_by_key`.
+
+    - ``:param meta:`` Per-reduction precompute metadata
+        (``{output_key: {"future", "shape", "dtype", "kind"?, "finalize"?}}``).
+    - ``:param chunk_axis_by_key:`` Cached ``output_key -> chunk_axis`` map.
+    - ``:param chunk_position:`` The MPI coordinates of the bridge that
+        contributed this partial (used to rebuild the nested chunk-grid layout).
+    - ``:return:`` The ``futures`` payload list for the topic event.
+    """
+    return [
+        {
+            "future": info["future"],
+            "shape": info["shape"],
+            "dtype": info["dtype"],
+            "kind": info.get("kind", "scalar"),
+            "finalize": info.get("finalize"),
+            "chunk_position": chunk_position,
+            "chunk_axis": chunk_axis_by_key.get(output_key),
+            "output_key": output_key,
+        }
+        for output_key, info in meta.items()
+    ]
