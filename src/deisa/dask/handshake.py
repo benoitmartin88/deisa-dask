@@ -94,9 +94,6 @@ class Handshake:
         def get_task_branches(self, array_name: str) -> List[BranchSpec] | Future:
             return self.task_branches.get(array_name, [])
 
-        def get_task_branches_dict(self) -> dict | Future:
-            return self.task_branches
-
         def __go(self) -> None:
             logger.debug("Handshake go !")
             Event(Handshake._DEISA_WAIT_FOR_GO_EVENT, client=self.client).set()
@@ -148,15 +145,11 @@ class Handshake:
 
     def set_task_branches(self, array_name: str, hints: list) -> None:
         assert self.__handshake_actor is not None
-        self.__handshake_actor.set_task_branches(array_name, hints)
+        self.__handshake_actor.set_task_branches(array_name, hints).result()
 
     def get_task_branches(self, array_name: str) -> List[BranchSpec]:
         assert self.__handshake_actor is not None
         return self.__handshake_actor.get_task_branches(array_name).result()
-
-    def get_task_branches_dict(self) -> dict:
-        assert self.__handshake_actor is not None
-        return self.__handshake_actor.get_task_branches_dict().result()
 
     def __wait_for_go(self) -> None:
         Event(Handshake._DEISA_WAIT_FOR_GO_EVENT, client=self.client).wait()
