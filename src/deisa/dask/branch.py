@@ -338,7 +338,43 @@ def _make_branch_func(chunk_func: Callable, chunk_kwargs: Dict[str, Any]) -> Cal
     return _functools.partial(_branch_func_with_kwargs, _cf=chunk_func, _kw=chunk_kwargs)
 
 
-def _build_branch_from_dict(
+def _discover_partial_metadata(
+    branch_func: Callable[[Any], Any],
+    placeholder: Optional[Any],
+    branch: Dict[str, Any],
+) -> Tuple[Tuple[int, ...], str]:
+    """Run ``branch_func`` on the placeholder and return ``(partial_shape, partial_dtype)``.
+
+    Used by :func:`_build_length1_branch` and :func:`_build_chain_branch`. Structural inspection only:
+    ``branch_func`` is a numpy op / chain composition, not the user callback, so calling it has no side effects.
+    ``mean``/``moment`` branch_funcs return a dict; the per-key reduced shape is taken from ``total`` (fallback
+    ``M``, else first key). Without a placeholder, falls back to the branch ``shape``/``dtype`` (``shape`` unset by
+    the analyzer -> ``()``/``float64``, overwritten by the bridge at run time).
+    """
+    if placeholder is None:
+        partial_shape: Tuple[int, ...] = tuple(branch.get("shape") or ())
+        partial_dtype = str(branch.get("dtype", "float64"))
+    else:
+        sample = branch_func(placeholder)
+        if isinstance(sample, dict):
+            # mean / moment : the per-bridge partial is a dict with per-key shape.
+            # Pick ``total`` as the representative (it always has the reduction-output shape).
+            if "total" in sample:
+                rep = np.asarray(sample["total"])
+            elif "M" in sample:
+                rep = np.asarray(sample["M"])
+            else:
+                rep = np.asarray(next(iter(sample.values())))
+            partial_shape = tuple(rep.shape)
+            partial_dtype = str(rep.dtype)
+        else:
+            arr = np.asarray(sample)
+            partial_shape = tuple(arr.shape)
+            partial_dtype = str(arr.dtype)
+    return partial_shape, partial_dtype
+
+
+def _build_length1_branch(
     branch: Dict[str, Any],
     chunk_func: Callable[[Any], Any],
     input_name: str,
@@ -390,31 +426,7 @@ def _build_branch_from_dict(
     # top-level ``_make_branch_func`` helper so the closure is picklable across processes.
     branch_func = _make_branch_func(chunk_func, effective_kwargs)
 
-    if placeholder is None:
-        # Fallback: best-effort shape from branch metadata. The branch's ``shape`` field is not populated by the
-        # analyzer. Only the bridge records it after running the chunk_func. We try to recover it from
-        # ``keepdims`` + ``chunk_axis`` + the chunk's shape (which the branch doesn't carry either). Without a
-        # placeholder we can't compute shape reliably, so we leave it as ``()`` and let the bridge's run-time
-        # inspection overwrite it.
-        partial_shape: Tuple[int, ...] = tuple(branch.get("shape") or ())
-        partial_dtype = str(branch.get("dtype", "float64"))
-    else:
-        sample = branch_func(placeholder)
-        if isinstance(sample, dict):
-            # mean / moment : the per-bridge partial is a dict with per-key shape.
-            # Pick ``total`` as the representative (it always has the reduction-output shape).
-            if "total" in sample:
-                rep = np.asarray(sample["total"])
-            elif "M" in sample:
-                rep = np.asarray(sample["M"])
-            else:
-                rep = np.asarray(next(iter(sample.values())))
-            partial_shape = tuple(rep.shape)
-            partial_dtype = str(rep.dtype)
-        else:
-            arr = np.asarray(sample)
-            partial_shape = tuple(arr.shape)
-            partial_dtype = str(arr.dtype)
+    partial_shape, partial_dtype = _discover_partial_metadata(branch_func, placeholder, branch)
 
     output_shape = _derive_combined_output_shape(chunk_axis, array_ndim, partial_shape)
     output_dtype = partial_dtype  # mean/moment keep dtype through the agg
@@ -559,7 +571,7 @@ def _analyze_branch(callback: Callable, registered_arrays: Dict[str, Any], preco
         if branch is None:
             if not precompute:
                 logger.debug(
-                    "analyze_branch: build failed for %s. The length-1 path's build_branch_from_dict raised "
+                    "analyze_branch: build failed for %s. The length-1 path's build_length1_branch raised "
                     "(most likely the placeholder couldn't be computed or the chunk_func rejected the chunk shape).",
                     branch_dict.get("output_key"),
                 )
@@ -569,7 +581,7 @@ def _analyze_branch(callback: Callable, registered_arrays: Dict[str, Any], preco
             raise RuntimeError(
                 f"analyze_branch: cannot build branch for branch {branch_dict.get('output_key')!r}. "
                 f"The chain walker refused (likely cross-array or constant upstream) AND the length-1 fallback's "
-                f"build_branch_from_dict raised. This usually means the chunk_func rejected the placeholder. "
+                f"build_length1_branch raised. This usually means the chunk_func rejected the placeholder. "
                 f"Inspect with the failing branch's chunk_kwargs."
             )
         branches.append(branch)
@@ -639,7 +651,7 @@ def _try_length1_branch(
     and no extra kwargs.
     """
     try:
-        return _build_branch_from_dict(
+        return _build_length1_branch(
             branch=branch,
             chunk_func=chunk_func,
             input_name=primary,
@@ -653,7 +665,7 @@ def _try_length1_branch(
         # dtype, or the placeholder is itself a dask array (because
         # .compute() silently failed upstream).
         logger.debug(
-            "_try_length1_branch: build_branch_from_dict raised for %s "
+            "_try_length1_branch: build_length1_branch raised for %s "
             "with chunk_kwargs=%r, array_ndim=%d, placeholder=%r: %s",
             branch.get("output_key"),
             branch.get("chunk_kwargs"),
@@ -799,8 +811,7 @@ def _build_chain_branch(
     """Build a chain-folded :class:`BranchSpec` from a branch and a layer chain.
 
     The chain's ``branch_func`` is the composition of the layer funcs (root-to-chunk).
-    The branch provides the reduction's ``kind``/``finalize``/``chunk_axis`` metadata; ``keepdims=True`` is forced for
-    mean/moment (same as the length-1 path).
+    The branch provides the reduction's ``kind``/``finalize``/``chunk_axis`` metadata.
 
     If ``chain_branch_func`` is provided (the memoized version), use it directly instead of rebuilding.
     Otherwise build a fresh callable from ``chain``.
@@ -808,8 +819,8 @@ def _build_chain_branch(
     kind = branch.get("kind", _BRANCH_KIND_SCALAR)
     finalize = branch.get("finalize")
 
-    ck = branch.get("chunk_kwargs") or {}
-    ax = ck.get("axis")
+    chunk_kwargs = branch.get("chunk_kwargs") or {}
+    ax = chunk_kwargs.get("axis")
     if isinstance(ax, (list, tuple)):
         chunk_axis = tuple(int(a) for a in ax)
     elif ax is not None:
@@ -817,31 +828,10 @@ def _build_chain_branch(
     else:
         chunk_axis = None
 
-    effective_kwargs = dict(ck)
-    if kind in (_BRANCH_KIND_MEAN, _BRANCH_KIND_MOMENT):
-        effective_kwargs["keepdims"] = True
-
     if chain_branch_func is None:
         chain_branch_func = _build_chain_branch_func(chain)
 
-    if placeholder is None:
-        partial_shape: Tuple[int, ...] = tuple(branch.get("shape") or ())
-        partial_dtype = str(branch.get("dtype", "float64"))
-    else:
-        sample = chain_branch_func(placeholder)
-        if isinstance(sample, dict):
-            if "total" in sample:
-                rep = np.asarray(sample["total"])
-            elif "M" in sample:
-                rep = np.asarray(sample["M"])
-            else:
-                rep = np.asarray(next(iter(sample.values())))
-            partial_shape = tuple(rep.shape)
-            partial_dtype = str(rep.dtype)
-        else:
-            arr = np.asarray(sample)
-            partial_shape = tuple(arr.shape)
-            partial_dtype = str(arr.dtype)
+    partial_shape, partial_dtype = _discover_partial_metadata(chain_branch_func, placeholder, branch)
 
     output_shape = _derive_combined_output_shape(chunk_axis, array_ndim, partial_shape)
     output_dtype = partial_dtype
