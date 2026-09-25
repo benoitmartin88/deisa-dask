@@ -985,9 +985,7 @@ class _BoundaryWalker:
     # -- Calls: this is where compute boundaries are detected --------------
     def _is_map_blocks_call(self, node: ast.Call) -> bool:
         # Detect ``arr.map_blocks(...)`` method calls for MapBlocks fixtures
-        if isinstance(node.func, ast.Attribute) and node.func.attr == "map_blocks":
-            return True
-        return False
+        return isinstance(node.func, ast.Attribute) and node.func.attr == "map_blocks"
 
     def _call_map_blocks(self, node: ast.Call, scope: _Scope) -> Any:
         # .map_blocks produces a new dask array (opaque to reductions);
