@@ -374,77 +374,6 @@ def _discover_partial_metadata(
     return partial_shape, partial_dtype
 
 
-def _build_length1_branch(
-    branch: Dict[str, Any],
-    chunk_func: Callable[[Any], Any],
-    input_name: str,
-    array_ndim: int,
-    placeholder: Optional[Any] = None,
-) -> BranchSpec:
-    """Build a :class:`BranchSpec` from a per-reduction branch dict.
-
-    The branch_func is the same length-1 chunk_func the branch already carries.
-    The BranchSpec re-exposes the branch's ``kind``/``finalize``/``shape``/``dtype`` metadata in the structured form
-    the bridge and Deisa side will consume.
-
-    If ``placeholder`` is provided, we run the chunk_func on it to discover the partial's actual shape/dtype.
-    The placeholder is a dask array or numpy array representing the registered chunk (typically a zero-filled dask array
-    of the right shape). This is purely a structural inspection, the chunk_func is a numpy operation, not a callback,
-    so it has no side effects.
-
-    For ``mean``/``moment`` partials the chunk_func returns a dict (``{n, total}`` or ``{n, total, M}``), we record the
-    per-bridge partial's shape as the shape of the ``total`` value (the representative per-key shape, since all keys
-    share the same reduced-axes pattern).
-    """
-
-    kind = branch.get("kind", _BRANCH_KIND_SCALAR)
-    finalize = branch.get("finalize")
-
-    # Reconstruct chunk_axis from chunk_kwargs['axis']. The branch carries
-    # ``axis`` as a tuple/list/int; normalise to a tuple of ints.
-    chunk_kwargs = branch.get("chunk_kwargs") or {}
-    ax = chunk_kwargs.get("axis")
-    if isinstance(ax, (list, tuple)):
-        chunk_axis = tuple(int(a) for a in ax)
-    elif ax is not None:
-        chunk_axis = (int(ax),)
-    else:
-        chunk_axis = None
-
-    # Discover the partial's shape and dtype by running the chunk_func on the placeholder. This is structural,
-    # chunk_func is a numpy op, not the user's callback, so no side effects.
-    # For ``mean`` and ``moment`` the bridge overrides ``keepdims=True``
-    # (see :meth:`Bridge._execute_operations_on_chunk`) so the per-bridge  dict values are at least 1-D for
-    # ``mean_agg`` / ``moment_agg`` to walk with ``_concatenate2``. Mirror that here.
-    effective_kwargs = dict(chunk_kwargs)
-    if kind in (_BRANCH_KIND_MEAN, _BRANCH_KIND_MOMENT):
-        effective_kwargs["keepdims"] = True
-
-    # Wrap the raw chunk_func in a closure that binds the analyzer's chunk_kwargs (axis, keepdims, dtype, ...).
-    # The bridge calls ``branch.branch_func(chunk)`` with no extra kwargs, this closure carries them.
-    # Pickle-friendly: a function with a closure of two picklable objects (a functools.partial and a dict). Uses the
-    # top-level ``_make_branch_func`` helper so the closure is picklable across processes.
-    branch_func = _make_branch_func(chunk_func, effective_kwargs)
-
-    partial_shape, partial_dtype = _discover_partial_metadata(branch_func, placeholder, branch)
-
-    output_shape = _derive_combined_output_shape(chunk_axis, array_ndim, partial_shape)
-    output_dtype = partial_dtype  # mean/moment keep dtype through the agg
-
-    return BranchSpec(
-        input_name=input_name,
-        output_key=branch["output_key"],
-        output_kind=kind,
-        branch_func=branch_func,
-        chunk_axis=chunk_axis,
-        finalize=finalize,
-        partial_shape=partial_shape,
-        partial_dtype=partial_dtype,
-        output_shape=output_shape,
-        output_dtype=output_dtype,
-    )
-
-
 def _analyze_branch(callback: Callable, registered_arrays: Dict[str, Any], precompute: bool = True) -> List[BranchSpec]:
     """Walk the callback's dask graph and emit a :class:`BranchSpec` per branch.
 
@@ -676,6 +605,127 @@ def _try_length1_branch(
         return None
 
 
+def _build_chain_branch(
+    branch: Dict[str, Any],
+    chain: List[Tuple[Callable, dict, int]],
+    input_name: str,
+    array_ndim: int,
+    placeholder: Optional[Any] = None,
+    chain_branch_func: Optional[Callable] = None,
+) -> BranchSpec:
+    """Build a chain-folded :class:`BranchSpec` from a branch and a layer chain.
+
+    The chain's ``branch_func`` is the composition of the layer funcs (root-to-chunk).
+    The branch provides the reduction's ``kind``/``finalize``/``chunk_axis`` metadata.
+
+    If ``chain_branch_func`` is provided (the memoized version), use it directly instead of rebuilding.
+    Otherwise build a fresh callable from ``chain``.
+    """
+    kind = branch.get("kind", _BRANCH_KIND_SCALAR)
+    finalize = branch.get("finalize")
+
+    chunk_kwargs = branch.get("chunk_kwargs") or {}
+    ax = chunk_kwargs.get("axis")
+    if isinstance(ax, (list, tuple)):
+        chunk_axis = tuple(int(a) for a in ax)
+    elif ax is not None:
+        chunk_axis = (int(ax),)
+    else:
+        chunk_axis = None
+
+    if chain_branch_func is None:
+        chain_branch_func = _build_chain_branch_func(chain)
+
+    partial_shape, partial_dtype = _discover_partial_metadata(chain_branch_func, placeholder, branch)
+
+    output_shape = _derive_combined_output_shape(chunk_axis, array_ndim, partial_shape)
+    output_dtype = partial_dtype
+
+    return BranchSpec(
+        input_name=input_name,
+        output_key=branch["output_key"],
+        output_kind=kind,
+        branch_func=chain_branch_func,
+        chunk_axis=chunk_axis,
+        finalize=finalize,
+        partial_shape=partial_shape,
+        partial_dtype=partial_dtype,
+        output_shape=output_shape,
+        output_dtype=output_dtype,
+    )
+
+
+def _build_length1_branch(
+    branch: Dict[str, Any],
+    chunk_func: Callable[[Any], Any],
+    input_name: str,
+    array_ndim: int,
+    placeholder: Optional[Any] = None,
+) -> BranchSpec:
+    """Build a :class:`BranchSpec` from a per-reduction branch dict.
+
+    The branch_func is the same length-1 chunk_func the branch already carries.
+    The BranchSpec re-exposes the branch's ``kind``/``finalize``/``shape``/``dtype`` metadata in the structured form
+    the bridge and Deisa side will consume.
+
+    If ``placeholder`` is provided, we run the chunk_func on it to discover the partial's actual shape/dtype.
+    The placeholder is a dask array or numpy array representing the registered chunk (typically a zero-filled dask array
+    of the right shape). This is purely a structural inspection, the chunk_func is a numpy operation, not a callback,
+    so it has no side effects.
+
+    For ``mean``/``moment`` partials the chunk_func returns a dict (``{n, total}`` or ``{n, total, M}``), we record the
+    per-bridge partial's shape as the shape of the ``total`` value (the representative per-key shape, since all keys
+    share the same reduced-axes pattern).
+    """
+
+    kind = branch.get("kind", _BRANCH_KIND_SCALAR)
+    finalize = branch.get("finalize")
+
+    # Reconstruct chunk_axis from chunk_kwargs['axis']. The branch carries
+    # ``axis`` as a tuple/list/int; normalise to a tuple of ints.
+    chunk_kwargs = branch.get("chunk_kwargs") or {}
+    ax = chunk_kwargs.get("axis")
+    if isinstance(ax, (list, tuple)):
+        chunk_axis = tuple(int(a) for a in ax)
+    elif ax is not None:
+        chunk_axis = (int(ax),)
+    else:
+        chunk_axis = None
+
+    # Discover the partial's shape and dtype by running the chunk_func on the placeholder. This is structural,
+    # chunk_func is a numpy op, not the user's callback, so no side effects.
+    # For ``mean`` and ``moment`` the bridge overrides ``keepdims=True``
+    # (see :meth:`Bridge._execute_operations_on_chunk`) so the per-bridge  dict values are at least 1-D for
+    # ``mean_agg`` / ``moment_agg`` to walk with ``_concatenate2``. Mirror that here.
+    effective_kwargs = dict(chunk_kwargs)
+    if kind in (_BRANCH_KIND_MEAN, _BRANCH_KIND_MOMENT):
+        effective_kwargs["keepdims"] = True
+
+    # Wrap the raw chunk_func in a closure that binds the analyzer's chunk_kwargs (axis, keepdims, dtype, ...).
+    # The bridge calls ``branch.branch_func(chunk)`` with no extra kwargs, this closure carries them.
+    # Pickle-friendly: a function with a closure of two picklable objects (a functools.partial and a dict). Uses the
+    # top-level ``_make_branch_func`` helper so the closure is picklable across processes.
+    branch_func = _make_branch_func(chunk_func, effective_kwargs)
+
+    partial_shape, partial_dtype = _discover_partial_metadata(branch_func, placeholder, branch)
+
+    output_shape = _derive_combined_output_shape(chunk_axis, array_ndim, partial_shape)
+    output_dtype = partial_dtype  # mean/moment keep dtype through the agg
+
+    return BranchSpec(
+        input_name=input_name,
+        output_key=branch["output_key"],
+        output_kind=kind,
+        branch_func=branch_func,
+        chunk_axis=chunk_axis,
+        finalize=finalize,
+        partial_shape=partial_shape,
+        partial_dtype=partial_dtype,
+        output_shape=output_shape,
+        output_dtype=output_dtype,
+    )
+
+
 def _find_primary_aggregate(graph) -> Optional[str]:
     """Return the first ``-aggregate-`` layer name in the graph.
 
@@ -798,53 +848,3 @@ def _chain_branch_func(chunk, _chain=None):
             # For now refuse; can be extended for N-ary pointwise.
             raise ValueError(f"chain has layer with {input_count} inputs; only 1 or 2 supported")
     return x
-
-
-def _build_chain_branch(
-    branch: Dict[str, Any],
-    chain: List[Tuple[Callable, dict, int]],
-    input_name: str,
-    array_ndim: int,
-    placeholder: Optional[Any] = None,
-    chain_branch_func: Optional[Callable] = None,
-) -> BranchSpec:
-    """Build a chain-folded :class:`BranchSpec` from a branch and a layer chain.
-
-    The chain's ``branch_func`` is the composition of the layer funcs (root-to-chunk).
-    The branch provides the reduction's ``kind``/``finalize``/``chunk_axis`` metadata.
-
-    If ``chain_branch_func`` is provided (the memoized version), use it directly instead of rebuilding.
-    Otherwise build a fresh callable from ``chain``.
-    """
-    kind = branch.get("kind", _BRANCH_KIND_SCALAR)
-    finalize = branch.get("finalize")
-
-    chunk_kwargs = branch.get("chunk_kwargs") or {}
-    ax = chunk_kwargs.get("axis")
-    if isinstance(ax, (list, tuple)):
-        chunk_axis = tuple(int(a) for a in ax)
-    elif ax is not None:
-        chunk_axis = (int(ax),)
-    else:
-        chunk_axis = None
-
-    if chain_branch_func is None:
-        chain_branch_func = _build_chain_branch_func(chain)
-
-    partial_shape, partial_dtype = _discover_partial_metadata(chain_branch_func, placeholder, branch)
-
-    output_shape = _derive_combined_output_shape(chunk_axis, array_ndim, partial_shape)
-    output_dtype = partial_dtype
-
-    return BranchSpec(
-        input_name=input_name,
-        output_key=branch["output_key"],
-        output_kind=kind,
-        branch_func=chain_branch_func,
-        chunk_axis=chunk_axis,
-        finalize=finalize,
-        partial_shape=partial_shape,
-        partial_dtype=partial_dtype,
-        output_shape=output_shape,
-        output_dtype=output_dtype,
-    )
