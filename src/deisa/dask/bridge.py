@@ -33,7 +33,7 @@ import uuid
 import zlib
 from collections import defaultdict, deque
 from numbers import Number
-from typing import Any, Deque, Dict, Final, Iterator, List, Optional, Tuple, Union
+from typing import Any, Deque, Dict, Final, Iterator, List, Mapping, Optional, Tuple, Union
 
 import numpy as np
 from deisa.core import IBridge, ICommunicator, validate_arrays_metadata
@@ -57,6 +57,43 @@ try:
     _UNDEFINED = MPI.UNDEFINED
 except ImportError:
     _UNDEFINED = 2147483647
+
+
+def _build_futures_payload(
+    meta: Mapping[str, Mapping[str, Any]],
+    chunk_axis_by_key: Mapping[str, Any],
+    chunk_position: Any,
+) -> List[Dict[str, Any]]:
+    """Build per-reduction ``futures`` entries for a precompute topic event.
+
+    One entry per reduction in ``meta`` (``{output_key: {future, shape, dtype,
+    kind?, finalize?}}``), carrying the partial's reduced shape/dtype, the
+    reduction's ``chunk_axis`` and the caller-provided ``chunk_position``.
+    Shared by :meth:`Bridge.send` (multi-bridge gather) and
+    :meth:`Bridge._direct_send` (single-bridge fast path) so both emit
+    byte-identical payloads. ``chunk_axis_by_key`` is the cached per-array
+    ``output_key -> chunk_axis`` map from :meth:`Bridge._get_chunk_axis_by_key`.
+
+    - ``:param meta:`` Per-reduction precompute metadata
+        (``{output_key: {"future", "shape", "dtype", "kind"?, "finalize"?}}``).
+    - ``:param chunk_axis_by_key:`` Cached ``output_key -> chunk_axis`` map.
+    - ``:param chunk_position:`` The MPI coordinates of the bridge that
+        contributed this partial (used to rebuild the nested chunk-grid layout).
+    - ``:return:`` The ``futures`` payload list for the topic event.
+    """
+    return [
+        {
+            "future": info["future"],
+            "shape": info["shape"],
+            "dtype": info["dtype"],
+            "kind": info.get("kind", "scalar"),
+            "finalize": info.get("finalize"),
+            "chunk_position": chunk_position,
+            "chunk_axis": chunk_axis_by_key.get(output_key),
+            "output_key": output_key,
+        }
+        for output_key, info in meta.items()
+    ]
 
 
 class Bridge(IBridge):
@@ -133,7 +170,7 @@ class Bridge(IBridge):
             assert self.client is not None, "client cannot be None for Bridge id 0."
             self.handshake = Handshake(self.client)
             # Send merged metadata (from all bridges) to the handshake actor
-            metadata_for_handshake = self._handshake_metadata if self._handshake_metadata else self.arrays_metadata
+            metadata_for_handshake = self._handshake_metadata or self.arrays_metadata
             self.handshake.all_bridges_ready(
                 nb_bridge=self.comm.Get_size(), arrays_metadata=metadata_for_handshake, **kwargs
             )
@@ -418,20 +455,13 @@ class Bridge(IBridge):
                 # ``mean_agg`` / ``moment_agg``.
                 futures_payload = []
                 for bridge_idx, partial_meta in enumerate(all_partials_meta):
-                    for output_key, p_info in partial_meta.items():
-                        chunk_axis = chunk_axis_by_key.get(output_key)
-                        futures_payload.append(
-                            {
-                                "future": p_info["future"],
-                                "shape": p_info["shape"],
-                                "dtype": p_info["dtype"],
-                                "kind": p_info.get("kind", "scalar"),
-                                "finalize": p_info.get("finalize"),
-                                "chunk_position": gathered_data[bridge_idx]["chunk_position"],
-                                "chunk_axis": chunk_axis,
-                                "output_key": output_key,
-                            }
+                    futures_payload.extend(
+                        _build_futures_payload(
+                            partial_meta,
+                            chunk_axis_by_key,
+                            gathered_data[bridge_idx]["chunk_position"],
                         )
+                    )
             else:
                 # Legacy path: emit one entry per bridge with the full-chunk shape, same as before the precompute
                 # feature.
@@ -504,19 +534,11 @@ class Bridge(IBridge):
             # The per-output_key lookup is cached per array (static after registration), so it is not rebuilt on every
             # send.
             chunk_axis_by_key = self._get_chunk_axis_by_key(array_name, branches or [])
-            futures_payload = [
-                {
-                    "future": info["future"],
-                    "shape": info["shape"],
-                    "dtype": info["dtype"],
-                    "kind": info.get("kind", "scalar"),
-                    "finalize": info.get("finalize"),
-                    "chunk_position": self.arrays_metadata[array_name]["chunk_position"],
-                    "chunk_axis": chunk_axis_by_key.get(output_key),
-                    "output_key": output_key,
-                }
-                for output_key, info in precomputed_meta.items()
-            ]
+            futures_payload = _build_futures_payload(
+                precomputed_meta,
+                chunk_axis_by_key,
+                self.arrays_metadata[array_name]["chunk_position"],
+            )
         else:
             futures_payload = [
                 {
