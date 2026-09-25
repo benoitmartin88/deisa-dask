@@ -51,6 +51,7 @@ from __future__ import annotations
 import ast
 import inspect
 import logging
+import operator
 import textwrap
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -121,7 +122,7 @@ def analyze_callback(
     registered_arrays: Dict[str, Any],
     helpers: Optional[Dict[str, Callable]] = None,
     precompute: bool = True,
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Analyze the callback's source to find all reducible operations.
 
     - ``:param callback:`` The user's callback function. **Not invoked.**
@@ -135,43 +136,17 @@ def analyze_callback(
       walking the callback's source file.
     - ``:param precompute:`` If False, skip unresolvable reductions with a
       warning instead of raising.
-    - ``:return:`` List of branch dicts (the schema from
-      :mod:`deisa.dask.task_branches`).
+    - ``:return:`` Tuple ``(hints, dask_arrays)``. ``hints`` is the list of
+      branch dicts (the schema from :mod:`deisa.dask.task_branches`);
+      ``dask_arrays`` is the AST walker's snapshot. Each entry in the
+      ``dask_arrays`` list is ``{"array": darr, "kind":
+      "compute"|"client.compute"|..., "lineno": int}`` -- ``darr`` is the
+      dask expression the walker built at that compute boundary (e.g.
+      ``(arr*arr).sum()``). This is the graph the chain walker in
+      :mod:`deisa.dask.branch` needs to fold multi-layer pointwise chains;
+      the registered placeholders' graphs only have the root layer, not the
+      chain.
     - ``:raises PrecomputeError:`` On any unresolvable reduction (unless ``precompute=False``).
-    """
-    try:
-        hints, err, _dask_arrays = _analyze_callback(callback, registered_arrays, helpers, precompute)
-    except PrecomputeError as e:
-        if not precompute:
-            logger.warning("analyze_callback: %s (precompute=False, skipping)", e)
-            return []
-        raise
-
-    if err is not None:
-        if not precompute:
-            logger.warning("analyze_callback: %s (precompute=False, skipping)", err)
-            return []
-        raise err
-
-    return hints
-
-
-def analyze_callback_with_dask_arrays(
-    callback: Callable,
-    registered_arrays: Dict[str, Any],
-    helpers: Optional[Dict[str, Callable]] = None,
-    precompute: bool = True,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Variant of :func:`analyze_callback` that also returns the
-    AST walker's ``dask_arrays``.
-
-    Each entry in the returned dask_arrays list is ``{"array": darr,
-    "kind": "compute"|"client.compute"|..., "lineno": int}`` --
-    ``darr`` is the dask expression the walker built at that compute
-    boundary (e.g. ``(arr*arr).sum()``). This is the graph the chain
-    walker in :mod:`deisa.dask.branch` needs to fold multi-layer
-    pointwise chains; the registered placeholders' graphs only have
-    the root layer, not the chain.
     """
     try:
         hints, err, dask_arrays = _analyze_callback(callback, registered_arrays, helpers, precompute)
@@ -475,26 +450,19 @@ class _UnboundParam:
     def __mul__(self, other):
         return other * 0.0
 
-    def __rmul__(self, other):
-        return other * 0.0
+    __rmul__ = __mul__
 
     def __add__(self, other):
         return other
 
-    def __radd__(self, other):
-        return other
-
-    def __sub__(self, other):
-        return other
-
-    def __rsub__(self, other):
-        return other
+    __radd__ = __add__
+    __sub__ = __add__
+    __rsub__ = __add__
 
     def __truediv__(self, other):
         return 0.0
 
-    def __rtruediv__(self, other):
-        return 0.0
+    __rtruediv__ = __truediv__
 
     def __pow__(self, other):
         return 0.0**other
@@ -505,8 +473,7 @@ class _UnboundParam:
     def __neg__(self):
         return 0.0
 
-    def __pos__(self):
-        return 0.0
+    __pos__ = __neg__
 
     def __repr__(self) -> str:
         return f"<UnboundParam {self.name!r}>"
@@ -540,6 +507,58 @@ _MATERIALIZING_FUNCS = {"array", "asarray", "save", "savetxt", "savez", "savez_c
 
 # Subset of dask/np submodules we recognize as returning a dask array.
 _DASK_RECURSE_SUBMODULES = {"fft"}
+
+# Module-level operator dispatch tables (data-driven, replacing hand-written
+# if-chains). Each table maps an ``ast`` operator node type to the
+# :mod:`operator` function that produces the same result as the corresponding
+# Python operator. Operator functions use the same dunder dispatch Python
+# would (e.g. ``operator.add(a, b)`` == ``a + b``), so dask arrays lazily
+# build their graph, and ``_Missing`` / ``_UnboundParam`` placeholder
+# propagation is unchanged.
+_BINOPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+    ast.LShift: operator.lshift,
+    ast.RShift: operator.rshift,
+    ast.BitOr: operator.or_,  # bitwise |; ast.And is a BoolOp, not here
+    ast.BitXor: operator.xor,
+    ast.BitAnd: operator.and_,  # bitwise &
+    ast.MatMult: operator.matmul,
+}
+
+
+def _unary_not(operand: Any) -> bool:
+    # ``not _truthy(operand)`` semantics -- NOT ``operator.not_``, which would
+    # call ``__bool__`` on a dask array and raise "ambiguous truth value".
+    return not _truthy(operand)
+
+
+_UNARYOPS = {
+    ast.USub: operator.neg,
+    ast.UAdd: operator.pos,
+    ast.Invert: operator.invert,
+    ast.Not: _unary_not,
+}
+
+_CMPOPS = {
+    ast.Eq: operator.eq,
+    ast.NotEq: operator.ne,
+    ast.Lt: operator.lt,
+    ast.LtE: operator.le,
+    ast.Gt: operator.gt,
+    ast.GtE: operator.ge,
+    ast.Is: operator.is_,
+    ast.IsNot: operator.is_not,
+    # operator.contains reverses its argument order (contains(b, a)); the
+    # lambda keeps ``a in b`` argument order.
+    ast.In: lambda a, b: a in b,
+    ast.NotIn: lambda a, b: a not in b,
+}
 
 # -----------------------------------------------------------------------
 # Effect-bearing bare names: calls that the analyzer MUST refuse because
@@ -803,13 +822,7 @@ class _BoundaryWalker:
         ),
         ast.Call: lambda self, n, s: (self._call_map_blocks(n, s) if self._is_map_blocks_call(n) else self._call(n, s)),
         ast.Attribute: lambda self, n, s: self._attr(n, s),
-        ast.IfExp: lambda self, n, s: (
-            (lambda v, b=n.body, o=n.orelse:
-                v is True and self._eval(b, s)
-                or v is False and self._eval(o, s)
-                or self._eval(b, s)
-            )(_truthy(self._eval(n.test, s)))
-        ),
+        ast.IfExp: lambda self, n, s: self._ifexp(n, s),
         ast.List: lambda self, n, s: [self._eval(e, s) for e in n.elts],
         ast.Tuple: lambda self, n, s: tuple(self._eval(e, s) for e in n.elts),
         ast.Dict: lambda self, n, s: {self._eval(k, s): self._eval(v, s) for k, v in zip(n.keys, n.values)},
@@ -865,46 +878,27 @@ class _BoundaryWalker:
         # Other types: try to subscript and hope for the best
         return value[slc]
 
+    def _ifexp(self, node: ast.IfExp, scope: _Scope) -> Any:
+        test = _truthy(self._eval(node.test, scope))
+        if test is True:
+            return self._eval(node.body, scope)
+        if test is False:
+            return self._eval(node.orelse, scope)
+        # Unknown/None test: walk the body as a defensive default.
+        return self._eval(node.body, scope)
+
     # -- Operators ---------------------------------------------------------
     def _binop(self, op: ast.AST, left: Any, right: Any) -> Any:
-        if isinstance(op, ast.Add):
-            return left + right
-        if isinstance(op, ast.Sub):
-            return left - right
-        if isinstance(op, ast.Mult):
-            return left * right
-        if isinstance(op, ast.Div):
-            return left / right
-        if isinstance(op, ast.FloorDiv):
-            return left // right
-        if isinstance(op, ast.Mod):
-            return left % right
-        if isinstance(op, ast.Pow):
-            return left**right
-        if isinstance(op, ast.LShift):
-            return left << right
-        if isinstance(op, ast.RShift):
-            return left >> right
-        if isinstance(op, ast.BitOr):
-            return left | right
-        if isinstance(op, ast.BitXor):
-            return left ^ right
-        if isinstance(op, ast.BitAnd):
-            return left & right
-        if isinstance(op, ast.MatMult):
-            return left @ right
-        raise IncompatibleCallbackError(f"Unsupported binary operator: {type(op).__name__}")
+        fn = _BINOPS.get(type(op))
+        if fn is None:
+            raise IncompatibleCallbackError(f"Unsupported binary operator: {type(op).__name__}")
+        return fn(left, right)
 
     def _unaryop(self, op: ast.AST, operand: Any) -> Any:
-        if isinstance(op, ast.USub):
-            return -operand
-        if isinstance(op, ast.UAdd):
-            return +operand
-        if isinstance(op, ast.Not):
-            return not _truthy(operand)
-        if isinstance(op, ast.Invert):
-            return ~operand
-        raise IncompatibleCallbackError(f"Unsupported unary operator: {type(op).__name__}")
+        fn = _UNARYOPS.get(type(op))
+        if fn is None:
+            raise IncompatibleCallbackError(f"Unsupported unary operator: {type(op).__name__}")
+        return fn(operand)
 
     def _boolop(self, op: ast.AST, values: List[Any], scope: _Scope) -> Any:
         if isinstance(op, ast.And):
@@ -934,27 +928,10 @@ class _BoundaryWalker:
         return True
 
     def _apply_compare(self, op: ast.AST, left: Any, right: Any) -> bool:
-        if isinstance(op, ast.Eq):
-            return bool(left == right)
-        if isinstance(op, ast.NotEq):
-            return bool(left != right)
-        if isinstance(op, ast.Lt):
-            return bool(left < right)
-        if isinstance(op, ast.LtE):
-            return bool(left <= right)
-        if isinstance(op, ast.Gt):
-            return bool(left > right)
-        if isinstance(op, ast.GtE):
-            return bool(left >= right)
-        if isinstance(op, ast.Is):
-            return left is right
-        if isinstance(op, ast.IsNot):
-            return left is not right
-        if isinstance(op, ast.In):
-            return left in right
-        if isinstance(op, ast.NotIn):
-            return left not in right
-        return False
+        fn = _CMPOPS.get(type(op))
+        if fn is None:
+            return False  # unknown comparison -> False (matches previous default)
+        return bool(fn(left, right))
 
     # -- Attribute access --------------------------------------------------
     def _attr(self, node: ast.Attribute, scope: _Scope) -> Any:
