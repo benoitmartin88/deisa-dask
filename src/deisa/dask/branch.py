@@ -540,7 +540,6 @@ def _analyze_branch(callback: Callable, registered_arrays: Dict[str, Any], preco
 
         branch = _try_chain_branch(
             branch=branch_dict,
-            chunk_func=chunk_func,
             primary=primary,
             array_ndim=array_ndim,
             placeholder=placeholder,
@@ -548,7 +547,8 @@ def _analyze_branch(callback: Callable, registered_arrays: Dict[str, Any], preco
             seen_chains=_seen_chains,
         )
         if branch is None:
-            # Chain walker refused; fall back to the length-1 path, passing the ORIGINAL branch dict (not the None result).
+            # Chain walker refused; fall back to the length-1 path, passing the ORIGINAL branch dict
+            # (not the None result).
             branch = _try_length1_branch(
                 branch=branch_dict,
                 chunk_func=chunk_func,
@@ -578,7 +578,6 @@ def _analyze_branch(callback: Callable, registered_arrays: Dict[str, Any], preco
 
 def _try_chain_branch(
     branch: Dict[str, Any],
-    chunk_func: Callable,
     primary: str,
     array_ndim: int,
     placeholder: Optional[Any],

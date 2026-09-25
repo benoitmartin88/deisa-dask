@@ -360,7 +360,6 @@ class Bridge(IBridge):
                 res,
                 chunk,
                 timestep,
-                precomputed=precomputed_meta,
                 precomputed_meta=precomputed_meta,
                 branches=branches,  # BranchSpec list
             )
@@ -468,7 +467,6 @@ class Bridge(IBridge):
         res: dict,
         chunk: np.ndarray,
         timestep: int,
-        precomputed: Optional[Dict] = None,
         precomputed_meta: Optional[Dict[str, Dict]] = None,
         branches: Optional[List[BranchSpec]] = None,
     ):
@@ -482,8 +480,6 @@ class Bridge(IBridge):
             precompute: dict with a list ``future`` of all partial keys).
         - ``:param chunk:`` The numpy ndarray data chunk (kept for legacy shape/dtype).
         - ``:param timestep:`` The current timestep.
-        - ``:param precomputed:`` Optional precomputed values dict (legacy key, kept for API stability;
-            prefer ``precomputed_meta``).
         - ``:param precomputed_meta:`` Per-partial scatter metadata
             (``{output_key: {"future", "shape", "dtype"}}``); only set on the
             precompute path. When provided, the topic event's ``futures`` list
@@ -534,7 +530,7 @@ class Bridge(IBridge):
         to_send = {
             "array_name": array_name,
             "iteration": timestep,
-            "precomputed": True if precomputed_meta else precomputed,
+            "precomputed": True if precomputed_meta else None,
             "futures": futures_payload,
         }
         self.client.log_event(array_name, to_send)
