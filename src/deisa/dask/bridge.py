@@ -102,8 +102,8 @@ class Bridge(IBridge):
         self._array_comms: Dict[str, Any] = {}  # array_name -> sub-comm (from comm.Split)
         self._handshake_metadata = None
 
-        # array_name -> branches for local execution
-        self._task_branches: Dict[str, List[BranchSpec]] = {}
+        # array_name -> branches for local execution (None = "not fetched yet")
+        self._task_branches: Dict[str, Optional[List[BranchSpec]]] = {}
         #  array_name -> output_key -> chunk_axis (derived once from branches; static)
         self._chunk_axis_by_key: Dict[str, Dict[str, Optional[Tuple[int, ...]]]] = {}
         #  array_name -> output_key -> branch (BranchSpec)
@@ -140,6 +140,22 @@ class Bridge(IBridge):
 
             if kwargs.get("wait_for_go", True):
                 Event(WAIT_FOR_EXECUTE_CB_EVENT, client=self.client).wait()
+
+        # World-wide barrier. Rank 0 waited on WAIT_FOR_EXECUTE_CB_EVENT (all callbacks
+        # have written their task-branches to the handshake actor by then); the other ranks
+        # skipped that wait and reach here immediately. The barrier brings every rank past
+        # the callback-registration point together so the prefetch below reads a consistent
+        # handshake state. MUST be unconditional (a world collective needs all ranks to
+        # participate); it is deliberately NOT gated on wait_for_go.
+        self.comm.barrier()
+        logger.debug(f"[{self.id}] Bridge __init__(): post-registration barrier done")
+
+        if kwargs.get("wait_for_go", True):
+            # Prefetch static task-branches out of the send() latency path. Safe only on the
+            # wait_for_go path: the barrier guarantees branches exist in the handshake (rank 0
+            # confirmed via the event). On wait_for_go=False the branches may not be registered
+            # yet, so skip prefetch and keep the lazy first-send fetch in _get_task_branches.
+            self._prefetch_task_branches()
 
     def _gather_global_metadata(self):
         """
@@ -214,8 +230,11 @@ class Bridge(IBridge):
                 # Connect to existing handshake actor from analytics side (created by Deisa)
                 self.handshake = Handshake(self.client)
 
-            # Store empty hints initially - they will be fetched on first send()
-            self._task_branches[array_name] = []
+            # Seed a "not fetched yet" sentinel. None is DISTINCT from a genuinely
+            # branch-less array ([]), which means "no precompute, full-chunk scatter".
+            # Branches are fetched once (prefetch in __init__ on the wait_for_go path,
+            # otherwise lazily on first send()) and then cached, empty lists included.
+            self._task_branches[array_name] = None
 
             logger.debug(
                 f"[{self.id}] _setup_array_comms: "
@@ -631,8 +650,9 @@ class Bridge(IBridge):
         # Check cache first. Branches are fixed after registration. Once fetched (rank 0 reads from the handshake actor
         # and broadcasts to all ranks in the sub_comm), subsequent sends hit the cache and never touch the handshake or
         # broadcast, keeping the send() critical path fast.
-        if self._task_branches.get(array_name):
-            return self._task_branches[array_name]
+        cached = self._task_branches.get(array_name)
+        if cached is not None:
+            return cached
 
         # Cache miss -> rank 0 of the sub_comm reads branches from the handshake actor (only rank 0 has a
         # client/handshake connection) and broadcasts to every rank. Branches are set by the analytics side during
@@ -648,10 +668,39 @@ class Bridge(IBridge):
             else:
                 branches = sub_comm.bcast(None, root=0)
 
-            if branches:
-                self._task_branches[array_name] = branches
+            # Store unconditionally, including empty lists: a genuinely branch-less
+            # array ([]) is a valid cached result meaning "no precompute, full-chunk
+            # scatter" and must not be re-fetched on every send.
+            self._task_branches[array_name] = branches
 
         return branches
+
+    def _prefetch_task_branches(self) -> None:
+        """Prefetch static task-branches for every global array into the local cache.
+
+        Branches are written to the handshake actor by register_callback during
+        decoration and are static afterwards. On the wait_for_go path rank 0 has already
+        waited on WAIT_FOR_EXECUTE_CB_EVENT and the world-wide barrier guarantees every
+        bridge is past the callback-registration point, so the handshake is complete here.
+        Broadcasting per array now moves branch fetches out of the send() critical path.
+
+        The broadcast mirrors _get_task_branches: the array's sub-comm rank 0 reads from
+        the handshake actor and broadcasts to that sub-comm's members; every other
+        participating rank receives via bcast(None). A genuinely branch-less array ([]) is
+        cached as-is so it is not re-fetched on every send. Non-participating ranks skip
+        the array entirely (no bcast, cache left at the None sentinel).
+        """
+        for array_name in self._global_array_names:
+            sub_comm = self._array_comms.get(array_name)
+            if sub_comm is None or sub_comm is _COMM_NULL:
+                # This bridge does not participate in this array's sub-comm.
+                continue
+            if sub_comm.Get_rank() == 0 and self.handshake is not None:
+                branches = self.handshake.get_task_branches(array_name)
+                sub_comm.bcast(branches, root=0)
+            else:
+                branches = sub_comm.bcast(None, root=0)
+            self._task_branches[array_name] = branches
 
     def _get_chunk_axis_by_key(
         self, array_name: str, branches: List[BranchSpec]
