@@ -232,7 +232,7 @@ def _nest_partial_dicts_by_grid(partials: List[Dict[str, Any]]) -> Tuple[Any, Tu
         if not dims_remaining:
             return partials[by_coord[prefix]]["future"]
         head, *tail = dims_remaining
-        return [_build_nested(tuple(tail), prefix + (i,)) for i in range(head)]
+        return [_build_nested(tuple(tail), (*prefix, i)) for i in range(head)]
 
     nested = _build_nested(grid_shape, ())
     return nested, grid_shape
