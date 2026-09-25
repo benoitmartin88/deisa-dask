@@ -338,7 +338,7 @@ def _make_branch_func(chunk_func: Callable, chunk_kwargs: Dict[str, Any]) -> Cal
     return _functools.partial(_branch_func_with_kwargs, _cf=chunk_func, _kw=chunk_kwargs)
 
 
-def _build_branch_from_dict(
+def _build_length1_branch(
     branch: Dict[str, Any],
     chunk_func: Callable[[Any], Any],
     input_name: str,
@@ -559,7 +559,7 @@ def _analyze_branch(callback: Callable, registered_arrays: Dict[str, Any], preco
         if branch is None:
             if not precompute:
                 logger.debug(
-                    "analyze_branch: build failed for %s. The length-1 path's build_branch_from_dict raised "
+                    "analyze_branch: build failed for %s. The length-1 path's build_length1_branch raised "
                     "(most likely the placeholder couldn't be computed or the chunk_func rejected the chunk shape).",
                     branch_dict.get("output_key"),
                 )
@@ -569,7 +569,7 @@ def _analyze_branch(callback: Callable, registered_arrays: Dict[str, Any], preco
             raise RuntimeError(
                 f"analyze_branch: cannot build branch for branch {branch_dict.get('output_key')!r}. "
                 f"The chain walker refused (likely cross-array or constant upstream) AND the length-1 fallback's "
-                f"build_branch_from_dict raised. This usually means the chunk_func rejected the placeholder. "
+                f"build_length1_branch raised. This usually means the chunk_func rejected the placeholder. "
                 f"Inspect with the failing branch's chunk_kwargs."
             )
         branches.append(branch)
@@ -639,7 +639,7 @@ def _try_length1_branch(
     and no extra kwargs.
     """
     try:
-        return _build_branch_from_dict(
+        return _build_length1_branch(
             branch=branch,
             chunk_func=chunk_func,
             input_name=primary,
@@ -653,7 +653,7 @@ def _try_length1_branch(
         # dtype, or the placeholder is itself a dask array (because
         # .compute() silently failed upstream).
         logger.debug(
-            "_try_length1_branch: build_branch_from_dict raised for %s "
+            "_try_length1_branch: build_length1_branch raised for %s "
             "with chunk_kwargs=%r, array_ndim=%d, placeholder=%r: %s",
             branch.get("output_key"),
             branch.get("chunk_kwargs"),
