@@ -383,7 +383,7 @@ class Deisa(IDeisa):
             """
             tasks = [
                 task
-                for task in dask_scheduler.tasks.keys()
+                for task in dask_scheduler.tasks
                 if isinstance(task, str)
                 # Note: This may be an issue if the Dask scheduler is used by multiple users
                 if not task.startswith(KEY_PREFIX)
@@ -683,9 +683,9 @@ class Deisa(IDeisa):
             if isinstance(arg, str):
                 array_names.append(arg)
             elif isinstance(arg, tuple):
-                if len(arg) == 1 and isinstance(arg[0], str):
-                    array_names.append(arg[0])
-                elif len(arg) == 2 and isinstance(arg[0], str) and isinstance(arg[1], int):
+                if (len(arg) == 1 and isinstance(arg[0], str)) or (
+                    len(arg) == 2 and isinstance(arg[0], str) and isinstance(arg[1], int)
+                ):
                     array_names.append(arg[0])
                 else:
                     raise TypeError(
