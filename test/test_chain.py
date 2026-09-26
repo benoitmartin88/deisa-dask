@@ -91,6 +91,28 @@ class TestWalkChain:
                 True,
                 id="scalar-constant-refused",
             ),
+            # Dedicated chunk/aggregate pairs must resolve via
+            # _chunk_base_for_aggregate_base (mean_chunk/mean_agg,
+            # chunk_max/max, chunk_min/min) instead of requiring an
+            # exact base match.
+            pytest.param(
+                lambda arr: (arr * arr).mean(),
+                2,
+                False,
+                id="self-ref-mul-mean",
+            ),
+            pytest.param(
+                lambda arr: (arr * arr).max(),
+                2,
+                False,
+                id="self-ref-mul-max",
+            ),
+            pytest.param(
+                lambda arr: (arr * arr).min(),
+                2,
+                False,
+                id="self-ref-mul-min",
+            ),
         ],
     )
     def test_walk_chain_parametrized(self, expr, expected_length, should_refuse):
@@ -272,3 +294,149 @@ class TestAnalyzeBranchLength1:
         names = [_layer_name(layer) for layer in chain]
         assert any(n in {"mul", "multiply"} for n in names)
         assert "sum" in names
+
+
+# ---------------------------------------------------------------------------
+# Multi-reduction callbacks: each branch must fold its OWN aggregate
+# ---------------------------------------------------------------------------
+class TestMultiReductionBranches:
+    """Chain folding is hint-aware: a hint must be folded with the aggregate
+    layer of its OWN reduction, never the first aggregate of the first walked
+    graph. Regression for the aggregate-mismatch bug where
+    ``s=arr.sum(); m=arr.mean(); mx=arr.max()`` folded the SUM chain into all
+    three branches (f-mean and f-max then shipped wrong partials).
+    """
+
+    def _analyze(self, body: str) -> Dict[str, Any]:
+        from deisa.dask.branch import _analyze_branch
+
+        cb = _make_callback("multi_reduction_cb", body)
+        branches = _analyze_branch(cb, {"f": da.zeros((4, 4), chunks=2, dtype="float64")})
+        return {b.output_key: b for b in branches}
+
+    def _chain_names(self, branch) -> list:
+        chain = branch.branch_func.keywords["_chain"]
+        names = []
+        for layer in chain:
+            func = layer[0]
+            if isinstance(func, functools.partial):
+                names.append(getattr(func.func, "__name__", repr(func)))
+            else:
+                names.append(getattr(func, "__name__", repr(func)))
+        return names
+
+    @staticmethod
+    def _scalar(value) -> float:
+        return float(np.asarray(value).reshape(-1)[0])
+
+    def test_multi_reduction_each_branch_uses_own_reduction(self):
+        # T1 repro: three compute boundaries, one per reduction. Before the
+        # fix, all three hints folded the SUM chain (walker_dask_arrays[0] +
+        # first aggregate), so f-mean/f-max were wrong.
+        branches = self._analyze(
+            "s = arr.sum()\nm = arr.mean()\nmx = arr.max()\nreturn s.compute(), m.compute(), mx.compute()"
+        )
+        assert set(branches) == {"f-sum", "f-mean", "f-max"}
+        assert branches["f-sum"].output_kind == "scalar"
+        assert branches["f-mean"].output_kind == "mean"
+        assert branches["f-max"].output_kind == "scalar"
+
+        real = np.arange(1, 17, dtype=np.float64).reshape(4, 4)
+
+        sum_names = self._chain_names(branches["f-sum"])
+        assert "sum" in sum_names
+        assert np.isclose(self._scalar(branches["f-sum"].branch_func(real)), real.sum())
+
+        # f-mean must compute its OWN reduction: the mean_chunk form
+        # ({n, total} dict), not the sum chain (which ships a bare scalar
+        # and fails mean_agg at combine time).
+        mean_names = self._chain_names(branches["f-mean"])
+        assert "mean_chunk" in mean_names
+        assert "sum" not in mean_names
+        mean_partial = branches["f-mean"].branch_func(real)
+        assert isinstance(mean_partial, dict)
+        assert set(mean_partial) >= {"n", "total"}
+        assert np.isclose(self._scalar(mean_partial["total"] / mean_partial["n"]), real.mean())
+
+        # f-max must compute its OWN reduction via chunk_max, not the sum chain.
+        max_names = self._chain_names(branches["f-max"])
+        assert "chunk_max" in max_names
+        assert "sum" not in max_names
+        assert np.isclose(self._scalar(branches["f-max"].branch_func(real)), real.max())
+
+    def test_single_graph_two_aggregates_each_folds_own_chain(self):
+        # T2: ONE walker graph with TWO aggregate layers (sum and max).
+        # f-max must fold the max chain; it must NOT inherit the 'mul','sum'
+        # chain of f-sum.
+        branches = self._analyze("return ((arr * arr).sum() + arr.max()).compute()")
+        assert set(branches) == {"f-sum", "f-max"}
+
+        real = np.arange(1, 17, dtype=np.float64).reshape(4, 4)
+
+        sum_names = self._chain_names(branches["f-sum"])
+        assert "mul" in sum_names and "sum" in sum_names
+        assert np.isclose(self._scalar(branches["f-sum"].branch_func(real)), (real**2).sum())
+
+        max_names = self._chain_names(branches["f-max"])
+        assert "chunk_max" in max_names
+        assert "mul" not in max_names and "sum" not in max_names
+        assert np.isclose(self._scalar(branches["f-max"].branch_func(real)), real.max())
+
+    def test_chained_mean_max_min_use_dedicated_chunk_pairs(self):
+        # The dedicated chunk/aggregate pairs (mean_chunk/mean_agg,
+        # chunk_max/max, chunk_min/min) must fold. Before the fix the chunk
+        # layer lookup required an exact base match, so these fell back to
+        # the length-1 path and silently shipped the RAW reduction:
+        # (arr*arr).mean() returned total=136 (sum) instead of 1496
+        # (sum of squares).
+        real = np.arange(1, 17, dtype=np.float64).reshape(4, 4)
+
+        mean = self._analyze("return (arr * arr).mean().compute()")["f-mean"]
+        mean_partial = mean.branch_func(real)
+        assert isinstance(mean_partial, dict)
+        assert np.isclose(self._scalar(mean_partial["total"]), (real**2).sum())
+        assert np.isclose(self._scalar(mean_partial["total"] / mean_partial["n"]), (real**2).mean())
+        assert "mean_chunk" in self._chain_names(mean)
+
+        mx = self._analyze("return (arr * arr).max().compute()")["f-max"]
+        assert np.isclose(self._scalar(mx.branch_func(real)), (real**2).max())
+        assert "chunk_max" in self._chain_names(mx)
+
+        # min needs negative data so the raw min (-5) differs from the min of
+        # squares (4).
+        neg = np.array([[-5.0, 2.0], [3.0, 4.0]])
+        mn = self._analyze("return (arr * arr).min().compute()")["f-min"]
+        assert np.isclose(self._scalar(mn.branch_func(neg)), (neg**2).min())
+        assert "chunk_min" in self._chain_names(mn)
+
+    def test_var_std_folded_partials_combine_correctly(self):
+        # var/std fold their pointwise chain AND ship {n, total, M} dict
+        # partials that _combine_array_from_partials (kind='moment') can
+        # combine into the correct global value.
+        from deisa.dask.branch import _combine_array_from_partials
+
+        real = np.arange(1, 17, dtype=np.float64).reshape(4, 4)
+        chunks = [real[i : i + 2, j : j + 2] for i in range(0, 4, 2) for j in range(0, 4, 2)]
+
+        for label, expected in [("std", (real**2).std()), ("var", (real**2).var())]:
+            branch = self._analyze(f"return (arr * arr).{label}().compute()")[f"f-{label}"]
+            assert "moment_chunk" in self._chain_names(branch)
+            partials = []
+            for c in chunks:
+                p = branch.branch_func(c)
+                partials.append(
+                    {
+                        "future": p,
+                        "chunk_position": tuple(np.unravel_index(len(partials), (2, 2))),
+                        "shape": tuple(np.asarray(p["total"]).shape),
+                        "dtype": np.asarray(p["total"]).dtype,
+                    }
+                )
+            combined = _combine_array_from_partials(
+                partials,
+                kind=branch.output_kind,
+                finalize=branch.finalize,
+                hint_axis=(0, 1),
+                array_ndim=2,
+            )
+            assert np.isclose(self._scalar(combined.compute()), float(expected))
