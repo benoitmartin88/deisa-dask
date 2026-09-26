@@ -33,6 +33,8 @@ from deisa.core import DeisaArray, ICommunicator
 from distributed import Client, Lock, Variable
 
 import dask.array as da
+from deisa.dask.precompute_analyzer import PrecomputeRuntimeError, UnsupportedReductionError
+from deisa.dask.task_branches import _normalize_reduction_axis
 
 logger = logging.getLogger(__name__)
 
@@ -121,3 +123,119 @@ def build_deisa_array(darr: da.Array, timestep: int) -> DeisaArray:
         meta=darr._meta,
         shape=darr.shape,
     )
+
+
+# The per-callback dispatch view overrides the seven dask array reduction
+# methods (``sum``/``prod``/``max``/``min``/``mean``/``var``/``std``) so the
+# callback's re-application routes to the correct pre-combined array.
+class _PrecomputedDeisaArray(DeisaArray):
+    """Per-callback dispatch view over the combined per-bridge partials.
+
+    The runtime delivers ONE combined dask array per reduction
+    (per ``output_key``). A callback's source is not rewritten, so its
+    reduction calls (``arr.sum()``, ``arr.mean()``, ...) must be routed to the
+    array the analyzer recorded for THAT callback and THAT reduction -- never
+    re-applied onto a wrong array. This view stores, for each recorded
+    reduction signature ``(op_name, normalized_axis)``, the combined array and
+    dispatches:
+
+    - signature match + scalar FULL reduction (the per-bridge partial
+      ``da.stack``): re-apply the op over the stack via dask (today's
+      backward-compatible shape semantics; the stack's shape is preserved for
+      existing tests);
+    - signature match + anything else (mean/moment, any axis reduction): the
+      stored array is already FINAL and correctly shaped -- return it
+      directly, neutralizing the callback's re-application (this is what makes
+      ``var``/``std`` correct: re-applying ``.var()`` to a one-element array is
+      mathematically forced to ``0.0``);
+    - no match (analyzer/runtime signature drift, an op the callback performs
+      but never recorded): raise a typed error -- never silently mis-reduce.
+
+    The underlying dask guts wrap the FIRST recorded reduction's combined
+    array so ``.shape`` / ``.dtype`` / ``.ndim`` / ``.t`` / slicing /
+    passthrough attributes behave like a regular ``DeisaArray``.
+    """
+
+    def __new__(cls, t, signatures, reapply, registered_ndim, *args, **kwargs):
+        # ``DeisaArray.__new__`` (``deisa.core``) forwards *all* keyword
+        # arguments to ``dask.array.Array.__new__``, which in current dask
+        # accepts exactly ``(cls, dask, name, chunks, dtype, meta, shape)``.
+        # Consume the dispatch-view extras here so they never reach
+        # ``Array.__new__`` (previously raised ``TypeError: unexpected keyword
+        # argument 'signatures'`` at every precompute topic event).
+        array_kwargs = {key: kwargs.pop(key) for key in ("dask", "name", "chunks", "dtype", "meta", "shape")}
+        if kwargs:
+            raise TypeError(
+                f"_PrecomputedDeisaArray: unexpected keyword arguments {sorted(kwargs)} "
+                f"(allowed array keywords: {sorted(array_kwargs)})"
+            )
+        return super().__new__(cls, t, *args, **array_kwargs)
+
+    def __init__(self, t, signatures, reapply, registered_ndim, *args, **kwargs):
+        super().__init__(t, *args, **kwargs)
+        self._signatures = signatures
+        self._reapply = reapply
+        self._registered_ndim = registered_ndim
+
+    def _dispatch(self, op_name: str, axis, keepdims: bool):
+        if keepdims:
+            raise PrecomputeRuntimeError(
+                f"Precomputed array {self.name!r}: reduction {op_name}(keepdims=True) is not supported on the "
+                f"precompute path -- the analyzer cannot distinguish keepdims at registration time and the "
+                f"combined result would have a different shape. Use keepdims=False (the default)."
+            )
+        # Normalize the CALL's axis against the REGISTERED array's ndim: the
+        # callback wrote the axis relative to the delivered array's shape
+        # semantics at registration time, and the combined arrays have already
+        # dropped the reduced axes, so normalizing against the view's own ndim
+        # would silently shift axes (e.g. ``mean(axis=0)`` on a 1-D final
+        # array would normalize to the FULL reduction).
+        sig = (op_name, _normalize_reduction_axis(axis, self._registered_ndim))
+        stored = self._signatures.get(sig)
+        if stored is None:
+            raise UnsupportedReductionError(
+                f"Precomputed array {self.name!r}: reduction {op_name} with axis={axis!r} was not recorded for "
+                f"this callback by the precompute analyzer (recorded: "
+                f"{sorted(((o, a) for (o, a) in self._signatures))}). The precompute delivery path cannot "
+                f"compute it correctly on the callback side; register this reduction or use precompute=False."
+            )
+        if sig in self._reapply:
+            # Scalar FULL reduction: the stored array is the stack of per-bridge
+            # partials; dask aggregates it (the value is the global reduction,
+            # matching the callback's op on the pre-stack behavior). The op is
+            # called on the STORED (plain dask) array -- NOT on ``self``, whose
+            # custom dispatch would re-enter ``_dispatch``.
+            return getattr(stored, op_name)(axis=None, keepdims=False)
+        # Already-final combined array: neutralize the callback's re-application.
+        return stored
+
+    def sum(self, axis=None, dtype=None, keepdims=False, split_every=None, out=None):
+        return self._dispatch("sum", axis, keepdims)
+
+    def prod(self, axis=None, dtype=None, keepdims=False, split_every=None, out=None):
+        return self._dispatch("prod", axis, keepdims)
+
+    def max(self, axis=None, dtype=None, keepdims=False, split_every=None, out=None):
+        return self._dispatch("max", axis, keepdims)
+
+    def min(self, axis=None, dtype=None, keepdims=False, split_every=None, out=None):
+        return self._dispatch("min", axis, keepdims)
+
+    def mean(self, axis=None, dtype=None, keepdims=False, split_every=None, out=None):
+        return self._dispatch("mean", axis, keepdims)
+
+    def var(self, axis=None, dtype=None, ddof=0, keepdims=False, split_every=None, out=None):
+        if ddof != 0:
+            raise PrecomputeRuntimeError(
+                f"Precomputed array {self.name!r}: var(ddof={ddof}) is not supported on the precompute path "
+                f"(the per-bridge partials are population moments). Use ddof=0 (the default)."
+            )
+        return self._dispatch("var", axis, keepdims)
+
+    def std(self, axis=None, dtype=None, ddof=0, keepdims=False, split_every=None, out=None):
+        if ddof != 0:
+            raise PrecomputeRuntimeError(
+                f"Precomputed array {self.name!r}: std(ddof={ddof}) is not supported on the precompute path "
+                f"(the per-bridge partials are population moments). Use ddof=0 (the default)."
+            )
+        return self._dispatch("std", axis, keepdims)

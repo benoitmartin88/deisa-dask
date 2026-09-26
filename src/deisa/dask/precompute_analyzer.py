@@ -86,6 +86,18 @@ class NoPrecomputableReductionError(PrecomputeError):
     """
 
 
+class PrecomputeRuntimeError(PrecomputeError):
+    """A runtime (post-registration) precompute invariant was violated.
+
+    Raised on the Deisa side (topic handler, callback dispatch view) and the
+    bridge side (executing a branch on the local chunk) when a precompute
+    contract breaks -- e.g. a failed branch dropped a partial, a reduction's
+    partials do not cover the full chunk grid, or a callback calls a
+    reduction that the analyzer did not record. Always prefer raising this
+    over silently delivering a wrong number.
+    """
+
+
 class MaterializationError(PrecomputeError):
     """A full data materialization was detected in the callback.
 
@@ -253,6 +265,11 @@ def _analyze_callback(
     dask_arrays = walker.dask_arrays
     had_boundaries = bool(walker.boundaries)
 
+    # One shared seen-map for the WHOLE callback: output_key must be unique
+    # per reduction signature across every compute boundary of the callback
+    # (e.g. ``arr.sum()`` + ``arr.sum(axis=0)`` must not both key ``f-sum``).
+    output_key_seen: Dict = {}
+
     # 7. Walk the dask graphs to find reductions.
     hints: List[Dict[str, Any]] = []
     for arr_info in dask_arrays:
@@ -267,7 +284,7 @@ def _analyze_callback(
         array_name = matched[0] if matched else primary_name
         multi = len(matched) > 1
         try:
-            new_hints = extract_reduction_hints(darr, array_name)
+            new_hints = extract_reduction_hints(darr, array_name, output_key_seen=output_key_seen)
         except UnsupportedReductionError:
             # Cross-reduction dependency detected. This is the signal we MUST propagate to the caller. The precompute
             # path cannot produce correct per-bridge partials for an expression whose reduction depends on another

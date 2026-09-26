@@ -59,6 +59,7 @@ from dask import delayed
 from dask.array.reductions import mean_agg, moment_agg
 from deisa.dask.precompute_analyzer import (
     PrecomputeError,
+    PrecomputeRuntimeError,
     UnsupportedReductionError,
     _match_source_arrays,
     analyze_callback,
@@ -70,6 +71,7 @@ from deisa.dask.task_branches import (
     _chunk_func_and_kwargs,
     _find_chunk_layer,
     _is_aggregate_layer,
+    _normalize_reduction_axis,
     _op_for_aggregate_layer,
 )
 from deisa.dask.utils import build_deisa_array
@@ -139,6 +141,51 @@ class BranchSpec:
     finalize: Optional[str]
     partial_shape: Tuple[int, ...]
     partial_dtype: str
+    op_name: str = ""
+    deliver_direct: bool = True
+    window_read: bool = False
+    dispatch_sig: Tuple[int, ...] = ()
+
+
+def merge_branches(existing: List[BranchSpec], new: List[BranchSpec]) -> List[BranchSpec]:
+    """Merge two branch lists, deduping by ``output_key``.
+
+    Identical reduction signatures (same op, same axis -- e.g. two callbacks
+    both doing ``arr.sum()``) carry the SAME ``output_key`` and are
+    semantically identical: one branch, one bridge execution, shared by every
+    callback's dispatch view. Distinct keys (different reductions) all
+    survive intact.
+
+    A same-key branch whose RUNTIME dispatch signature differs (e.g. a
+    window-read ``x[-1].sum()`` vs a true ``x.sum(axis=0)`` -- both chunk
+    over axis 0 but deliver different shapes) can never be shared: one of the
+    two callbacks would receive the other's result. Refusing loudly at
+    registration beats silently delivering a wrong number.
+
+    - ``:param existing:`` The previously registered branches for an array.
+    - ``:param new:`` The newly analyzed branches for the same array.
+    - ``:return:`` The merged list (order: existing first, then new keys).
+    - ``:raises PrecomputeRuntimeError:`` On a same-key/different-signature collision.
+    """
+    merged = list(existing)
+    seen: Dict[str, BranchSpec] = {b.output_key: b for b in merged}
+    for b in new:
+        prev = seen.get(b.output_key)
+        if prev is None:
+            merged.append(b)
+            seen[b.output_key] = b
+            continue
+        if prev.dispatch_sig != b.dispatch_sig or prev.op_name != b.op_name or prev.output_kind != b.output_kind:
+            raise PrecomputeRuntimeError(
+                f"merge_branches: array {b.input_name!r} has two reductions sharing output_key "
+                f"{b.output_key!r} but different runtime signatures: "
+                f"(op={prev.op_name!r}, sig={prev.dispatch_sig!r}, kind={prev.output_kind!r}) vs "
+                f"(op={b.op_name!r}, sig={b.dispatch_sig!r}, kind={b.output_kind!r}). The precompute "
+                f"delivery path cannot serve both callbacks from one branch; rename one of the reductions "
+                f"or register them on separate arrays."
+            )
+        # Identical signatures: keep the first branch (dedup).
+    return merged
 
 
 def _analyze_callback_for_branches(callback: Callable, registered_arrays: Dict[str, Any], precompute: bool = True):
@@ -194,7 +241,21 @@ def _analyze_callback_for_branches(callback: Callable, registered_arrays: Dict[s
         raise
 
 
-def _nest_partial_dicts_by_grid(partials: List[Dict[str, Any]]) -> Tuple[Any, Tuple[int, ...]]:
+# Scalar-kind (``sum``/``prod``/``max``/``min``) elementwise fold used in
+# Phase A of the axis combine: partials for a scalar axis reduction are plain
+# arrays (reduced axes already dropped by the chunk func) and combining the
+# red-level entries is a binary-ufunc fold over the identical shapes.
+_SCALAR_FOLDS = {
+    "sum": lambda entries: np.sum(entries, axis=0),
+    "prod": lambda entries: np.prod(entries, axis=0),
+    "max": lambda entries: np.max(entries, axis=0),
+    "min": lambda entries: np.min(entries, axis=0),
+}
+
+
+def _nest_partial_dicts_by_grid(
+    partials: List[Dict[str, Any]], grid_extent: Optional[Tuple[int, ...]] = None
+) -> Tuple[Any, Tuple[int, ...]]:
     """Arrange per-bridge dict-blob partials into a nested list that mirrors
     the MPI chunk grid, so that ``mean_agg`` / ``moment_agg`` (which walk the
     nested list with ``_concatenate2``) can combine them.
@@ -204,6 +265,11 @@ def _nest_partial_dicts_by_grid(partials: List[Dict[str, Any]]) -> Tuple[Any, Tu
     ``grid_shape`` is the MPI grid shape (``(N, M, ...)``) and
     ``nested_list[i_0][i_1]...`` is the dict (or future-of-dict) at MPI
     coords ``(i_0, i_1, ...)``.
+
+    ``grid_extent`` (per data axis, from ``global_shape // chunk_shape``) is
+    validated against the coords when provided: a mismatch means the grid
+    layout the partials describe contradicts the array metadata, which would
+    silently corrupt any axis combine -- raise instead (F5).
 
     For a 1-D MPI grid (e.g. ``(2,)`` or ``(4,)``) this returns a flat
     list of length N. For higher-D grids the list is nested.
@@ -223,6 +289,12 @@ def _nest_partial_dicts_by_grid(partials: List[Dict[str, Any]]) -> Tuple[Any, Tu
         for ax, v in enumerate(c):
             axis_sizes[ax].add(v)
     grid_shape = tuple(len(axis_sizes[ax]) for ax in range(ndim))
+    if grid_extent is not None and tuple(grid_extent) != grid_shape:
+        raise PrecomputeRuntimeError(
+            f"_nest_partial_dicts_by_grid: partials' chunk grid {grid_shape} contradicts the array metadata "
+            f"grid {tuple(grid_extent)}. The grid<->data axis mapping is ambiguous; refusing to combine "
+            f"rather than silently producing a wrong reduction."
+        )
     # Validate full grid is filled
     expected = set(itertools.product(*(range(g) for g in grid_shape)))
     actual = set(coords)
@@ -244,58 +316,211 @@ def _nest_partial_dicts_by_grid(partials: List[Dict[str, Any]]) -> Tuple[Any, Tu
     return nested, grid_shape
 
 
+def _flatten_grid_entries(nested: Any) -> List[Any]:
+    """Flatten a (possibly nested) grid structure of partial values into a flat list."""
+    out: List[Any] = []
+    stack = [nested]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, list):
+            stack.extend(reversed(item))
+        else:
+            out.append(item)
+    return out
+
+
+def _concat_kept_grid(grid: Any, depth: int) -> np.ndarray:
+    """np.concatenate a kept-grid (nested over kept axes) along the result axes.
+
+    The Phase-A result for kept-coordinate ``(i0, i1, ...)`` has axes
+    ``(kept data axes in ascending data order)``; nesting level ``depth`` of
+    the grid corresponds to result axis ``depth``, so concatenating level by
+    level reproduces the full-kept-extent array.
+    """
+    if isinstance(grid[0], list):
+        return np.concatenate([_concat_kept_grid(g, depth + 1) for g in grid], axis=depth)
+    return np.concatenate([np.asarray(g) for g in grid], axis=depth)
+
+
+@delayed
+def _combine_two_phase(
+    flat_entries: List[Tuple[Tuple[int, ...], Any]],
+    kind: str,
+    op_name: Optional[str],
+    red_axes: Tuple[int, ...],
+    kept_axes: Tuple[int, ...],
+    grid_shape: Tuple[int, ...],
+    out_dtype: str,
+    finalize: Optional[str],
+) -> np.ndarray:
+    """Combine per-bridge partials into the final, correctly-shaped reduction.
+
+    ``flat_entries`` is ``[(chunk_position, partial_value), ...]`` where the
+    partial values (dicts for mean/moment, plain arrays/scalars for scalar
+    kind) have already been resolved by the scheduler.
+
+    Phase A: for each kept-grid coordinate, aggregate the sub-nest over the
+    RED grid levels (levels whose data axis is in ``red_axes``):
+    - mean/moment: ``mean_agg`` / ``moment_agg`` with ``axis=red_axes`` (the
+      DATA axes being reduced -- ``_concatenate2`` walks the nest level by
+      level and the level axis equals the data axis for our grid layout);
+    - scalar: fold the plain partial arrays with the op's binary ufunc.
+
+    Phase B: np.concatenate the Phase-A results along each KEPT data axis in
+    kept-level order (nesting order == data-axis order guarantees contiguity).
+
+    The returned array's shape automatically equals the kept axes' full
+    global extents; scalar partials carry their own dims and mean/moment
+    aggregators collapse the reduced axes.
+    """
+    by_coord = {tuple(c): v for c, v in flat_entries}
+
+    def _full_coord(kept_coord: Tuple[int, ...], red_coord: Tuple[int, ...]) -> Tuple[int, ...]:
+        full = [0] * len(grid_shape)
+        for pos, ax in enumerate(kept_axes):
+            full[ax] = kept_coord[pos]
+        for pos, ax in enumerate(red_axes):
+            full[ax] = red_coord[pos]
+        return tuple(full)
+
+    def _build_sub(idx: int, red_prefix: Tuple[int, ...], kept_coord: Tuple[int, ...]) -> Any:
+        if idx == len(red_axes):
+            return by_coord[_full_coord(kept_coord, red_prefix)]
+        ax = red_axes[idx]
+        return [_build_sub(idx + 1, red_prefix + (i,), kept_coord) for i in range(grid_shape[ax])]
+
+    phase_a: Dict[Tuple[int, ...], np.ndarray] = {}
+    for kept_coord in itertools.product(*(range(grid_shape[ax]) for ax in kept_axes)):
+        sub = _build_sub(0, (), kept_coord)
+        if kind in ("mean", "moment"):
+            if kind == "mean":
+                res = mean_agg(sub, dtype=np.dtype(out_dtype), axis=red_axes)
+            else:
+                res = moment_agg(sub, order=2, ddof=0, dtype=np.dtype(out_dtype), axis=red_axes)
+            phase_a[kept_coord] = np.asarray(res)
+        elif kind == "scalar":
+            fold = _SCALAR_FOLDS.get(op_name or "")
+            if fold is None:
+                raise PrecomputeRuntimeError(f"_combine_two_phase: no scalar fold for op {op_name!r}")
+            entries = np.stack([np.asarray(v) for v in _flatten_grid_entries(sub)])
+            res = np.asarray(fold(entries))
+            # Scalar chunk funcs run with keepdims=True (dask's chunk stage),
+            # so the RED axes survive as size-1 dims at their data positions.
+            # Drop them so the combined result's shape matches the declared
+            # kept-extent out_shape (and Phase B concatenates cleanly).
+            for ax in sorted(red_axes, reverse=True):
+                res = np.squeeze(res, axis=ax)
+            phase_a[kept_coord] = res
+        else:
+            raise PrecomputeRuntimeError(f"_combine_two_phase: unknown kind {kind!r}")
+
+    # Phase B: concatenate along kept levels; no kept axes -> single result.
+    if not kept_axes:
+        result = phase_a[()]
+    else:
+        kept_grid_shape = tuple(grid_shape[ax] for ax in kept_axes)
+
+        def _build_kept_grid(idx: int, prefix: Tuple[int, ...]) -> Any:
+            if idx == len(kept_axes):
+                return phase_a[prefix]
+            return [_build_kept_grid(idx + 1, prefix + (i,)) for i in range(kept_grid_shape[idx])]
+
+        result = _concat_kept_grid(_build_kept_grid(0, ()), 0)
+
+    if finalize == "sqrt":
+        result = np.sqrt(result)
+    return result
+
+
 def _combine_array_from_partials(
     partials: List[Dict[str, Any]],
     kind: str,
     finalize: Optional[str],
     hint_axis: Optional[Tuple[int, ...]],
     array_ndim: int,
+    op_name: Optional[str] = None,
+    global_shape: Optional[Tuple[int, ...]] = None,
+    grid_extent: Optional[Tuple[int, ...]] = None,
 ) -> Any:
-    """Build a single-block dask array that combines per-bridge partials via ``mean_agg`` or ``moment_agg``.
+    """Build a single-block dask array that combines per-bridge partials.
 
-    For each output_key (``sum``, ``mean``, ...) the bridge shipped a single future whose value is a dict
-    ``{n: ..., total: ...[, M: ...]}`` (per dask's ``mean_chunk`` / ``moment_chunk``).
-    The Deisa side has one such future per bridge (per MPI rank).
-    To combine them we:
+    The two-phase, data-axis-ordered combine (``_combine_two_phase``)
+    aggregates the partials over the RED grid levels (data axes in
+    ``hint_axis``) and concatenates the results over the KEPT levels, so the
+    output is the FINAL correctly-shaped reduction -- unlike the previous
+    all-grid nest, which could only express full reductions.
 
-    1. Arrange the futures in a nested list matching the MPI grid.
-    2. Build a delayed task that, when run, resolves the futures, calls ``mean_agg`` / ``moment_agg`` over the nested
-       list, and applies ``sqrt`` if ``finalize == "sqrt"`` (std).
-    3. Wrap that single delayed task as ``da.from_delayed`` so the callback sees a normal dask array.
-
-    The output shape comes from the chunk's ``axis`` hint: removing the reduced axes from the array's ndim gives the
-    reduction output's shape. For ``mean()`` on a 2-D array (``axis=(0, 1)``), the output is scalar ``()``.
-    For ``mean(axis=0)``, the output is 1-d ``(N,)``.
+    - ``:param partials:`` One entry per (bridge, reduction): the payload
+      dicts from the topic event, each carrying ``future`` / ``shape`` /
+      ``dtype`` / ``chunk_position`` / ``chunk_axis``.
+    - ``:param kind:`` ``"mean"`` / ``"moment"`` (dict-blob partials) or
+      ``"scalar"`` (plain arrays -- axis reductions only; full scalar
+      reductions stay on the ``da.stack`` path in the topic handler).
+    - ``:param finalize:`` ``"sqrt"`` for std, else ``None``.
+    - ``:param hint_axis:`` The chunk's reduction axes (data axes). ``None``
+      or a tuple covering all data axes means a full reduction.
+    - ``:param array_ndim:`` The registered array's dimensionality.
+    - ``:param op_name:`` Canonical op name (``sum``/``mean``/...); required
+      for scalar-kind folding.
+    - ``:param global_shape:`` The array's full global shape; used for the
+      combine's output shape. Falls back to the per-bridge partial shape when
+      omitted (legacy callers, full reductions).
+    - ``:param grid_extent:`` Per-data-axis chunk grid extent from the
+      metadata (``global_shape[i] // chunk_shape[i]``); validated against the
+      partials' positions when provided (F5).
+    - ``:return:`` A dask array via ``da.from_delayed``.
     """
     if not partials:
-        raise ValueError("_build_dict_blob_combine_array: no partials provided")
-    nested, grid_shape = _nest_partial_dicts_by_grid(partials)
-    out_dtype = partials[0]["dtype"]
-    # Compute the output shape from the reduced axes.
+        raise ValueError("_combine_array_from_partials: no partials provided")
+    nested, grid_shape = _nest_partial_dicts_by_grid(partials, grid_extent=grid_extent)
+    out_dtype = str(partials[0]["dtype"])
+
+    # Grid <-> data axis mapping must be explicit: each grid level is one data
+    # axis (the harness's cart dims == array ndim invariant).
+    if len(grid_shape) != array_ndim:
+        raise PrecomputeRuntimeError(
+            f"_combine_array_from_partials: chunk grid {grid_shape} has {len(grid_shape)} levels but the "
+            f"array has {array_ndim} data axes; cannot map grid axes to data axes. Refusing to combine."
+        )
+
+    # Red axes = the data axes being reduced. ``hint_axis is None`` is the
+    # legacy no-axis form of a full reduction (reduce all data axes).
     if hint_axis is None:
-        # Fallback: rely on the bridge-recorded shape (keepdims=True result).
-        out_shape = partials[0]["shape"]
+        red_axes = tuple(range(array_ndim))
     else:
-        kept_axes = tuple(ax for ax in range(array_ndim) if ax not in hint_axis)
-        out_shape = tuple(partials[0]["shape"][ax] for ax in kept_axes)
-    agg_kind = kind  # "mean" or "moment"
-    # The agg's axis is the chunk's reduction axis. mean_agg / moment_agg walk the nested list with one axis per nesting
-    # level, and the chunk's reduction axis happens to be the same as the MPI-grid axis when each bridge owns exactly
-    # one chunk along the reduced axes (our precompute invariant). For higher-D reductions that span multiple bridge
-    # axes, ``hint_axis`` carries the full tuple.
-    agg_axis = hint_axis if hint_axis is not None else tuple(range(len(grid_shape)))
+        red_axes = tuple(int(a) for a in hint_axis)
+        for ax in red_axes:
+            if not 0 <= ax < array_ndim:
+                raise PrecomputeRuntimeError(
+                    f"_combine_array_from_partials: reduction axis {ax} out of range for {array_ndim}-D array"
+                )
+    kept_axes = tuple(ax for ax in range(array_ndim) if ax not in red_axes)
 
-    @delayed
-    def _combine(pairs):
-        if agg_kind == "mean":
-            result = mean_agg(pairs, dtype=np.dtype(out_dtype), axis=agg_axis)
+    # Compute the combined output shape.
+    if global_shape is not None:
+        out_shape = tuple(int(global_shape[ax]) for ax in kept_axes)
+    else:
+        # Legacy fallback (no metadata): derive from the per-bridge partial.
+        if hint_axis is None:
+            out_shape = tuple(partials[0]["shape"])
         else:
-            result = moment_agg(pairs, order=2, ddof=0, dtype=np.dtype(out_dtype), axis=agg_axis)
-        if finalize == "sqrt":
-            result = np.sqrt(result)
-        return result
+            out_shape = tuple(partials[0]["shape"][ax] for ax in kept_axes)
 
-    return da.from_delayed(_combine(nested), shape=out_shape, dtype=out_dtype)
+    flat_entries = [(tuple(p["chunk_position"]), p["future"]) for p in partials]
+    return da.from_delayed(
+        _combine_two_phase(
+            flat_entries,
+            kind=kind,
+            op_name=op_name,
+            red_axes=red_axes,
+            kept_axes=kept_axes,
+            grid_shape=grid_shape,
+            out_dtype=out_dtype,
+            finalize=finalize,
+        ),
+        shape=out_shape,
+        dtype=out_dtype,
+    )
 
 
 def _discover_partial_metadata(
@@ -486,13 +711,20 @@ def _analyze_branch(callback: Callable, registered_arrays: Dict[str, Any], preco
             seen_chains=_seen_chains,
         )
         if branch is None:
-            # Chain walker refused; fall back to the length-1 path, passing the ORIGINAL branch dict
-            # (not the None result).
+            # Chain walker refused (no candidates, ambiguous candidates, or the
+            # chain itself is not foldable); fall back to the length-1 path,
+            # passing the ORIGINAL branch dict (not the None result). The
+            # fallback's ``deliver_direct`` is conservative: the reduction is
+            # direct ONLY if every candidate aggregate's chunk stage reads
+            # directly from the registered root (see F1 gate in deisa.py).
+            direct, window_read = _candidate_chain_classify(branch_dict, aggregate_candidates)
             branch = _try_length1_branch(
                 branch=branch_dict,
                 chunk_func=chunk_func,
                 array_ndim=array_ndim,
                 placeholder=placeholder,
+                deliver_direct=direct,
+                window_read=window_read,
             )
         if branch is None:
             if not precompute:
@@ -512,6 +744,94 @@ def _analyze_branch(callback: Callable, registered_arrays: Dict[str, Any], preco
             )
         branches.append(branch)
     return branches
+
+
+def _candidate_chain_classify(branch: Dict[str, Any], aggregate_candidates: Dict) -> Tuple[bool, bool]:
+    """Conservative ``(deliver_direct, window_read)`` for the length-1 fallback.
+
+    The chain walker can't tell which candidate aggregate belongs to THIS
+    hint when several reductions share ``(array_name, op_name)`` (e.g.
+    ``arr.sum()`` + ``arr.sum(axis=0)``). The reduction is deemed DIRECT only
+    when EVERY candidate's chain from the chunk stage to the registered root
+    contains just the reduction chunk stage and/or window-read getitem
+    layers (``root[-1].op()`` -- DataFrame.region Python-level list indexing).
+    Zero candidates, an unwalkable chain, a pointwise chain (``arr*arr``), or
+    a real slice (``arr[2:5]`` / ``arr[:, 0]``) -> not direct (refused by the
+    F1 gate) so a chained reduction can never sneak past the gate as
+    "direct".
+
+    ``window_read`` is True when every candidate is a window read (the
+    callback's runtime reduction runs on the WHOLE delivered array, so its
+    dispatch signature is the FULL reduction regardless of the stub-side
+    chunk axis).
+    """
+    op_name = branch.get("op_name")
+    array_name = branch.get("array_name")
+    if op_name is None:
+        return False, False
+    candidates = aggregate_candidates.get((array_name, op_name), [])
+    if not candidates:
+        return False, False
+    direct = True
+    window_read = True
+    for agg_name, graph in candidates:
+        d, w = _chain_direct_and_window_read(graph, agg_name)
+        if not d:
+            direct = False
+        if not w:
+            window_read = False
+    return direct, window_read
+
+
+def _chain_direct_and_window_read(graph, agg_name: str) -> Tuple[bool, bool]:
+    """Classify one aggregate's reduction-input chain.
+
+    Walks from the reduction's chunk stage toward the registered root. The
+    chain is DIRECT when every layer between the chunk stage and the root is
+    either the chunk stage itself or a window-read getitem layer; ANY other
+    layer (pointwise blockwise like ``mul``, a real slice, an unwalkable
+    input) makes it non-direct (``(False, ...)``). Returns ``(direct,
+    window_read)`` where ``window_read`` is True when the chain contains a
+    window-read getitem (and is otherwise direct).
+    """
+    from deisa.dask.task_branches import (
+        _chain_has_window_read,
+        _find_chunk_layer,
+        _is_stub_layer_name,
+        _is_window_read_layer,
+        _window_read_upstream_name,
+    )
+
+    chunk_layer_name = _find_chunk_layer(graph, _base_for_aggregate(agg_name))
+    if chunk_layer_name is None:
+        return False, False
+    window_read = _chain_has_window_read(graph, chunk_layer_name)
+    current = chunk_layer_name
+    seen = set()
+    while current is not None and current not in seen:
+        seen.add(current)
+        layer = graph.layers[current]
+        if _is_stub_layer_name(current):
+            break  # reached the registered-array root stub
+        if _is_window_read_layer(layer):
+            upstream = _window_read_upstream_name(layer)
+            if upstream is None:
+                return False, window_read
+            if upstream not in graph.layers:
+                break
+            current = upstream
+            continue
+        # Ordinary layer: the reduction chunk stage is the ONLY allowed one.
+        if current != chunk_layer_name:
+            return False, window_read
+        upstream = _find_single_upstream(layer)
+        if upstream is None:
+            return False, window_read
+        upstream_name, _ = upstream
+        if upstream_name not in graph.layers:
+            break  # root data node
+        current = upstream_name
+    return True, window_read
 
 
 def _try_chain_branch(
@@ -560,6 +880,8 @@ def _try_chain_branch(
             array_ndim=array_ndim,
             placeholder=placeholder,
             chain_branch_func=chain_branch_func,
+            deliver_direct=(len(chain) == 1),
+            window_read=False,
         )
     except Exception:
         return None
@@ -570,6 +892,8 @@ def _try_length1_branch(
     chunk_func: Callable,
     array_ndim: int,
     placeholder: Optional[Any],
+    deliver_direct: bool = False,
+    window_read: bool = False,
 ) -> Optional[BranchSpec]:
     """Build a length-1 BranchSpec from a per-reduction branch.
 
@@ -577,6 +901,15 @@ def _try_length1_branch(
     and built via the unified :func:`_build_branch`. The chain machinery binds the chunk_kwargs
     (axis, keepdims, dtype, ...) to the chunk_func, so the bridge calls ``branch_func(chunk)`` with
     just the chunk and no extra kwargs.
+
+    ``deliver_direct`` defaults to False because the length-1 path is reached
+    exactly when the chain walker could not PROVE the reduction reads the
+    registered root directly (no/ambiguous candidates, unwalkable chain); the
+    caller computes the conservative value via :func:`_candidate_chain_classify`.
+    ``window_read`` marks a whole-row-plane ``root[-1]`` read (see
+    :mod:`deisa.dask.task_branches`): the callback's runtime reduction runs on
+    the WHOLE delivered array, so the branch's dispatch signature is the full
+    reduction even though the stub-side chunk axis is partial.
     """
     try:
         # For ``mean`` and ``moment`` the bridge overrides ``keepdims=True``
@@ -592,6 +925,8 @@ def _try_length1_branch(
             chain=chain,
             array_ndim=array_ndim,
             placeholder=placeholder,
+            deliver_direct=deliver_direct,
+            window_read=window_read,
         )
     except Exception as e:
         # The length-1 path is the last-resort fallback. If it
@@ -616,6 +951,8 @@ def _build_branch(
     array_ndim: int,
     placeholder: Optional[Any] = None,
     chain_branch_func: Optional[Callable] = None,
+    deliver_direct: Optional[bool] = None,
+    window_read: bool = False,
 ) -> BranchSpec:
     """Build a :class:`BranchSpec` from a branch and a layer chain.
 
@@ -625,6 +962,20 @@ def _build_branch(
 
     If ``chain_branch_func`` is provided (the memoized / pre-built version), use it directly instead
     of rebuilding.
+
+    ``deliver_direct`` records whether the reduction's chunk stage reads
+    DIRECTLY from the registered array root (a plain ``arr.<op>()`` call,
+    possibly via ``window[-1]``) rather than from a pointwise chain or slice
+    (``(arr*arr).sum()``, ``arr[2:5].sum()``). The F1 registration gate in
+    :mod:`deisa.dask.deisa` refuses non-direct reductions because the
+    precompute delivery path cannot reconstruct a chain on the callback side.
+    ``None`` defaults to ``len(chain) == 1`` (a single layer means the chunk
+    stage is the only layer between root and aggregate).
+
+    ``window_read`` marks a whole-row-plane ``root[-1]`` read: the callback's
+    runtime reduction runs on the WHOLE delivered array, so the branch's
+    dispatch signature (``dispatch_sig``) is the FULL reduction even though
+    the stub-side chunk axis is partial.
     """
     kind = branch.get("kind", _BRANCH_KIND_SCALAR)
     finalize = branch.get("finalize")
@@ -643,6 +994,17 @@ def _build_branch(
 
     partial_shape, partial_dtype = _discover_partial_metadata(chain_branch_func, placeholder, branch)
 
+    # Runtime dispatch signature: what the callback's reduction call on the
+    # delivered view must match. A window read runs on the whole array (full
+    # reduction); any other direct reduction normalizes its chunk axis against
+    # the registered array's ndim.
+    if window_read:
+        dispatch_sig: Tuple[int, ...] = ()
+    elif chunk_axis is None:
+        dispatch_sig = ()
+    else:
+        dispatch_sig = _normalize_reduction_axis(chunk_axis, array_ndim)
+
     return BranchSpec(
         output_key=branch["output_key"],
         input_name=branch.get("array_name", ""),
@@ -652,6 +1014,10 @@ def _build_branch(
         finalize=finalize,
         partial_shape=partial_shape,
         partial_dtype=partial_dtype,
+        op_name=branch.get("op_name", ""),
+        deliver_direct=(len(chain) == 1) if deliver_direct is None else deliver_direct,
+        window_read=window_read,
+        dispatch_sig=dispatch_sig,
     )
 
 
