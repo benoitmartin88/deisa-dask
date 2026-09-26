@@ -58,7 +58,13 @@ import dask.array as da
 from dask import delayed
 from dask.array.reductions import mean_agg, moment_agg
 from deisa.dask.precompute_analyzer import PrecomputeError, analyze_callback
-from deisa.dask.task_branches import _blockwise_indices_inputs, _find_chunk_layer, _is_aggregate_layer
+from deisa.dask.task_branches import (
+    _aggregate_output_feeds_other_reduction,
+    _blockwise_indices_inputs,
+    _find_chunk_layer,
+    _is_aggregate_layer,
+    _op_for_aggregate_layer,
+)
 from deisa.dask.utils import build_deisa_array
 
 logger = logging.getLogger(__name__)
@@ -410,18 +416,29 @@ def _analyze_branch(callback: Callable, registered_arrays: Dict[str, Any], preco
     # The chain walker needs at least one dask expression to walk. The AST walker builds one dask_arrays entry per
     # compute boundary. If there's nothing in the list, the registered placeholder is the only thing available,
     # but its graph is the root layer (no chain). We fall back to the length-1 path in that case.
-    # We use the FIRST walker dask_array as the graph to walk. This matches the analyzer's behavior of treating the
-    # first compute boundary as the primary one.
-    dask_arr_for_chain: Optional[Any] = None
-    if walker_dask_arrays:
-        candidate = walker_dask_arrays[0].get("array")
-        if hasattr(candidate, "__dask_graph__"):
-            dask_arr_for_chain = candidate
+    # Build a per-hint candidate map from ALL walker graphs: a callback with several reductions can produce
+    # several graphs (one per boundary, e.g. ``s=arr.sum(); m=arr.mean()``) or one graph with several aggregate
+    # layers (e.g. ``(arr*arr).sum() + arr.max()``). Each candidate maps the aggregate layer's canonical op name
+    # (matching the hint's ``op_name``) to the (layer_name, graph) pair it belongs to.
+    aggregate_candidates: Dict[str, List[Tuple[str, Any]]] = {}
+    for arr_info in walker_dask_arrays:
+        candidate = arr_info.get("array")
+        if not hasattr(candidate, "__dask_graph__"):
+            continue
+        graph = candidate.__dask_graph__()
+        for layer_name in graph.layers:
+            if not _is_aggregate_layer(layer_name):
+                continue
+            op_name = _op_for_aggregate_layer(graph, layer_name)
+            if op_name is None:
+                continue
+            aggregate_candidates.setdefault(op_name, []).append((layer_name, graph))
 
-    # The chain walker folds multi-layer pointwise chains into one branch_func. We dedupe chains per-branch: a chain
-    # is unique by its (agg-layer-name, length). Multiple hints can share the same chain
-    # (e.g. ``(arr**2).sum()`` and ``(arr**2).max()``). The walker builds the same branch_func either way.
-    # ``_seen_chains`` keeps a memo to avoid rebuilding identical functools.partial objects.
+    # The chain walker folds multi-layer pointwise chains into one branch_func. A chain is unique by its
+    # (agg-layer-name, length). Hints MUST be folded with their OWN aggregate layer (matched by op_name via the
+    # candidate map); folding a shared chain -- e.g. the first aggregate of the first walked graph -- into every
+    # hint is the multi-reduction bug this selection prevents. ``_seen_chains`` memoizes identical (agg-name,
+    # length) pairs so identical expressions reuse the same functools.partial object.
     _seen_chains: Dict[Tuple[str, int], Any] = {}
 
     branches: List[BranchSpec] = []
@@ -458,7 +475,7 @@ def _analyze_branch(callback: Callable, registered_arrays: Dict[str, Any], preco
             primary=primary,
             array_ndim=array_ndim,
             placeholder=placeholder,
-            dask_arr_for_chain=dask_arr_for_chain,
+            aggregate_candidates=aggregate_candidates,
             seen_chains=_seen_chains,
         )
         if branch is None:
@@ -496,26 +513,28 @@ def _try_chain_branch(
     primary: str,
     array_ndim: int,
     placeholder: Optional[Any],
-    dask_arr_for_chain: Optional[Any],
+    aggregate_candidates: Dict[str, List[Tuple[str, Any]]],
     seen_chains: Dict[Tuple[str, int], Any],
 ) -> Optional[BranchSpec]:
     """Try to fold the branch's reduction into a chain-folded BranchSpec.
 
-    Returns ``None`` if the registered array has no dask graph (no
-    chain to walk) or if ``_walk_chain`` refuses to fold (cross-array,
-    constant, etc.). The caller falls back to the length-1 path on
-    ``None``.
+    Folding must use the aggregate layer that belongs to THIS branch:
+    the hint carries its canonical op name (``op_name``), and we match
+    it against the candidate aggregate layers collected from all walker
+    graphs. Zero candidates (no foldable graph) or more than one
+    (duplicate op across boundaries, e.g. two ``sum`` reductions) make
+    the assignment ambiguous, so folding is refused and the caller
+    falls back to the length-1 path, which computes the branch's OWN
+    ``chunk_func``. Cross-array / constant upstreams also return
+    ``None`` via ``_walk_chain``.
     """
-    if dask_arr_for_chain is None:
+    op_name = branch.get("op_name")
+    if op_name is None:
         return None
-    graph = dask_arr_for_chain.__dask_graph__()
-    # Find the aggregate layer name from the branch's chunk_kwargs.
-    # ``extract_reduction_hints`` stores the agg-layer name implicitly via the chunk_func's identity.
-    # For chain walking we need the explicit aggregate layer name. Walk the graph looking for any aggregate layer
-    # reachable from the primary array.
-    agg_name = _find_primary_aggregate(graph)
-    if agg_name is None:
+    candidates = aggregate_candidates.get(op_name, [])
+    if len(candidates) != 1:
         return None
+    agg_name, graph = candidates[0]
     chain = _walk_chain(graph, agg_name)
     if chain is None:
         return None
@@ -638,20 +657,6 @@ def _build_branch(
     )
 
 
-def _find_primary_aggregate(graph) -> Optional[str]:
-    """Return the first ``-aggregate-`` layer name in the graph.
-
-    Today every detected reduction is rooted at one array. The analyzer emits hints per-array-info.
-    The chain walker only needs ONE aggregate layer per branch to start walking back from, and when a callback has
-    multiple independent reductions (e.g. ``energy = (arr**2).sum(); drift = arr.mean(axis=0)``), the walker will refuse
-    chains it can't fold and the caller falls back to the length-1 path for the rest.
-    """
-    for layer_name in graph.layers:
-        if _is_aggregate_layer(layer_name):
-            return layer_name
-    return None
-
-
 def _walk_chain(graph, agg_name: str) -> Optional[List[Tuple[Callable, dict, int]]]:
     """Walk from a chunk layer back to the placeholder root.
 
@@ -664,8 +669,15 @@ def _walk_chain(graph, agg_name: str) -> Optional[List[Tuple[Callable, dict, int
     """
     if "-aggregate-" not in agg_name:
         return None
-    chunk_layer_name = _find_chunk_layer(graph, agg_name.split("-aggregate-", 1)[0], exact=True)
+    # Match the chunk layer via the dedicated chunk/aggregate pairs (mean_chunk / mean_agg, chunk_max / max,
+    # chunk_min / min, moment_agg / var) instead of requiring an exact base name.
+    chunk_layer_name = _find_chunk_layer(graph, agg_name.split("-aggregate-", 1)[0])
     if chunk_layer_name is None:
+        return None
+    # Refuse to fold an aggregate whose output feeds ANOTHER reduction's chunk stage (cross-reduction
+    # expression like ``(arr - arr.mean()).sum()``). Such an aggregate's global value is required downstream;
+    # folding it alone would produce a wrong local partial.
+    if _aggregate_output_feeds_other_reduction(graph, agg_name):
         return None
     chain: List[Tuple[Callable, dict, int]] = []
     current = chunk_layer_name

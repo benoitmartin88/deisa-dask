@@ -248,6 +248,40 @@ def _op_from_func(func: Any) -> Optional[str]:
     return _OP_FROM_FUNC_NAME.get(name)
 
 
+def _aggregate_layer_func(layer) -> Optional[Any]:
+    """Return the aggregator callable of an aggregate layer.
+
+    Legacy tuple form preferred, then the new Task spec.
+    """
+    tup = _layer_first_tuple(layer)
+    if tup is not None:
+        return tup[0]
+    task = _layer_first_task(layer)
+    if task is not None:
+        return task.func
+    return None
+
+
+def _op_for_aggregate_layer(graph, layer_name: str) -> Optional[str]:
+    """Return the canonical op name for an aggregate layer, matching hint extraction.
+
+    ``moment_agg`` is shared by var and std; the ``_sqrt`` poststep
+    disambiguates them exactly like :func:`extract_reduction_hints`
+    does, so chain folding selects the same op name the hint carries
+    (``hint['op_name']``). Keeping this in one place prevents the two
+    op-naming paths from drifting.
+    """
+    agg_func = _aggregate_layer_func(graph.layers[layer_name])
+    if agg_func is None:
+        return None
+    op_name = _op_from_func(agg_func)
+    if op_name is None:
+        return None
+    if op_name == "moment":
+        op_name = "std" if _has_sqrt_poststep(graph) else "var"
+    return op_name
+
+
 def _collect_chunk_keys_from_aggregate(layer) -> List[str]:
     """Return the chunk-layer base names referenced by the aggregate layer.
 
@@ -321,10 +355,10 @@ def _chunk_func_and_kwargs(chunk_layer) -> Optional[tuple]:
 def _find_chunk_layer(graph, agg_base: str, exact: bool = False) -> Optional[str]:
     """Locate the chunk layer that feeds the aggregate layer with the given base.
 
-    ``exact=False`` (hint extraction) matches candidate chunk base names
+    ``exact=False`` (the default) matches candidate chunk base names
     (including the dedicated mean/max/min chunk/aggregate pairs) and layers
-    whose name starts with a candidate base. ``exact=True`` (chain folding)
-    requires a chunk layer whose stripped base equals ``agg_base`` exactly.
+    whose name starts with a candidate base. ``exact=True`` requires a chunk
+    layer whose stripped base equals ``agg_base`` exactly.
 
     Returns ``None`` if no matching chunk layer exists.
     """
@@ -410,6 +444,48 @@ def _chunk_inputs_reach_other_aggregate(graph, chunk_layer_name: str) -> set:
     return reachable_aggregates
 
 
+def _aggregate_output_feeds_other_reduction(graph, agg_layer_name: str) -> bool:
+    """Return True if ``agg_layer_name``'s output feeds another reduction.
+
+    Walks forward from the aggregate's output through the layers that
+    consume it (via the graph's dependency edges). If the output (or a
+    pointwise layer derived from it) is consumed by another
+    ``-aggregate-`` layer, the aggregate's value participates in a
+    *different* reduction's chunk stage. Folding such an aggregate
+    alone is not a valid local precompute: its consumer needs the
+    aggregate's GLOBAL value, which a bridge cannot produce from its
+    own chunk. This is the mirror image of
+    :func:`_chunk_inputs_reach_other_aggregate` (which detects the
+    same expression from the consumer's side) and lets chain
+    walkers refuse the INNER reduction of a cross-reduction expression
+    without having to reject the whole graph.
+
+    Returns False if the aggregate output is only consumed by the
+    graph's terminal layers (or nothing), e.g. two sibling reductions
+    combined pointwise once -- ``(arr*arr).sum() + arr.max()`` -- where
+    both aggregates feed only the final ``add`` layer.
+    """
+    dependencies = getattr(graph, "dependencies", None)
+    if dependencies is None:
+        return False
+    # Invert the dependency edges: consumers[layer] = layers that read it.
+    consumers: Dict[str, set] = {}
+    for layer_name, deps in dependencies.items():
+        for dep in deps:
+            consumers.setdefault(dep, set()).add(layer_name)
+    seen: set = set()
+    queue: set = set(consumers.get(agg_layer_name, ()))
+    while queue:
+        current = queue.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        if _is_aggregate_layer(current):
+            return True
+        queue.update(consumers.get(current, ()))
+    return False
+
+
 def _blockwise_upstream_layer_names(layer) -> List[str]:
     """Return the upstream layer names referenced by a Blockwise
     layer's task. Falls back to scanning the first task's args if the
@@ -465,8 +541,6 @@ def extract_reduction_hints(darr: da.Array, array_name: str = "f") -> List[Dict[
         logger.debug("extract_reduction_hints: failed to get graph: %s", e)
         return hints
 
-    has_sqrt = _has_sqrt_poststep(graph)
-
     # First pass: refuse any dask expression whose reductions' chunk
     # stages depend on data from another reduction's aggregate. The
     # only way to compute those correctly is to let dask run them
@@ -509,33 +583,13 @@ def extract_reduction_hints(darr: da.Array, array_name: str = "f") -> List[Dict[
         if not _is_aggregate_layer(layer_name):
             continue
 
-        # Find the aggregator function: legacy tuple form preferred, then Task
-        agg_func: Optional[Any] = None
-        tup = _layer_first_tuple(layer)
-        if tup is not None:
-            agg_func = tup[0]
-        else:
-            task = _layer_first_task(layer)
-            if task is not None:
-                agg_func = task.func
-
-        if agg_func is None:
-            continue
-
-        op_name = _op_from_func(agg_func)
+        op_name = _op_for_aggregate_layer(graph, layer_name)
         if op_name is None:
             continue
 
-        # ``moment_agg`` is shared by var and std; disambiguate using the
-        # _sqrt poststep (std = var followed by sqrt).
-        finalize: Optional[str] = None
-        if op_name == "moment":
-            if has_sqrt:
-                op_name = "std"
-                finalize = "sqrt"
-            else:
-                op_name = "var"
-                finalize = None
+        # ``moment_agg`` is shared by var and std; ``_op_for_aggregate_layer``
+        # disambiguates via the _sqrt poststep (std = var followed by sqrt).
+        finalize: Optional[str] = "sqrt" if op_name == "std" else None
 
         if op_name not in SUPPORTED_OPS:
             logger.debug("extract_reduction_hints: unsupported op %s, skipping", op_name)
@@ -563,7 +617,7 @@ def extract_reduction_hints(darr: da.Array, array_name: str = "f") -> List[Dict[
             logger.debug("extract_reduction_hints: failed to pickle chunk func: %s", e)
             continue
         try:
-            agg_pickle = _serialize_func(agg_func)
+            agg_pickle = _serialize_func(_aggregate_layer_func(layer))
         except Exception as e:
             logger.debug("extract_reduction_hints: failed to pickle agg func: %s", e)
             continue
