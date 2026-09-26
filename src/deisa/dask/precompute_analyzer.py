@@ -207,6 +207,7 @@ def _analyze_callback(
     # 5. Walk the callback body and collect compute boundaries.
     walker = _BoundaryWalker(source_file=source_file, primary_name=primary_name)
     walker.walk_body(callback_def.body, scope)
+    dask_arrays_snapshot = list(walker.dask_arrays)
 
     # 6. Materialization takes priority: if any np.array/asarray on a dask array was found, the callback can't be
     # precomputed at all.
@@ -216,7 +217,7 @@ def _analyze_callback(
             MaterializationError(
                 "Callback contains a full materialization (e.g. np.array(dask_array)) that defeats precomputation."
             ),
-            list(walker.dask_arrays),
+            dask_arrays_snapshot,
         )
 
     dask_arrays = walker.dask_arrays
@@ -252,17 +253,17 @@ def _analyze_callback(
                     f"(.compute(), client.compute(), client.submit(), etc.). "
                     f"Cannot determine which arrays to precompute."
                 ),
-                list(walker.dask_arrays),
+                dask_arrays_snapshot,
             )
         return (
             [],
             NoPrecomputableReductionError(
                 f"Callback {callback.__name__!r} contains compute boundaries but no reductions we can precompute."
             ),
-            list(walker.dask_arrays),
+            dask_arrays_snapshot,
         )
 
-    return hints, None, list(walker.dask_arrays)
+    return hints, None, dask_arrays_snapshot
 
 
 # ---------------------------------------------------------------------------
@@ -533,8 +534,8 @@ _CMPOPS = {
 # Anything not in this set is either resolved as a dask reduction (sum/min/max), a pure builtin, a registered helper,
 # or treated as opaque (_Missing) so analysis can continue.
 #
-# Note: ``compute`` / ``persist`` are not in this set because they are only reached as ``arr.compute()``.
-# A method call on a dask Array, not as a bare name. The attribute-call branch already handles them.
+# Note: bare-name ``compute()`` / ``persist()`` ARE refused via this set; the attribute-call branch handles
+# ``arr.compute()`` / method ``.persist()`` separately.
 _EFFECT_BEARING_NAMES = frozenset(
     {
         # Dask control flow that bypasses precompute.
@@ -565,7 +566,7 @@ _EFFECT_BEARING_NAMES = frozenset(
 # Pure builtins are tolerant of ``_Missing`` arguments: an opaque argument propagates as ``_Missing`` so the surrounding
 # analysis can continue degrading to the full-chunk path. This is what makes the analyzer open-world: the user can call
 # any builtin on a sub-expression we couldn't resolve without breaking the analysis.
-def _safe_pure_call(fn, args, kwargs, default=None):
+def _safe_pure_call(fn, args, kwargs):
     """Apply ``fn`` to args/kwargs, propagating ``_Missing`` instead of raising when an argument is opaque.
     Any exception is caught and returns ``_Missing`` so the analyzer stays open-world."""
     if any(isinstance(a, _Missing) for a in args) or any(isinstance(v, _Missing) for v in kwargs.values()):
@@ -577,26 +578,16 @@ def _safe_pure_call(fn, args, kwargs, default=None):
 
 
 _PURE_BUILTINS: dict = {
-    "len": lambda args, kwargs: _safe_pure_call(lambda x: len(x), args, kwargs, default=0),
-    "int": lambda args, kwargs: _safe_pure_call(lambda x: int(x), args, kwargs, default=0),
-    "float": lambda args, kwargs: _safe_pure_call(lambda x: float(x), args, kwargs, default=0.0),
-    "bool": lambda args, kwargs: _safe_pure_call(lambda x: bool(x), args, kwargs, default=False),
-    "abs": lambda args, kwargs: _safe_pure_call(lambda x: abs(x), args, kwargs, default=None),
-    "round": lambda args, kwargs: _safe_pure_call(round, args, kwargs, default=None),
+    "len": lambda args, kwargs: _safe_pure_call(lambda x: len(x), args, kwargs),
+    "int": lambda args, kwargs: _safe_pure_call(lambda x: int(x), args, kwargs),
+    "float": lambda args, kwargs: _safe_pure_call(lambda x: float(x), args, kwargs),
+    "bool": lambda args, kwargs: _safe_pure_call(lambda x: bool(x), args, kwargs),
+    "abs": lambda args, kwargs: _safe_pure_call(lambda x: abs(x), args, kwargs),
+    "round": lambda args, kwargs: _safe_pure_call(round, args, kwargs),
     "print": lambda args, kwargs: None,  # void -- always safe
-    "slice": lambda args, kwargs: _safe_pure_call(slice, args, kwargs, default=slice(None)),
-    "tuple": lambda args, kwargs: _safe_pure_call(
-        lambda x: tuple(x) if isinstance(x, (list, tuple)) else tuple(x) if x is not None else (),
-        args,
-        kwargs,
-        default=(),
-    ),
-    "list": lambda args, kwargs: _safe_pure_call(
-        lambda x: list(x) if isinstance(x, (list, tuple)) else list(x) if x is not None else [],
-        args,
-        kwargs,
-        default=[],
-    ),
+    "slice": lambda args, kwargs: _safe_pure_call(slice, args, kwargs),
+    "tuple": lambda args, kwargs: _safe_pure_call(lambda x: tuple(x) if x is not None else (), args, kwargs),
+    "list": lambda args, kwargs: _safe_pure_call(lambda x: list(x) if x is not None else [], args, kwargs),
 }
 
 
@@ -678,12 +669,7 @@ class _BoundaryWalker:
             return
         # Anything else: best-effort evaluation. We don't need to surface IncompatibleCallbackError for rare AST shapes.
         # The tests that need them can be added explicitly.
-        try:
-            self._eval(stmt, scope)
-        except IncompatibleCallbackError:
-            raise
-        except PrecomputeError:
-            raise
+        self._eval(stmt, scope)
 
     # -- For-loop: static-range unroll, else fail --------------------------
     def _walk_for(self, stmt: ast.For, scope: _Scope) -> None:
@@ -910,14 +896,6 @@ class _BoundaryWalker:
     def _call(self, node: ast.Call, scope: _Scope) -> Any:
         func = node.func
 
-        # Special-case: getattr(...) -> IncompatibleCallbackError
-        if isinstance(func, ast.Name) and func.id == "getattr":
-            raise IncompatibleCallbackError(f"getattr() is not supported (dynamic dispatch) at line {node.lineno}")
-        if isinstance(func, ast.Name) and func.id in {"exec", "eval", "compile"}:
-            raise IncompatibleCallbackError(
-                f"{func.id}() is not supported in precompute analysis at line {node.lineno}"
-            )
-
         # ---- Materialization detection (np.array/asarray/save on dask arrays) ----
         if isinstance(func, ast.Attribute):
             recv = func.value
@@ -1034,13 +1012,6 @@ class _BoundaryWalker:
                 node.lineno,
             )
             return _Missing(f"{name}(...)")
-
-        # obj.method() where obj is a complex expression
-        if isinstance(func, ast.Attribute):
-            obj = self._eval(func.value, scope)
-            kwargs = self._eval_kwargs(node.keywords, scope)
-            args = [self._eval(a, scope) for a in node.args]
-            return getattr(obj, func.attr)(*args, **kwargs)
 
         raise IncompatibleCallbackError(f"Unsupported call form: {type(func).__name__} at line {node.lineno}")
 

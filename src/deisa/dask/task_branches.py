@@ -44,9 +44,6 @@ the bridge side (local chunk execution)):
         "op_name": "sum",  # canonical op name
         "chunk_func_pickle": ...,  # pickle of the chunk callable
         "chunk_kwargs": {...},  # kwargs for the chunk callable
-        "agg_pickle": ...,  # pickle of the aggregator callable
-        "agg_dep_structures": [...],  # structure of chunk deps for the aggregator
-        "agg_keys": [...],  # chunk key paths the aggregator expects
         "finalize": "sqrt" | None,  # post-step (sqrt for std)
     }
 
@@ -282,53 +279,6 @@ def _op_for_aggregate_layer(graph, layer_name: str) -> Optional[str]:
     return op_name
 
 
-def _collect_chunk_keys_from_aggregate(layer) -> List[str]:
-    """Return the chunk-layer base names referenced by the aggregate layer.
-
-    The bridge only needs to know which chunk keys to expect, not the
-    nested positional structure. This walks the aggregate's deps and
-    returns the unique chunk-layer base names (strings).
-    """
-    keys: set = set()
-    # legacy form: (func, deps, ...) where deps is a nested list of key tuples
-    for value in layer.values():
-        if isinstance(value, tuple) and len(value) >= 2:
-            deps = value[1]
-            stack: List[Any] = [deps]
-            while stack:
-                item = stack.pop()
-                if isinstance(item, (list, tuple)):
-                    stack.extend(item)
-                elif isinstance(item, str):
-                    keys.add(item)
-            return sorted(keys)
-    # new form: a Task/GraphNode in the aggregate layer references the
-    # chunk layer keys directly in its args.
-    for value in layer.values():
-        if _is_task(value):
-            for arg in value.args:
-                if isinstance(arg, str):
-                    keys.add(arg)
-                else:
-                    # TaskRef or similar - extract the key
-                    name = getattr(arg, "key", None) or getattr(arg, "__str__", lambda: str(arg))()
-                    if isinstance(name, str):
-                        # take the layer name part (before the first "(")
-                        base = name.split("(", 1)[0]
-                        if base:
-                            keys.add(base)
-            return sorted(keys)
-    return []
-
-
-def _agg_dep_structures(layer) -> Optional[Any]:
-    """Return the deps structure of the first tuple-form task in ``layer``."""
-    for value in layer.values():
-        if isinstance(value, tuple) and len(value) >= 2:
-            return value[1]
-    return None
-
-
 def _chunk_func_and_kwargs(chunk_layer) -> Optional[tuple]:
     """Return ``(func, kwargs)`` for a chunk layer.
 
@@ -352,13 +302,11 @@ def _chunk_func_and_kwargs(chunk_layer) -> Optional[tuple]:
 # ---------------------------------------------------------------------------
 # branch extraction
 # ---------------------------------------------------------------------------
-def _find_chunk_layer(graph, agg_base: str, exact: bool = False) -> Optional[str]:
+def _find_chunk_layer(graph, agg_base: str) -> Optional[str]:
     """Locate the chunk layer that feeds the aggregate layer with the given base.
 
-    ``exact=False`` (the default) matches candidate chunk base names
-    (including the dedicated mean/max/min chunk/aggregate pairs) and layers
-    whose name starts with a candidate base. ``exact=True`` requires a chunk
-    layer whose stripped base equals ``agg_base`` exactly.
+    Matches candidate chunk base names (including the dedicated mean/max/min
+    chunk/aggregate pairs) and layers whose name starts with a candidate base.
 
     Returns ``None`` if no matching chunk layer exists.
     """
@@ -367,15 +315,10 @@ def _find_chunk_layer(graph, agg_base: str, exact: bool = False) -> Optional[str
         if _is_aggregate_layer(layer_name) or _is_sqrt_layer(layer_name):
             continue
         layer_base = _strip_hash(layer_name)
-        if exact:
-            # Chain folding: only an exact base match is foldable.
-            if layer_base == agg_base:
-                return layer_name
-            continue
         if layer_base in candidates:
             return layer_name
         # Also accept names that start with the base (e.g. ``sum-``)
-        if any(layer_name.startswith(c + "-") for c in candidates) and not _is_aggregate_layer(layer_name):
+        if any(layer_name.startswith(c + "-") for c in candidates):
             return layer_name
     return None
 
@@ -608,24 +551,15 @@ def extract_reduction_hints(darr: da.Array, array_name: str = "f") -> List[Dict[
             continue
         chunk_func, chunk_kwargs = chunk_info
 
-        chunk_keys = _collect_chunk_keys_from_aggregate(layer)
-        agg_deps = _agg_dep_structures(layer)
-
         try:
             chunk_func_pickle = _serialize_func(chunk_func)
         except Exception as e:
             logger.debug("extract_reduction_hints: failed to pickle chunk func: %s", e)
             continue
-        try:
-            agg_pickle = _serialize_func(_aggregate_layer_func(layer))
-        except Exception as e:
-            logger.debug("extract_reduction_hints: failed to pickle agg func: %s", e)
-            continue
 
         output_key = f"{array_name}-{op_name}"
-        # Backwards-compatible alias for callers that index hints by
-        # ``keywords`` rather than ``chunk_kwargs``. Also unwrap single-
-        # element axis tuples (dask normalizes ``axis=0`` to ``axis=(0,)``).
+        # Unwrap single-element axis tuples (dask normalizes ``axis=0`` to
+        # ``axis=(0,)``) for the bridge's chunk execution path.
         chunk_kwargs = dict(chunk_kwargs) if chunk_kwargs else {}
         if isinstance(chunk_kwargs.get("axis"), tuple) and len(chunk_kwargs["axis"]) == 1:
             chunk_kwargs["axis"] = chunk_kwargs["axis"][0]
@@ -636,10 +570,6 @@ def extract_reduction_hints(darr: da.Array, array_name: str = "f") -> List[Dict[
                 "kind": _REDUCTION_KIND.get(op_name, "scalar"),
                 "chunk_func_pickle": chunk_func_pickle,
                 "chunk_kwargs": chunk_kwargs,
-                "keywords": chunk_kwargs,
-                "agg_pickle": agg_pickle,
-                "agg_dep_structures": agg_deps,
-                "agg_keys": chunk_keys,
                 "finalize": finalize,
             }
         )

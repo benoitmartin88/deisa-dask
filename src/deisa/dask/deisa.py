@@ -33,7 +33,7 @@ import logging
 import threading
 import time
 import weakref
-from typing import Any, Callable, Collection, Dict, List, Literal, Set, Tuple, Union
+from typing import Any, Callable, Collection, Dict, List, Literal, Set
 
 import numpy as np
 from deisa.core import CallbackArgs, Window
@@ -58,7 +58,6 @@ logger = logging.getLogger(__name__)
 
 
 class Deisa(IDeisa):
-    Callback_args = Union[str, Tuple[str], Tuple[str, int]]  # array_name, window_size
     Callback_id = str
 
     def __init__(self, feedback_queue_size: int = 1024, *args, **kwargs) -> None:
@@ -238,7 +237,7 @@ class Deisa(IDeisa):
             if array_name not in self.arrays_metadata:
                 raise ValueError(f"unknown array name: {array_name}")
 
-        array_names = self.__get_array_names(*parsed)
+        array_names = [w.name for w in parsed]
         callback_id = self.__next_callback_id()
 
         logger.debug(f"_register_callback_impl: register callback_id={callback_id}")
@@ -264,9 +263,6 @@ class Deisa(IDeisa):
         # ``precompute=False`` is the explicit opt-out of precompute: skip the analysis entirely and fall back to the
         # full-chunk scatter path. This is the documented contract (see ``register``) and what the
         # test_no_precompute_worker_sees_full_chunk test expects.
-
-        for array_name in array_names:
-            self._callbacks_by_array.setdefault(array_name, set()).add(callback_id)
 
         if not precompute:
             logger.warning(
@@ -485,12 +481,10 @@ class Deisa(IDeisa):
                     # partials as its array). Multiple reductions on the same array produce multiple dask chunks.
                     # We dispatch the first one to the callback. If only one reduction is registered, the callback sees
                     # a single dask array.
-                    if len(darr_chunks) == 1:
-                        darr = darr_chunks[0]
-                    else:
+                    darr = darr_chunks[0]
+                    if len(darr_chunks) > 1:
                         # Multiple reductions: wrap as a tuple of dask arrays and stash on the darr for the callback to
                         # iterate. Most realistic callbacks register exactly one reduction, so this branch is uncommon.
-                        darr = darr_chunks[0]
                         darr.extra_precomputed_chunks = darr_chunks[1:]
                     logger.debug(
                         f"topic_handler: precompute path produced {len(darr_chunks)} reduction chunk(s) "
@@ -671,26 +665,6 @@ class Deisa(IDeisa):
 
         # Use da.block to combine blocks
         return da.block(nested)
-
-    @staticmethod
-    def __get_array_names(*callback_args: CallbackArgs) -> List[str]:
-        """Flatten callback_args to a tuple of array names."""
-        array_names = []
-        for arg in callback_args:
-            if isinstance(arg, str):
-                array_names.append(arg)
-            elif isinstance(arg, tuple):
-                if (len(arg) == 1 and isinstance(arg[0], str)) or (
-                    len(arg) == 2 and isinstance(arg[0], str) and isinstance(arg[1], int)
-                ):
-                    array_names.append(arg[0])
-                else:
-                    raise TypeError(
-                        "Tuple callback_args must be either (array_name,) or (array_name, window_size: int)"
-                    )
-            else:
-                raise TypeError("callback_args must be str or a tuple")
-        return array_names
 
     @staticmethod
     def __in_client_loop(client):
