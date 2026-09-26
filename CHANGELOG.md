@@ -18,12 +18,32 @@ Types of changes:
 
 ### Added
 
-- CI: continous benchmark using Bencher.
+- CI: continuous benchmark using Bencher.
+- Precompute: callbacks whose reductions are chunk-local (`sum`, `mean`, `var`, `std`,
+  `min`, `max`, `prod`) are analysed at registration time and shipped to Dask workers as
+  small per-bridge partials instead of the full array chunk. Branches are registered per
+  array, so a multi-array callback gets one branch set per array. Expressions whose
+  reduction depends on another reduction's output are refused with
+  `UnsupportedReductionError`.
+
+### Changed
+
+- benchmark: pin Dask/Distributed to `2025.11.0`, the newest version exercised by the
+  test matrix, instead of an untested newer release.
 
 ### Fixed
 
 - Missing first callback(s) due to not waiting for `Deisa.execute_callbacks()`
 - Deisa: avoid exceptions raised from `__del__()`
+- benchmark: report send->callback latency in the unit each consumer expects (milliseconds
+  in the human-readable summary, nanoseconds to Bencher); drop a `del` that broke a live
+  closure and could raise `NameError` on a late callback.
+
+### Security
+
+- CI: the closed-PR archive workflow interpolated `github.head_ref` (attacker-controlled
+  for fork PRs) directly into a shell command; it is now passed through `env`, preventing
+  command injection on that privileged runner.
 
 ## [0.6.3]
 
