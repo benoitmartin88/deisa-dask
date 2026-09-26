@@ -46,6 +46,7 @@ from dask.tokenize import tokenize
 from deisa.dask.branch import BranchSpec
 from deisa.dask.constants import CLIENT_KEY, FEEDBACK_QUEUE_PREFIX, KEY_PREFIX, WAIT_FOR_EXECUTE_CB_EVENT
 from deisa.dask.handshake import Handshake
+from deisa.dask.precompute_analyzer import PrecomputeRuntimeError
 from deisa.dask.utils import get_client
 
 logger = logging.getLogger(__name__)
@@ -763,6 +764,7 @@ class Bridge(IBridge):
                 "dtype": red_dtype,
                 "finalize": finalize,
                 "chunk_axis": branch.chunk_axis,
+                "op_name": branch.op_name,
             }
 
         # Serialize for scatter (handles numpy arrays in dict values).
@@ -811,8 +813,13 @@ class Bridge(IBridge):
             try:
                 partial = branch.branch_func(chunk)
             except Exception as e:
-                logger.warning(f"[{self.id}] _execute_operations_on_chunk: could not execute {output_key}: {e}")
-                continue
+                # A dropped partial silently corrupts the combined reduction
+                # (scalar stacks get smaller sums, mean_agg/moment_agg miss a
+                # whole bridge's n). FAIL LOUDLY instead of skipping.
+                raise PrecomputeRuntimeError(
+                    f"[{self.id}] _execute_operations_on_chunk: branch {output_key!r} failed on the local "
+                    f"chunk: {e!r}. Refusing to ship a partial set that would produce a wrong reduction."
+                ) from e
             partials[output_key] = partial
 
         logger.debug(f"[{self.id}] _execute_operations_on_chunk: {partials}")
@@ -847,6 +854,7 @@ def _build_futures_payload(
             "finalize": info.get("finalize"),
             "chunk_position": chunk_position,
             "chunk_axis": info.get("chunk_axis"),
+            "op_name": info.get("op_name"),
             "output_key": output_key,
         }
         for output_key, info in meta.items()
