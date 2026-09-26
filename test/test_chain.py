@@ -439,4 +439,8 @@ class TestMultiReductionBranches:
                 hint_axis=(0, 1),
                 array_ndim=2,
             )
-            assert np.isclose(self._scalar(combined.compute()), float(expected))
+            # Compute on an explicit scheduler. Earlier tests in the same worker
+            # can leave dask's global scheduler set to "dask.distributed" (any
+            # Client does), and a bare .compute() then raises
+            # "Requested dask.distributed scheduler but no Client active".
+            assert np.isclose(self._scalar(combined.compute(scheduler="sync")), float(expected))
