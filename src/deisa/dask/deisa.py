@@ -273,25 +273,32 @@ class Deisa(IDeisa):
         else:
             # Single analysis call for all arrays. No loop overhead.
             # The method takes the full registered_arrays dict, and we pass arrays_metadata here.
-            # The bridge distributes branches per array using the array names embedded in each BranchSpec.
+            # Each BranchSpec carries the registered array it descends from (``input_name``); branches
+            # are grouped per array and filed with set_task_branches ONCE PER ARRAY, so each bridge
+            # fetches only the branches that belong to its own array. Arrays with no branches simply
+            # fall back to the legacy full-chunk scatter path.
             branches = _analyze_callback_for_branches(callback, self.arrays_metadata, precompute=True)
-            array_name = array_names[0] if array_names else None
-            if array_name and branches:
-                self.handshake.set_task_branches(array_name, branches)
-            elif array_name:
+            if not branches:
                 logger.debug(
-                    f"_register_callback_impl: callback {callback.__name__!r} produced no precomputable branches for "
-                    f"array '{array_name}'."
+                    f"_register_callback_impl: callback {callback.__name__!r} produced no precomputable branches "
+                    f"for any of the registered arrays {array_names!r}."
                     f"Without branches, the bridge will fall back to scattering the FULL chunk to the dask workers."
                     f"This is the behavior the precompute optimization is designed to avoid. Set precompute=False and "
                     f"catch the exception if the full-chunk path is acceptable."
                 )
                 raise NoPrecomputableReductionError(
-                    f"Callback {callback.__name__!r} produced no precomputable reductions for array '{array_name}'."
+                    f"Callback {callback.__name__!r} produced no precomputable reductions for any of the "
+                    f"registered arrays {array_names!r}."
                     f"The precompute path requires at least one chunk-local reduction. To run the callback on the "
                     f"full-chunk scatter path, redesign the callback to use a single dask reduction (sum, mean, var, "
                     f"std, min, max, prod) and avoid expressions whose reduction depends on another reduction's output."
                 )
+            # Group branches by their source registered array and file each array's set under its own name.
+            by_array: Dict[str, List[Any]] = {}
+            for b in branches:
+                by_array.setdefault(b.input_name, []).append(b)
+            for arr_name, group in by_array.items():
+                self.handshake.set_task_branches(arr_name, group)
 
         # create the topic handler and subscribe for EVERY array in a callback (both precompute=True and
         # precompute=False paths. With precompute=False the bridge still needs the topic subscription to receive data
