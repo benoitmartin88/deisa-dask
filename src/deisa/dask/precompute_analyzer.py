@@ -109,6 +109,34 @@ class NoComputeBoundaryError(PrecomputeError):
 
 
 # ---------------------------------------------------------------------------
+# Source-array attribution
+# ---------------------------------------------------------------------------
+def _match_source_arrays(darr: Any, registered_arrays: Dict[str, Any]) -> Tuple[List[str], str]:
+    """Return ``(matched, primary_name)`` for a dask expression.
+
+    ``matched`` is the list of registered array names whose stub layer appears in the
+    expression's task graph (empty when the expression does not descend from any
+    registered array, e.g. a ``da.zeros`` created inside the callback). ``primary_name``
+    is the first registered array name -- the fallback used when no stub matches.
+
+    Stubs are created with a unique dask layer-name tag (``deisa-stub-<name>``, see
+    :mod:`deisa.dask.branch`), so graph-layer membership reliably attributes an
+    expression to its source array even when two registered arrays share identical
+    metadata (two plain ``da.zeros`` with the same shape/chunks collapse to one dask
+    name).
+    """
+    layers: set = set()
+    try:
+        layers = set(darr.__dask_graph__().layers)  # type: ignore[attr-defined]
+    except Exception:  # pragma: no cover - safety net
+        pass
+    matched = [
+        name for name, value in registered_arrays.items() if isinstance(value, da.Array) and value.name in layers
+    ]
+    return matched, next(iter(registered_arrays), "f")
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 def analyze_callback(
@@ -182,7 +210,9 @@ def _analyze_callback(
         raise IncompatibleCallbackError(f"Could not locate FunctionDef for {callback.__name__!r} in callback source.")
 
     # 4. Build initial scope: callback params bound to registered arrays.
-    # The dict's first key is the "primary" registered array name (used as the base for output keys in hints).
+    # The dict's first key is used as the FALLBACK array name for output keys when a boundary
+    # expression cannot be attributed to any registered array (e.g. a fresh da.zeros built
+    # inside the callback). Normal expressions are attributed to their exact source array.
     primary_name: str = next(iter(registered_arrays)) if registered_arrays else "f"
     reg_values = list(registered_arrays.values())
     param_names = [a.arg for a in callback_def.args.args]
@@ -227,11 +257,17 @@ def _analyze_callback(
     hints: List[Dict[str, Any]] = []
     for arr_info in dask_arrays:
         darr = arr_info["array"]
-        # Pick the array name: the first registered array, by default.
-        # We don't try to track which specific registered array a chain of dask ops descends from.
-        # The primary name is used uniformly so the bridge gets stable output keys.
+        # Attribute each boundary expression to the exact registered array(s) it descends from.
+        # The stub layer-name tag (``deisa-stub-<name>``) makes graph-layer membership a reliable
+        # provenance signal even when two registered arrays share identical metadata. An expression
+        # that descends from MORE than one registered array (cross-array, e.g. ``(a - b).max()``)
+        # is attributed to the FIRST matched array and flagged ``multi_source`` so the branch
+        # builder can refuse it (a chunk-local branch cannot rebuild a cross-array expression).
+        matched, _ = _match_source_arrays(darr, registered_arrays)
+        array_name = matched[0] if matched else primary_name
+        multi = len(matched) > 1
         try:
-            new_hints = extract_reduction_hints(darr, primary_name)
+            new_hints = extract_reduction_hints(darr, array_name)
         except UnsupportedReductionError:
             # Cross-reduction dependency detected. This is the signal we MUST propagate to the caller. The precompute
             # path cannot produce correct per-bridge partials for an expression whose reduction depends on another
@@ -241,6 +277,9 @@ def _analyze_callback(
         except Exception as e:  # pragma: no cover - safety net
             logger.debug("extract_reduction_hints failed: %s", e)
             new_hints = []
+        for hint in new_hints:
+            hint["array_name"] = array_name
+            hint["multi_source"] = multi
         hints.extend(new_hints)
 
     # 8. Decide what (if anything) to raise.
