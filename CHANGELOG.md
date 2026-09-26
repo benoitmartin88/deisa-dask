@@ -26,11 +26,6 @@ Types of changes:
   reduction depends on another reduction's output are refused with
   `UnsupportedReductionError`.
 
-### Changed
-
-- benchmark: pin Dask/Distributed to `2025.11.0`, the newest version exercised by the
-  test matrix, instead of an untested newer release.
-
 ### Fixed
 
 - Missing first callback(s) due to not waiting for `Deisa.execute_callbacks()`
@@ -38,12 +33,6 @@ Types of changes:
 - benchmark: report send->callback latency in the unit each consumer expects (milliseconds
   in the human-readable summary, nanoseconds to Bencher); drop a `del` that broke a live
   closure and could raise `NameError` on a late callback.
-
-### Security
-
-- CI: the closed-PR archive workflow interpolated `github.head_ref` (attacker-controlled
-  for fork PRs) directly into a shell command; it is now passed through `env`, preventing
-  command injection on that privileged runner.
 
 ## [0.6.3]
 
