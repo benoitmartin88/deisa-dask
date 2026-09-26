@@ -209,6 +209,56 @@ def test_compute_multiple_reductions() -> None:
     assert _hint_keys(hints) == ["f-max", "f-mean", "f-sum"]
 
 
+def test_same_op_different_axes_distinct_output_keys() -> None:
+    """``arr.sum()`` + ``arr.sum(axis=0)`` must produce DISTINCT output keys (B3).
+
+    On the pre-fix code both hints carried ``f-sum`` (the key was
+    ``f"{array_name}-{op_name}"``), so the topic handler grouped the two
+    reductions into one and one of them was silently overwritten
+    (``bridge.py`` indexed branches by ``output_key``). The full reduction
+    keeps the stable ``f-sum`` key (existing tests pin it); the axis
+    reduction gets a deterministic discriminator suffix.
+    """
+    arr = _simple_stub()
+    src = """
+        def callback(arr):
+            result = arr.sum()
+            result.compute()
+            result0 = arr.sum(axis=0)
+            result0.compute()
+        """
+    cb = _make_function("callback", src)
+    hints, _ = analyze_callback(cb, {"f": arr})
+    keys = [h["output_key"] for h in hints]
+    assert len(keys) == 2, f"expected two hints, got {keys}"
+    assert len(set(keys)) == 2, f"expected distinct output keys, got {keys}"
+    assert _hint_keys(hints) == ["f-sum", "f-sum-axis0"]
+
+
+def test_same_op_same_axis_keeps_single_output_key() -> None:
+    """Two IDENTICAL reductions (``arr.sum()`` twice) keep ONE output key.
+
+    They are semantically identical: one branch, one bridge execution,
+    shared by every callback's dispatch view. Distinct keys would file two
+    branches that compute the same thing.
+    """
+    arr = _simple_stub()
+    src = """
+        def callback(arr):
+            a = arr.sum()
+            a.compute()
+            b = arr.sum()
+            b.compute()
+        """
+    cb = _make_function("callback", src)
+    hints, _ = analyze_callback(cb, {"f": arr})
+    keys = [h["output_key"] for h in hints]
+    assert len(keys) == 2, f"expected two hints, got {keys}"
+    # Identical reductions share ONE key (the dedup unit is the output_key:
+    # merge_branches and the topic handler group by it).
+    assert set(keys) == {"f-sum"}, f"expected a single shared key, got {keys}"
+
+
 def test_compute_helper_same_file() -> None:
     arr = _simple_stub()
     src = """

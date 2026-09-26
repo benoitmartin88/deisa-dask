@@ -55,7 +55,11 @@ from deisa.dask.constants import (
     WAIT_FOR_EXECUTE_CB_EVENT,
 )
 from deisa.dask.handshake import Handshake
-from deisa.dask.precompute_analyzer import NoPrecomputableReductionError, PrecomputeRuntimeError, UnsupportedReductionError
+from deisa.dask.precompute_analyzer import (
+    NoPrecomputableReductionError,
+    PrecomputeRuntimeError,
+    UnsupportedReductionError,
+)
 from deisa.dask.task_branches import _normalize_reduction_axis
 from deisa.dask.utils import _PrecomputedDeisaArray, build_deisa_array, get_client
 
@@ -361,15 +365,16 @@ class Deisa(IDeisa):
                 self.handshake.set_task_branches(arr_name, merged)
             # Record the per-callback reduction descriptors (output_key, op,
             # normalized axis signature, kind). The topic handler builds the
-            # callback's dispatch view from these; array ndim comes from the
-            # metadata (global_shape length) so full reductions (axis covering
-            # every axis) and axis reductions normalize identically at
-            # registration and dispatch.
+            # callback's dispatch view from these. ``dispatch_sig`` is the
+            # signature computed by the branch builder (window reads and
+            # full reductions -> ``()``; axis reductions -> the sorted axes),
+            # NOT a re-normalization of ``chunk_axis`` here: re-normalizing
+            # would mislabel window reads (their chunk axis is partial even
+            # though the callback's runtime reduction is full) and drift from
+            # the signature the dispatch view matches against.
             descriptors: Dict[str, List[Tuple[str, str, Tuple[int, ...], str]]] = {}
             for b in branches:
-                ndim = len(self.arrays_metadata[b.input_name]["global_shape"])
-                axes_sig = _normalize_reduction_axis(b.chunk_axis, ndim)
-                desc = (b.output_key, b.op_name, axes_sig, b.output_kind)
+                desc = (b.output_key, b.op_name, b.dispatch_sig, b.output_kind)
                 if desc not in descriptors.setdefault(b.input_name, []):
                     descriptors[b.input_name].append(desc)
             self._callback_reductions[callback_id] = descriptors
@@ -545,9 +550,9 @@ class Deisa(IDeisa):
                                 f"{len(partial_futures)}. A bridge dropped or failed a branch; refusing to "
                                 f"deliver a corrupted reduction."
                             )
-                        if kind == "scalar" and (
-                            hint_axis is None
-                            or (array_ndim is not None and _normalize_reduction_axis(hint_axis, array_ndim) == ())
+                        if (
+                            kind == "scalar"
+                            and _weak_self._dispatch_sig_for(array_name, output_key, hint_axis, array_ndim) == ()
                         ):
                             # Full scalar reduction: stack per-bridge partials along a new axis so the callback's
                             # reduction combines them via dask's natural graph.
@@ -570,9 +575,13 @@ class Deisa(IDeisa):
                                 kind=kind,
                                 finalize=finalize,
                                 hint_axis=hint_axis,
-                                array_ndim=array_ndim if array_ndim is not None else len(partial_futures[0]["chunk_position"]),
+                                array_ndim=(
+                                    array_ndim if array_ndim is not None else len(partial_futures[0]["chunk_position"])
+                                ),
                                 op_name=op_name,
-                                global_shape=tuple(metadata.get("global_shape", ())) if metadata.get("global_shape") else None,
+                                global_shape=(
+                                    tuple(metadata.get("global_shape", ())) if metadata.get("global_shape") else None
+                                ),
                                 grid_extent=grid_extent,
                             )
                         else:
@@ -629,6 +638,35 @@ class Deisa(IDeisa):
 
         return topic_handler
 
+    def _dispatch_sig_for(
+        self, array_name: str, output_key: str, hint_axis: Optional[Tuple[int, ...]], array_ndim: Optional[int]
+    ) -> Tuple[int, ...]:
+        """Return the runtime dispatch signature recorded for ``output_key``.
+
+        The registered branches' descriptors were recorded with the branch
+        builder's ``dispatch_sig`` (``()`` for full reductions and window
+        reads, the sorted axes otherwise). A same-``output_key`` reduction
+        is recorded identically by every callback that holds it (merged
+        branches dedup to one signature), so the first descriptor found is
+        authoritative. Falls back to re-normalizing the payload ``hint_axis``
+        when no callback descriptor matches (e.g. the callback was
+        unregistered after branches were filed): the payload's ``chunk_axis``
+        is then the only available signature source.
+
+        - ``:param array_name:`` The array the event was published for.
+        - ``:param output_key:`` The reduction's unique output key.
+        - ``:param hint_axis:`` The payload's ``chunk_axis`` (fallback source).
+        - ``:param array_ndim:`` The array's ndim (fallback normalization).
+        - ``:return:`` The dispatch signature tuple (``()`` = full reduction).
+        """
+        for descriptors in self._callback_reductions.values():
+            for key, _op, axes_sig, _kind in descriptors.get(array_name, []):
+                if key == output_key:
+                    return axes_sig
+        if hint_axis is None or array_ndim is None:
+            return ()
+        return _normalize_reduction_axis(hint_axis, array_ndim)
+
     def _build_callback_views(self, array_name: str, iteration: int, combined_by_key: Dict[str, Any]) -> Dict[str, Any]:
         """Build the per-callback dispatch view for this array's event.
 
@@ -669,6 +707,7 @@ class Deisa(IDeisa):
                 t=iteration,
                 signatures=signatures,
                 reapply=reapply,
+                registered_ndim=len(self.arrays_metadata[array_name].get("global_shape", ())),
                 dask=first.dask,
                 name=first.name,
                 chunks=first.chunks,
