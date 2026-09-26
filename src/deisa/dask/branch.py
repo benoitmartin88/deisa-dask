@@ -313,31 +313,6 @@ def _derive_combined_output_shape(
     return tuple(partial_shape[ax] for ax in kept_axes)
 
 
-def _branch_func_with_kwargs(chunk, _cf=None, _kw=None):
-    """Top-level branch callable: ``chunk_func(chunk, **chunk_kwargs)``.
-
-    Defined at module level so pickle can find it across processes.
-    The default-arg trick (``_cf=chunk_func``, ``_kw=chunk_kwargs``) binds the closure cells at function-definition
-    time, which pickle serializes correctly.
-    """
-    if _cf is None or _kw is None:
-        # Defensive: a stray call with no closure should never happen (BranchSpec.branch_func is always built via the
-        # helper), but be loud rather than silent.
-        raise RuntimeError("_branch_func_with_kwargs called without bound chunk_func / chunk_kwargs")
-    return _cf(chunk, **_kw)
-
-
-def _make_branch_func(chunk_func: Callable, chunk_kwargs: Dict[str, Any]) -> Callable[[Any], Any]:
-    """Build a pickle-safe branch callable that closes over ``chunk_func`` and ``chunk_kwargs``.
-
-    Returns a :func:`_branch_func_with_kwargs` partial with the chunk_func and chunk_kwargs bound via the default-arg
-    trick. Returns a ``functools.partial`` so pickle can find the closure contents at unpickle time.
-    """
-    import functools as _functools
-
-    return _functools.partial(_branch_func_with_kwargs, _cf=chunk_func, _kw=chunk_kwargs)
-
-
 def _discover_partial_metadata(
     branch_func: Callable[[Any], Any],
     placeholder: Optional[Any],
@@ -345,7 +320,7 @@ def _discover_partial_metadata(
 ) -> Tuple[Tuple[int, ...], str]:
     """Run ``branch_func`` on the placeholder and return ``(partial_shape, partial_dtype)``.
 
-    Used by :func:`_build_length1_branch` and :func:`_build_chain_branch`. Structural inspection only:
+    Used by :func:`_build_branch`. Structural inspection only:
     ``branch_func`` is a numpy op / chain composition, not the user callback, so calling it has no side effects.
     ``mean``/``moment`` branch_funcs return a dict; the per-key reduced shape is taken from ``total`` (fallback
     ``M``, else first key). Without a placeholder, falls back to the branch ``shape``/``dtype`` (``shape`` unset by
@@ -499,7 +474,7 @@ def _analyze_branch(callback: Callable, registered_arrays: Dict[str, Any], preco
         if branch is None:
             if not precompute:
                 logger.debug(
-                    "analyze_branch: build failed for %s. The length-1 path's build_length1_branch raised "
+                    "analyze_branch: build failed for %s. The length-1 path's length-1 build raised "
                     "(most likely the placeholder couldn't be computed or the chunk_func rejected the chunk shape).",
                     branch_dict.get("output_key"),
                 )
@@ -509,7 +484,7 @@ def _analyze_branch(callback: Callable, registered_arrays: Dict[str, Any], preco
             raise RuntimeError(
                 f"analyze_branch: cannot build branch for branch {branch_dict.get('output_key')!r}. "
                 f"The chain walker refused (likely cross-array or constant upstream) AND the length-1 fallback's "
-                f"build_length1_branch raised. This usually means the chunk_func rejected the placeholder. "
+                f"length-1 build raised. This usually means the chunk_func rejected the placeholder. "
                 f"Inspect with the failing branch's chunk_kwargs."
             )
         branches.append(branch)
@@ -553,7 +528,7 @@ def _try_chain_branch(
         chain_branch_func = _build_chain_branch_func(chain)
         seen_chains[chain_key] = chain_branch_func
     try:
-        return _build_chain_branch(
+        return _build_branch(
             branch=branch,
             chain=chain,
             input_name=primary,
@@ -574,14 +549,23 @@ def _try_length1_branch(
 ) -> Optional[BranchSpec]:
     """Build a length-1 BranchSpec from a per-reduction branch.
 
-    The branch_func is the branch's chunk_func wrapped in a vpickle-friendly closure (``_make_branch_func``)
-    that binds the chunk_kwargs (axis, keepdims, dtype, ...). The bridge calls this branch_func with just the chunk
-    and no extra kwargs.
+    A length-1 branch is a chain of length 1: represented as ``[(chunk_func, effective_kwargs, 1)]``
+    and built via the unified :func:`_build_branch`. The chain machinery binds the chunk_kwargs
+    (axis, keepdims, dtype, ...) to the chunk_func, so the bridge calls ``branch_func(chunk)`` with
+    just the chunk and no extra kwargs.
     """
     try:
-        return _build_length1_branch(
+        # For ``mean`` and ``moment`` the bridge overrides ``keepdims=True``
+        # (see :meth:`Bridge._execute_operations_on_chunk`) so the per-bridge dict values are at least 1-D for
+        # ``mean_agg`` / ``moment_agg`` to walk with ``_concatenate2``. Mirror that here.
+        chunk_kwargs = branch.get("chunk_kwargs") or {}
+        effective_kwargs = dict(chunk_kwargs)
+        if branch.get("kind") in (_BRANCH_KIND_MEAN, _BRANCH_KIND_MOMENT):
+            effective_kwargs["keepdims"] = True
+        chain = [(chunk_func, effective_kwargs, 1)]
+        return _build_branch(
             branch=branch,
-            chunk_func=chunk_func,
+            chain=chain,
             input_name=primary,
             array_ndim=array_ndim,
             placeholder=placeholder,
@@ -593,8 +577,7 @@ def _try_length1_branch(
         # dtype, or the placeholder is itself a dask array (because
         # .compute() silently failed upstream).
         logger.debug(
-            "_try_length1_branch: build_length1_branch raised for %s "
-            "with chunk_kwargs=%r, array_ndim=%d, placeholder=%r: %s",
+            "_try_length1_branch: build_branch raised for %s with chunk_kwargs=%r, array_ndim=%d, placeholder=%r: %s",
             branch.get("output_key"),
             branch.get("chunk_kwargs"),
             array_ndim,
@@ -604,7 +587,7 @@ def _try_length1_branch(
         return None
 
 
-def _build_chain_branch(
+def _build_branch(
     branch: Dict[str, Any],
     chain: List[Tuple[Callable, dict, int]],
     input_name: str,
@@ -612,13 +595,14 @@ def _build_chain_branch(
     placeholder: Optional[Any] = None,
     chain_branch_func: Optional[Callable] = None,
 ) -> BranchSpec:
-    """Build a chain-folded :class:`BranchSpec` from a branch and a layer chain.
+    """Build a :class:`BranchSpec` from a branch and a layer chain.
 
-    The chain's ``branch_func`` is the composition of the layer funcs (root-to-chunk).
-    The branch provides the reduction's ``kind``/``finalize``/``chunk_axis`` metadata.
+    The chain (root-to-chunk ``(func, kwargs, input_count)`` triples) is composed into a single
+    ``branch_func``; the branch provides the reduction's ``kind``/``finalize``/``chunk_axis`` metadata.
+    A length-1 branch is simply a chain of length 1 (``[(chunk_func, effective_kwargs, 1)]``).
 
-    If ``chain_branch_func`` is provided (the memoized version), use it directly instead of rebuilding.
-    Otherwise build a fresh callable from ``chain``.
+    If ``chain_branch_func`` is provided (the memoized / pre-built version), use it directly instead
+    of rebuilding.
     """
     kind = branch.get("kind", _BRANCH_KIND_SCALAR)
     finalize = branch.get("finalize")
@@ -638,84 +622,13 @@ def _build_chain_branch(
     partial_shape, partial_dtype = _discover_partial_metadata(chain_branch_func, placeholder, branch)
 
     output_shape = _derive_combined_output_shape(chunk_axis, array_ndim, partial_shape)
-    output_dtype = partial_dtype
-
-    return BranchSpec(
-        input_name=input_name,
-        output_key=branch["output_key"],
-        output_kind=kind,
-        branch_func=chain_branch_func,
-        chunk_axis=chunk_axis,
-        finalize=finalize,
-        partial_shape=partial_shape,
-        partial_dtype=partial_dtype,
-        output_shape=output_shape,
-        output_dtype=output_dtype,
-    )
-
-
-def _build_length1_branch(
-    branch: Dict[str, Any],
-    chunk_func: Callable[[Any], Any],
-    input_name: str,
-    array_ndim: int,
-    placeholder: Optional[Any] = None,
-) -> BranchSpec:
-    """Build a :class:`BranchSpec` from a per-reduction branch dict.
-
-    The branch_func is the same length-1 chunk_func the branch already carries.
-    The BranchSpec re-exposes the branch's ``kind``/``finalize``/``shape``/``dtype`` metadata in the structured form
-    the bridge and Deisa side will consume.
-
-    If ``placeholder`` is provided, we run the chunk_func on it to discover the partial's actual shape/dtype.
-    The placeholder is a dask array or numpy array representing the registered chunk (typically a zero-filled dask array
-    of the right shape). This is purely a structural inspection, the chunk_func is a numpy operation, not a callback,
-    so it has no side effects.
-
-    For ``mean``/``moment`` partials the chunk_func returns a dict (``{n, total}`` or ``{n, total, M}``), we record the
-    per-bridge partial's shape as the shape of the ``total`` value (the representative per-key shape, since all keys
-    share the same reduced-axes pattern).
-    """
-
-    kind = branch.get("kind", _BRANCH_KIND_SCALAR)
-    finalize = branch.get("finalize")
-
-    # Reconstruct chunk_axis from chunk_kwargs['axis']. The branch carries
-    # ``axis`` as a tuple/list/int; normalise to a tuple of ints.
-    chunk_kwargs = branch.get("chunk_kwargs") or {}
-    ax = chunk_kwargs.get("axis")
-    if isinstance(ax, (list, tuple)):
-        chunk_axis = tuple(int(a) for a in ax)
-    elif ax is not None:
-        chunk_axis = (int(ax),)
-    else:
-        chunk_axis = None
-
-    # Discover the partial's shape and dtype by running the chunk_func on the placeholder. This is structural,
-    # chunk_func is a numpy op, not the user's callback, so no side effects.
-    # For ``mean`` and ``moment`` the bridge overrides ``keepdims=True``
-    # (see :meth:`Bridge._execute_operations_on_chunk`) so the per-bridge  dict values are at least 1-D for
-    # ``mean_agg`` / ``moment_agg`` to walk with ``_concatenate2``. Mirror that here.
-    effective_kwargs = dict(chunk_kwargs)
-    if kind in (_BRANCH_KIND_MEAN, _BRANCH_KIND_MOMENT):
-        effective_kwargs["keepdims"] = True
-
-    # Wrap the raw chunk_func in a closure that binds the analyzer's chunk_kwargs (axis, keepdims, dtype, ...).
-    # The bridge calls ``branch.branch_func(chunk)`` with no extra kwargs, this closure carries them.
-    # Pickle-friendly: a function with a closure of two picklable objects (a functools.partial and a dict). Uses the
-    # top-level ``_make_branch_func`` helper so the closure is picklable across processes.
-    branch_func = _make_branch_func(chunk_func, effective_kwargs)
-
-    partial_shape, partial_dtype = _discover_partial_metadata(branch_func, placeholder, branch)
-
-    output_shape = _derive_combined_output_shape(chunk_axis, array_ndim, partial_shape)
     output_dtype = partial_dtype  # mean/moment keep dtype through the agg
 
     return BranchSpec(
         input_name=input_name,
         output_key=branch["output_key"],
         output_kind=kind,
-        branch_func=branch_func,
+        branch_func=chain_branch_func,
         chunk_axis=chunk_axis,
         finalize=finalize,
         partial_shape=partial_shape,
