@@ -59,8 +59,9 @@ import logging
 import pickle
 from typing import Any, Dict, List, Optional, Tuple
 
-import dask.array as da
 import numpy as np
+
+import dask.array as da
 
 logger = logging.getLogger(__name__)
 

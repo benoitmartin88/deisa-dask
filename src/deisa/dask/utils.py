@@ -28,7 +28,6 @@
 # =============================================================================
 import logging
 import os
-from typing import Dict, Optional, Set, Tuple
 
 from deisa.core import DeisaArray, ICommunicator
 from distributed import Client, Lock, Variable

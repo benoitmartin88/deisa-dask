@@ -440,3 +440,96 @@ class TestMultiReductionBranches:
                 array_ndim=2,
             )
             assert np.isclose(self._scalar(combined.compute()), float(expected))
+
+    def test_axis_reduction_combine_correct(self):
+        # B4 unit: the two-phase, data-axis-ordered combine must produce the
+        # TRUE axis reduction for per-bridge partials on a 2x2 grid. On the
+        # pre-fix code mean(axis=0)/sum(axis=*) raised and mean(axis=1)
+        # silently returned the wrong values ([7.5 9.5] vs truth
+        # [2.5 6.5 10.5 14.5]).
+        from deisa.dask.branch import _combine_array_from_partials
+
+        real = np.arange(1, 17, dtype=np.float64).reshape(4, 4)
+        chunks = [real[i : i + 2, j : j + 2] for i in range(0, 4, 2) for j in range(0, 4, 2)]
+        truth = {
+            "mean": (np.mean(real, axis=0), np.mean(real, axis=1)),
+            "sum": (np.sum(real, axis=0), np.sum(real, axis=1)),
+        }
+        for op in ("mean", "sum"):
+            for ax in (0, 1):
+                branch = self._analyze(f"r = arr.{op}(axis={ax})\nreturn r.compute()")[f"f-{op}"]
+                partials = []
+                for c in chunks:
+                    p = branch.branch_func(c)
+                    rep = np.asarray(p["total"]) if isinstance(p, dict) else np.asarray(p)
+                    partials.append(
+                        {
+                            "future": p,
+                            "chunk_position": tuple(np.unravel_index(len(partials), (2, 2))),
+                            "shape": tuple(rep.shape),
+                            "dtype": str(rep.dtype),
+                        }
+                    )
+                combined = _combine_array_from_partials(
+                    partials,
+                    kind=branch.output_kind,
+                    finalize=branch.finalize,
+                    hint_axis=(ax,),
+                    array_ndim=2,
+                    op_name=branch.op_name,
+                )
+                got = np.asarray(combined.compute())
+                expected = truth[op][ax]
+                assert got.shape == expected.shape, f"{op}(axis={ax}): got shape {got.shape}, expected {expected.shape}"
+                assert np.allclose(got, expected, rtol=1e-10, atol=1e-12), (
+                    f"{op}(axis={ax}): got {got.tolist()}, expected {expected.tolist()}"
+                )
+
+
+def _make_spec(output_key, op_name="sum", output_kind="scalar", dispatch_sig=(), **kw):
+    """Minimal BranchSpec for merge_branches unit tests (no cluster needed)."""
+    from deisa.dask.branch import BranchSpec
+
+    return BranchSpec(
+        output_key=output_key,
+        input_name="f",
+        output_kind=output_kind,
+        branch_func=lambda chunk: chunk,
+        chunk_axis=None,
+        finalize=None,
+        partial_shape=(),
+        partial_dtype="float64",
+        op_name=op_name,
+        dispatch_sig=dispatch_sig,
+        **kw,
+    )
+
+
+def test_merge_branches_dedup_same_key_keeps_all_distinct_keys() -> None:
+    """B5 merge helper: identical signatures dedup, distinct keys survive."""
+    from deisa.dask.branch import merge_branches
+
+    existing = [_make_spec("f-sum"), _make_spec("f-mean", op_name="mean", output_kind="mean")]
+    new = [_make_spec("f-sum"), _make_spec("f-max", op_name="max")]
+    merged = merge_branches(existing, new)
+    assert {b.output_key for b in merged} == {"f-sum", "f-mean", "f-max"}
+    # The identical f-sum survived exactly once (the existing branch).
+    assert sum(1 for b in merged if b.output_key == "f-sum") == 1
+
+
+def test_merge_branches_refuses_same_key_different_signature() -> None:
+    """B5 merge helper: a same-key/different-signature collision must raise.
+
+    A window read ``x[-1].sum()`` and a true ``x.sum(axis=0)`` can both carry
+    ``f-sum`` from different callbacks (each starts a fresh per-callback seen
+    map); their runtime dispatch signatures (() vs (0,)) differ, so a single
+    shared branch cannot serve both callbacks. Refusing loudly at
+    registration beats silently delivering one callback the other's result.
+    """
+    from deisa.dask.branch import merge_branches
+    from deisa.dask.precompute_analyzer import PrecomputeRuntimeError
+
+    window_read = _make_spec("f-sum", dispatch_sig=())
+    axis_zero = _make_spec("f-sum", dispatch_sig=(0,))
+    with pytest.raises(PrecomputeRuntimeError):
+        merge_branches([window_read], [axis_zero])

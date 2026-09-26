@@ -253,7 +253,9 @@ _SCALAR_FOLDS = {
 }
 
 
-def _nest_partial_dicts_by_grid(partials: List[Dict[str, Any]], grid_extent: Optional[Tuple[int, ...]] = None) -> Tuple[Any, Tuple[int, ...]]:
+def _nest_partial_dicts_by_grid(
+    partials: List[Dict[str, Any]], grid_extent: Optional[Tuple[int, ...]] = None
+) -> Tuple[Any, Tuple[int, ...]]:
     """Arrange per-bridge dict-blob partials into a nested list that mirrors
     the MPI chunk grid, so that ``mean_agg`` / ``moment_agg`` (which walk the
     nested list with ``_concatenate2``) can combine them.
