@@ -95,7 +95,7 @@ def _make_compute_callback(body: str, results: List[Any]) -> Callable:
     whose callbacks call several reductions and store their outputs.
     """
     src = textwrap.dedent(f"def _cb(window):\n{textwrap.indent(body, '    ')}")
-    scope: Dict[str, Any] = {"results": results}
+    scope: Dict[str, Any] = {"results": results, "np": np}
     code = compile(src, "<test_precompute_memory>", "exec")
     exec(code, scope)
     fn = scope["_cb"]

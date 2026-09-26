@@ -156,6 +156,21 @@ class _PrecomputedDeisaArray(DeisaArray):
     passthrough attributes behave like a regular ``DeisaArray``.
     """
 
+    def __new__(cls, t, signatures, reapply, registered_ndim, *args, **kwargs):
+        # ``DeisaArray.__new__`` (``deisa.core``) forwards *all* keyword
+        # arguments to ``dask.array.Array.__new__``, which in current dask
+        # accepts exactly ``(cls, dask, name, chunks, dtype, meta, shape)``.
+        # Consume the dispatch-view extras here so they never reach
+        # ``Array.__new__`` (previously raised ``TypeError: unexpected keyword
+        # argument 'signatures'`` at every precompute topic event).
+        array_kwargs = {key: kwargs.pop(key) for key in ("dask", "name", "chunks", "dtype", "meta", "shape")}
+        if kwargs:
+            raise TypeError(
+                f"_PrecomputedDeisaArray: unexpected keyword arguments {sorted(kwargs)} "
+                f"(allowed array keywords: {sorted(array_kwargs)})"
+            )
+        return super().__new__(cls, t, *args, **array_kwargs)
+
     def __init__(self, t, signatures, reapply, registered_ndim, *args, **kwargs):
         super().__init__(t, *args, **kwargs)
         self._signatures = signatures
