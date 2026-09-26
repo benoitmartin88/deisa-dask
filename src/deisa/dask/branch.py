@@ -474,7 +474,7 @@ def _analyze_branch(callback: Callable, registered_arrays: Dict[str, Any], preco
         if branch is None:
             if not precompute:
                 logger.debug(
-                    "analyze_branch: build failed for %s. The length-1 path's length-1 build raised "
+                    "analyze_branch: build failed for %s. The length-1 build raised "
                     "(most likely the placeholder couldn't be computed or the chunk_func rejected the chunk shape).",
                     branch_dict.get("output_key"),
                 )
@@ -484,7 +484,7 @@ def _analyze_branch(callback: Callable, registered_arrays: Dict[str, Any], preco
             raise RuntimeError(
                 f"analyze_branch: cannot build branch for branch {branch_dict.get('output_key')!r}. "
                 f"The chain walker refused (likely cross-array or constant upstream) AND the length-1 fallback's "
-                f"length-1 build raised. This usually means the chunk_func rejected the placeholder. "
+                f"build raised. This usually means the chunk_func rejected the placeholder. "
                 f"Inspect with the failing branch's chunk_kwargs."
             )
         branches.append(branch)
