@@ -177,3 +177,37 @@ class TestBridge:
             await asyncio.gather(*[asyncio.to_thread(bridge.close, 0) for i, bridge in enumerate(bridges)])
 
         asyncio.run(_bridge_close())
+
+    def test_execute_operations_on_chunk_raises_on_failing_branch(self, env_setup):
+        """F2 unit: a branch that raises must NOT be dropped silently.
+
+        The pre-fix code caught every ``branch_func(chunk)`` exception,
+        logged it and continued, so the topic event carried FEWER partials
+        than bridges. The combine then silently produced a wrong reduction
+        (scalar stacks got smaller sums; mean/moment aggregators missed a
+        bridge's ``n``). The post-fix code raises a typed
+        ``PrecomputeRuntimeError`` naming the branch.
+        """
+        from deisa.dask.branch import BranchSpec
+        from deisa.dask.precompute_analyzer import PrecomputeRuntimeError
+
+        bridge, _ = self.get_new_bridge()
+
+        def boom(chunk):
+            raise ValueError("boom")
+
+        branch = BranchSpec(
+            output_key="f-sum",
+            input_name="temperature",
+            output_kind="scalar",
+            branch_func=boom,
+            chunk_axis=None,
+            finalize=None,
+            partial_shape=(),
+            partial_dtype="float64",
+            op_name="sum",
+        )
+        with pytest.raises(PrecomputeRuntimeError) as excinfo:
+            bridge._execute_operations_on_chunk(np.ones((1,)), [branch])
+        assert "f-sum" in str(excinfo.value)
+        assert "boom" in str(excinfo.value)
