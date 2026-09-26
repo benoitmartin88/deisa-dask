@@ -33,15 +33,19 @@ import logging
 import threading
 import time
 import weakref
-from typing import Any, Callable, Collection, Dict, List, Literal, Set
+from typing import Any, Callable, Collection, Dict, List, Literal, Optional, Set, Tuple
 
 import numpy as np
-from deisa.core import CallbackArgs, Window
+from deisa.core import CallbackArgs, DeisaArray, Window
 from deisa.core.interface import IDeisa
 from distributed import Client, Event, Future, Queue
 
 import dask.array as da
-from deisa.dask.branch import _analyze_callback_for_branches, _combine_array_from_partials
+from deisa.dask.branch import (
+    _analyze_callback_for_branches,
+    _combine_array_from_partials,
+    merge_branches,
+)
 from deisa.dask.constants import (
     CALLBACK_PREFIX,
     CLIENT_KEY,
@@ -51,10 +55,40 @@ from deisa.dask.constants import (
     WAIT_FOR_EXECUTE_CB_EVENT,
 )
 from deisa.dask.handshake import Handshake
-from deisa.dask.precompute_analyzer import NoPrecomputableReductionError
-from deisa.dask.utils import build_deisa_array, get_client
+from deisa.dask.precompute_analyzer import (
+    NoPrecomputableReductionError,
+    PrecomputeRuntimeError,
+    UnsupportedReductionError,
+)
+from deisa.dask.task_branches import _normalize_reduction_axis
+from deisa.dask.utils import _PrecomputedDeisaArray, build_deisa_array, get_client
 
 logger = logging.getLogger(__name__)
+
+
+def _grid_extent_from_metadata(metadata: Dict[str, Any]) -> Optional[Tuple[int, ...]]:
+    """Per-data-axis chunk-grid extent from the array metadata.
+
+    ``global_shape[i] // chunk_shape[i]`` (at least 1) is the number of MPI
+    chunks along data axis ``i`` -- the harness invariant that the MPI cart
+    dims map one-to-one onto the array's data axes. ``None`` when metadata is
+    incomplete.
+    """
+    g = metadata.get("global_shape")
+    c = metadata.get("chunk_shape")
+    if not g or not c or len(g) != len(c):
+        return None
+    if any(ch <= 0 for ch in c):
+        return None
+    return tuple(max(1, int(gl // ch)) for gl, ch in zip(g, c))
+
+
+def _grid_size_from_metadata(metadata: Dict[str, Any]) -> Optional[int]:
+    """Total number of MPI chunks (bridges) the metadata implies for an array."""
+    extent = _grid_extent_from_metadata(metadata)
+    if extent is None:
+        return None
+    return int(np.prod(extent))
 
 
 class Deisa(IDeisa):
@@ -99,6 +133,15 @@ class Deisa(IDeisa):
         self._topic_handlers: Dict[str, Callable] = {}
         self._callback_seq = 0  # unique counter
         self._tasks = set()
+        # Per-array merged branch groups (static after registration). The
+        # actor API (``set_task_branches``) is unchanged; only the CALLER now
+        # passes the full merged list so several callbacks on the same array
+        # all get their branches (B5).
+        self._branch_groups: Dict[str, List[Any]] = {}
+        # callback_id -> array_name -> ordered [(output_key, op_name, axis_sig, kind)]
+        # recorded at registration; the topic handler builds the per-callback
+        # dispatch view from these descriptors.
+        self._callback_reductions: Dict[Deisa.Callback_id, Dict[str, List[Tuple[str, str, Tuple[int, ...], str]]]] = {}
 
     def __del__(self):
         try:
@@ -293,12 +336,48 @@ class Deisa(IDeisa):
                     f"full-chunk scatter path, redesign the callback to use a single dask reduction (sum, mean, var, "
                     f"std, min, max, prod) and avoid expressions whose reduction depends on another reduction's output."
                 )
+            # F1 gate: refuse non-direct reductions. A reduction whose input is
+            # a pointwise chain or slice ((arr*arr).sum(), arr[2:5].sum()) cannot
+            # be reconstructed on the callback side -- the precompute delivery
+            # would silently compute the reduction of the WRONG input. The
+            # bridge scatters only chunk-local partials; the callbacks' source is
+            # not rewritten. Loud refusal beats silent wrong values.
+            for b in branches:
+                if not b.deliver_direct:
+                    raise UnsupportedReductionError(
+                        f"Callback {callback.__name__!r}: cannot precompute reduction {b.output_key!r} "
+                        f"(op {b.op_name or '<unknown>'!r} on array {b.input_name!r}): the reduction input is "
+                        f"not the registered array chunk itself -- it is a pointwise chain or slice (e.g. "
+                        f"(arr*arr).sum() or arr[2:5].sum()), which the precompute delivery path cannot "
+                        f"reconstruct correctly on the callback side. Register a plain arr.<op>() reduction "
+                        f"or use precompute=False."
+                    )
             # Group branches by their source registered array and file each array's set under its own name.
+            # Merge with the branches of previously registered callbacks on the same array (B5): every
+            # callback's array gets its OWN set (identical signature -> identical output_key -> shared
+            # single branch; distinct reductions coexist).
             by_array: Dict[str, List[Any]] = {}
             for b in branches:
                 by_array.setdefault(b.input_name, []).append(b)
             for arr_name, group in by_array.items():
-                self.handshake.set_task_branches(arr_name, group)
+                merged = merge_branches(self._branch_groups.get(arr_name, []), group)
+                self._branch_groups[arr_name] = merged
+                self.handshake.set_task_branches(arr_name, merged)
+            # Record the per-callback reduction descriptors (output_key, op,
+            # normalized axis signature, kind). The topic handler builds the
+            # callback's dispatch view from these. ``dispatch_sig`` is the
+            # signature computed by the branch builder (window reads and
+            # full reductions -> ``()``; axis reductions -> the sorted axes),
+            # NOT a re-normalization of ``chunk_axis`` here: re-normalizing
+            # would mislabel window reads (their chunk axis is partial even
+            # though the callback's runtime reduction is full) and drift from
+            # the signature the dispatch view matches against.
+            descriptors: Dict[str, List[Tuple[str, str, Tuple[int, ...], str]]] = {}
+            for b in branches:
+                desc = (b.output_key, b.op_name, b.dispatch_sig, b.output_kind)
+                if desc not in descriptors.setdefault(b.input_name, []):
+                    descriptors[b.input_name].append(desc)
+            self._callback_reductions[callback_id] = descriptors
 
         # create the topic handler and subscribe for EVERY array in a callback (both precompute=True and
         # precompute=False paths. With precompute=False the bridge still needs the topic subscription to receive data
@@ -319,6 +398,8 @@ class Deisa(IDeisa):
         cb_data = self._callbacks.pop(callback_id, None)
         if cb_data is None:
             return
+
+        self._callback_reductions.pop(callback_id, None)
 
         for array_name in cb_data["array_names"]:
             s = self._callbacks_by_array.get(array_name)
@@ -433,71 +514,92 @@ class Deisa(IDeisa):
                 if precomputed:
                     # Precompute path: each ``futures`` entry is one (bridge, reduction) pair with the partial's reduced
                     # shape/dtype. Group by ``output_key`` and dispatch on the partial ``kind``:
-                    # - ``"scalar"`` (sum/prod/max/min): stack per-bridge partials along a new axis via ``da.stack``.
-                    #   The callback's reduction (e.g. ``arr.sum()``) sums the stacked partials via dask's natural graph
-                    # - ``"mean"``: each bridge ships a ``{n, total}`` dict blob (per dask's ``mean_chunk``).
-                    #   Build a delayed task that resolves the per-bridge dicts and calls
-                    #   ``dask.array.reductions.mean_agg`` over them, arranged in a nested list that matches the MPI
-                    #   chunk grid. Return the combined value as a scalar (full reduction) or N-d array (axis reduction)
-                    #   dask array.
-                    # - ``"moment"``: same pattern, but using ``moment_agg``. For ``std`` (finalize="sqrt"), the
-                    #   combined result is sqrt-ed before being returned.
+                    # - ``"scalar"`` + FULL reduction (no axis / axis covers every data axis): stack per-bridge
+                    #   partials along a new axis via ``da.stack``; the callback's reduction (e.g. ``arr.sum()``)
+                    #   aggregates the stack through dask's natural graph.
+                    # - ``"scalar"`` + AXIS reduction (e.g. ``arr.sum(axis=0)``): the per-bridge partials are plain
+                    #   arrays reduced over the red axes and still splittable over the KEPT axes. The two-phase
+                    #   combine folds the red grid levels (binary-ufunc fold) and concatenates over the kept levels --
+                    #   only the kept extents are multiplied by the grid (concatenation), so the shape is correct.
+                    # - ``"mean"`` / ``"moment"``: each bridge ships a ``{n, total[, M]}`` dict blob (per dask's
+                    #   ``mean_chunk`` / ``moment_chunk``). The two-phase combine calls ``mean_agg`` / ``moment_agg``
+                    #   over the nested red-level structure and concatenates over the kept levels, producing the
+                    #   FINAL correctly shaped reduction (this is what makes ``var``/``std`` correct: the callback
+                    #   receives the final value, never a one-element array whose re-applied ``.var()`` is forced to 0).
                     by_reduction: Dict[str, List[Any]] = {}
                     for f in futures:
                         by_reduction.setdefault(f["output_key"], []).append(f)
-                    darr_chunks: List[Any] = []
+                    metadata = _weak_self.arrays_metadata[array_name]
+                    array_ndim = len(metadata.get("global_shape", ())) if metadata.get("global_shape") else None
+                    grid_size = _grid_size_from_metadata(metadata)
+                    grid_extent = _grid_extent_from_metadata(metadata)
+                    combined_by_key: Dict[str, Any] = {}
                     for output_key, partial_futures in by_reduction.items():
                         kind = partial_futures[0].get("kind", "scalar")
                         finalize = partial_futures[0].get("finalize")
                         partial_shape = partial_futures[0]["shape"]
                         partial_dtype = partial_futures[0]["dtype"]
-                        if kind == "scalar":
-                            # Sum-able scalar/array partials. Stack along a new axis so the callback's reduction
-                            # combines them via dask's natural graph.
+                        hint_axis = partial_futures[0].get("chunk_axis")
+                        op_name = partial_futures[0].get("op_name")
+                        # F2: every bridge must ship its partial for every reduction. A missing partial silently
+                        # corrupts the combined result (stacks shrink, n-totals lose a bridge). Refuse loudly.
+                        if grid_size is not None and len(partial_futures) != grid_size:
+                            raise PrecomputeRuntimeError(
+                                f"topic_handler: array {array_name!r} reduction {output_key!r}: expected "
+                                f"{grid_size} bridge partial(s) (grid {grid_extent}) but received "
+                                f"{len(partial_futures)}. A bridge dropped or failed a branch; refusing to "
+                                f"deliver a corrupted reduction."
+                            )
+                        if (
+                            kind == "scalar"
+                            and _weak_self._dispatch_sig_for(array_name, output_key, hint_axis, array_ndim) == ()
+                        ):
+                            # Full scalar reduction: stack per-bridge partials along a new axis so the callback's
+                            # reduction combines them via dask's natural graph.
                             sorted_partials = sorted(partial_futures, key=lambda p: tuple(p["chunk_position"]))
                             blocks = [
                                 da.from_delayed(p["future"], shape=partial_shape, dtype=partial_dtype)
                                 for p in sorted_partials
                             ]
                             if len(blocks) == 1:
-                                darr_chunks.append(blocks[0])
+                                combined_by_key[output_key] = blocks[0]
                             else:
-                                darr_chunks.append(da.stack(blocks))
-                        elif kind in ("mean", "moment"):
-                            # Dict-blob partials. Build a nested list of per-bridge dict futures matching the MPI
-                            # chunk grid, then call mean_agg / moment_agg in a single delayed task.
-                            # ``chunk_axis`` is shipped in the topic event. It tells us the chunk_func's reduction axes
-                            # so the combine's output shape and agg axis are computed correctly.
-                            hint_axis = partial_futures[0].get("chunk_axis")
-                            array_ndim = len(_weak_self.arrays_metadata[array_name]["global_shape"])
-                            darr_chunks.append(
-                                _combine_array_from_partials(
-                                    partial_futures,
-                                    kind=kind,
-                                    finalize=finalize,
-                                    hint_axis=hint_axis,
-                                    array_ndim=array_ndim,
-                                )
+                                combined_by_key[output_key] = da.stack(blocks)
+                        elif kind in ("mean", "moment") or kind == "scalar":
+                            # Dict-blob partials (mean/moment) OR plain-array axis partials (scalar): the two-phase
+                            # combine reduces over the red grid levels and concatenates over the kept levels. It needs
+                            # the ortographic grid<->data-axis map: pass the metadata grid extent and global shape so
+                            # the output shape is the full kept extent and any grid/metadata contradiction is loud.
+                            combined_by_key[output_key] = _combine_array_from_partials(
+                                partial_futures,
+                                kind=kind,
+                                finalize=finalize,
+                                hint_axis=hint_axis,
+                                array_ndim=(
+                                    array_ndim if array_ndim is not None else len(partial_futures[0]["chunk_position"])
+                                ),
+                                op_name=op_name,
+                                global_shape=(
+                                    tuple(metadata.get("global_shape", ())) if metadata.get("global_shape") else None
+                                ),
+                                grid_extent=grid_extent,
                             )
                         else:
-                            logger.warning(
-                                f"topic_handler: unknown precompute kind {kind!r} for {output_key}, skipping"
+                            raise PrecomputeRuntimeError(
+                                f"topic_handler: unknown precompute kind {kind!r} for {output_key}, refusing to deliver"
                             )
-                    # For precompute, the dask array *is* the partials. There's no global tiling.
-                    # The callback consumes these blocks via the registered callback (the callback gets the stacked
-                    # partials as its array). Multiple reductions on the same array produce multiple dask chunks.
-                    # We dispatch the first one to the callback. If only one reduction is registered, the callback sees
-                    # a single dask array.
-                    darr = darr_chunks[0]
-                    if len(darr_chunks) > 1:
-                        # Multiple reductions: wrap as a tuple of dask arrays and stash on the darr for the callback to
-                        # iterate. Most realistic callbacks register exactly one reduction, so this branch is uncommon.
-                        darr.extra_precomputed_chunks = darr_chunks[1:]
+                    # Every combined array must stay alive for the callback(s) that hold it.
+                    _weak_self.client.persist(list(combined_by_key.values()))
                     logger.debug(
-                        f"topic_handler: precompute path produced {len(darr_chunks)} reduction chunk(s) "
-                        f"with shapes {[c.shape for c in darr_chunks]}"
+                        f"topic_handler: precompute path produced {len(combined_by_key)} reduction chunk(s) "
+                        f"with shapes {[c.shape for c in combined_by_key.values()]}"
                     )
+                    # Build the per-callback dispatch view: each callback sees ITS OWN combined array per recorded
+                    # reduction (B5). The view neutralizes the callback's re-application (B3/B4) and refuses calls
+                    # that were never recorded (B6).
+                    views = _weak_self._build_callback_views(array_name, iteration, combined_by_key)
                 else:
+                    views = {}
                     # Full-chunk path: ``futures`` carries one entry per bridge with the full-chunk shape.
                     # Tile them into a single dask array.
                     parts = sorted(futures, key=lambda p: p["chunk_position"])
@@ -505,9 +607,8 @@ class Deisa(IDeisa):
                     darr = _weak_self.__tile_dask_blocks(
                         darr_chunks, _weak_self.arrays_metadata[array_name]["global_shape"]
                     )
-
-                # tell the scheduler that gc must *not* collect the futures used by this dask array
-                _weak_self.client.persist(darr)
+                    # tell the scheduler that gc must *not* collect the futures used by this dask array
+                    _weak_self.client.persist(darr)
 
                 # dispatch to interested callbacks
                 for callback_id in list(_weak_self._callbacks_by_array.get(array_name, [])):
@@ -518,8 +619,17 @@ class Deisa(IDeisa):
                     if array_name not in cb_data["state"]:
                         continue
 
+                    if precomputed:
+                        cb_darr = views.get(callback_id)
+                        if cb_darr is None:
+                            # This callback has no precomputed reduction for this array (its branches are all on
+                            # another array): nothing to deliver here.
+                            continue
+                    else:
+                        cb_darr = darr
+
                     try:
-                        _weak_self._process_callback(callback_id, cb_data, array_name, darr, iteration)
+                        _weak_self._process_callback(callback_id, cb_data, array_name, cb_darr, iteration)
                     except Exception as e:
                         _weak_self._handle_callback_exception(callback_id, cb_data, e)
 
@@ -527,6 +637,85 @@ class Deisa(IDeisa):
                 logger.error(f"topic_handler: topic handler error array_name={array_name}, e={e}")
 
         return topic_handler
+
+    def _dispatch_sig_for(
+        self, array_name: str, output_key: str, hint_axis: Optional[Tuple[int, ...]], array_ndim: Optional[int]
+    ) -> Tuple[int, ...]:
+        """Return the runtime dispatch signature recorded for ``output_key``.
+
+        The registered branches' descriptors were recorded with the branch
+        builder's ``dispatch_sig`` (``()`` for full reductions and window
+        reads, the sorted axes otherwise). A same-``output_key`` reduction
+        is recorded identically by every callback that holds it (merged
+        branches dedup to one signature), so the first descriptor found is
+        authoritative. Falls back to re-normalizing the payload ``hint_axis``
+        when no callback descriptor matches (e.g. the callback was
+        unregistered after branches were filed): the payload's ``chunk_axis``
+        is then the only available signature source.
+
+        - ``:param array_name:`` The array the event was published for.
+        - ``:param output_key:`` The reduction's unique output key.
+        - ``:param hint_axis:`` The payload's ``chunk_axis`` (fallback source).
+        - ``:param array_ndim:`` The array's ndim (fallback normalization).
+        - ``:return:`` The dispatch signature tuple (``()`` = full reduction).
+        """
+        for descriptors in self._callback_reductions.values():
+            for key, _op, axes_sig, _kind in descriptors.get(array_name, []):
+                if key == output_key:
+                    return axes_sig
+        if hint_axis is None or array_ndim is None:
+            return ()
+        return _normalize_reduction_axis(hint_axis, array_ndim)
+
+    def _build_callback_views(self, array_name: str, iteration: int, combined_by_key: Dict[str, Any]) -> Dict[str, Any]:
+        """Build the per-callback dispatch view for this array's event.
+
+        A callback that registered reductions on ``array_name`` receives a
+        ``_PrecomputedDeisaArray`` whose signature map routes ITS OWN
+        reduction calls to the combined array the analyzer recorded for that
+        callback and that reduction (B5, B6). Callbacks whose branches all
+        live on other arrays get no view here (nothing to deliver).
+        """
+        views: Dict[str, Any] = {}
+        for callback_id in list(self._callbacks_by_array.get(array_name, [])):
+            descriptors = self._callback_reductions.get(callback_id, {}).get(array_name)
+            if not descriptors:
+                # No precomputed reduction of this callback reads this array.
+                continue
+            signatures: Dict[Tuple[str, Tuple[int, ...]], Any] = {}
+            reapply: Set[Tuple[str, Tuple[int, ...]]] = set()
+            first = None
+            for output_key, op_name, axes_sig, kind in descriptors:
+                array = combined_by_key.get(output_key)
+                if array is None:
+                    raise PrecomputeRuntimeError(
+                        f"_build_callback_views: callback {callback_id!r} recorded reduction {output_key!r} "
+                        f"(op {op_name!r}, axis {axes_sig!r}) on array {array_name!r} but the topic event "
+                        f"carried no partials for it (delivered keys: {sorted(combined_by_key)}). "
+                        f"Refusing to deliver a callback with a missing reduction."
+                    )
+                sig = (op_name, axes_sig)
+                if sig not in signatures:
+                    signatures[sig] = array
+                if kind == "scalar" and axes_sig == ():
+                    reapply.add(sig)
+                if first is None:
+                    first = array
+            if first is None:
+                continue
+            views[callback_id] = _PrecomputedDeisaArray(
+                t=iteration,
+                signatures=signatures,
+                reapply=reapply,
+                registered_ndim=len(self.arrays_metadata[array_name].get("global_shape", ())),
+                dask=first.dask,
+                name=first.name,
+                chunks=first.chunks,
+                dtype=first.dtype,
+                meta=first._meta,
+                shape=first.shape,
+            )
+        return views
 
     def _process_callback(self, callback_id, cb_data, array_name: str, darr: da.Array, iteration: int):
         state = cb_data["state"]
@@ -539,7 +728,7 @@ class Deisa(IDeisa):
                 f"{iteration} which is before last seen iteration "
                 f"{entry['last_iteration']}. Iterations must be monotonically increasing."
             )
-        entry["window"].append(build_deisa_array(darr, iteration))
+        entry["window"].append(darr if isinstance(darr, DeisaArray) else build_deisa_array(darr, iteration))
         entry["changed"] = True
         entry["last_iteration"] = iteration
 
