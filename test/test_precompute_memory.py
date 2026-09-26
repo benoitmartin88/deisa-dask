@@ -87,6 +87,22 @@ def _make_callback(op: str, callback_results: List[float]) -> Callable:
     return fn
 
 
+def _make_compute_callback(body: str, results: List[Any]) -> Callable:
+    """Compile ``def _cb(window): <body>`` appending into ``results``.
+
+    ``body`` is the dedented statement list (``textwrap.indent`` re-indents
+    it inside the function). Used by the multi-reduction / axis e2e tests
+    whose callbacks call several reductions and store their outputs.
+    """
+    src = textwrap.dedent(f"def _cb(window):\n{textwrap.indent(body, '    ')}")
+    scope: Dict[str, Any] = {"results": results}
+    code = compile(src, "<test_precompute_memory>", "exec")
+    exec(code, scope)
+    fn = scope["_cb"]
+    fn.__source__ = src  # type: ignore[attr-defined]
+    return fn
+
+
 @pytest.fixture(scope="function")
 def env_setup_2workers():
     """Two-worker LocalCluster + matching client for end-to-end tests."""
@@ -120,38 +136,19 @@ class TestPrecomputeMemory:
     """
 
     @pytest.mark.parametrize(
-        "op, assert_result",
-        [
-            pytest.param(
-                "sum",
-                lambda x: np.isfinite(x) and x > 0,
-                id="sum",
-            ),
-            pytest.param(
-                "mean",
-                lambda x: np.isfinite(x) and 0.0 < x < 1.0,
-                id="mean",
-            ),
-            pytest.param(
-                "var",
-                lambda x: np.isfinite(x) and x >= 0.0,
-                id="var",
-            ),
-            pytest.param(
-                "std",
-                lambda x: np.isfinite(x) and x >= 0.0,
-                id="std",
-            ),
-        ],
+        "op",
+        ["sum", "mean", "var", "std"],
     )
-    def test_precompute_worker_only_sees_partials(self, env_setup_2workers, op, assert_result):
+    def test_precompute_worker_only_sees_partials(self, env_setup_2workers, op):
         """With a callback that reduces the global chunk to a scalar via
         ``arr.<op>()``, only the per-bridge partial (scalar/dict-blob size,
         ~8 bytes) should appear on workers. The full chunk (~32 MB) must NOT.
 
-        Parametrized over ``sum`` / ``mean`` / ``var`` / ``std``; each param
-        asserts the correctness of its own reduction result via
-        ``assert_result``.
+        Parametrized over ``sum`` / ``mean`` / ``var`` / ``std``; the
+        callback result is asserted against the true global value computed
+        from the same data ``generate_data`` returned (T-B1: the pre-fix
+        ``var``/``std`` predicates were ``x >= 0.0``, which the buggy ``0.0``
+        result satisfied).
         """
         client, cluster = env_setup_2workers
         # Use a chunk big enough that "big" vs "small" is unmistakable.
@@ -190,8 +187,8 @@ class TestPrecomputeMemory:
         before_max = max(_largest_key_per_worker(before).values())
         assert before_max == 0, f"Workers should start empty, but found max key of {before_max} bytes: {before}"
 
-        # Send one iteration.
-        sim.generate_data(array_name, iteration=1, update_workers=True)
+        # Send one iteration and keep the global ground-truth array.
+        global_data = sim.generate_data(array_name, iteration=1, update_workers=True)
 
         # Wait for the callback to fire (it sets callback_results).
         assert wait_for(lambda: len(callback_results) >= 1, timeout=30), "callback was not called within 30s"
@@ -215,12 +212,15 @@ class TestPrecomputeMemory:
             )
 
         # The callback must have fired exactly once (one iteration) and
-        # returned the correct reduction value for this op. generate_data
-        # fills the array with random values in [0, 1), so per-op ranges
-        # differ (see the assertion predicate above).
+        # returned the TRUE reduction value for this op (B1 regression: var/std
+        # used to deliver 0.0, which the old ``x >= 0.0`` predicates accepted).
+        # ``generate_data`` fills the array with random values in [0, 1).
         assert len(callback_results) == 1, f"Expected exactly one callback invocation, got {len(callback_results)}"
-        assert assert_result(callback_results[0]), (
-            f"callback result {callback_results[0]!r} failed the {op!r} correctness predicate"
+        truth = {"sum": np.sum, "mean": np.mean, "var": np.var, "std": np.std}[op](global_data)
+        assert np.isclose(callback_results[0], truth, rtol=1e-5, atol=1e-9), (
+            f"callback result {callback_results[0]!r} is not the true {op!r} of the global data "
+            f"(expected {truth!r}). The precompute delivery must return the combined FINAL value, "
+            f"never a value a re-applied callback op computes from a mis-shaped delivered array."
         )
 
         # NOTE: we deliberately do NOT call deisa.execute_callbacks() here:
@@ -351,3 +351,230 @@ class TestPrecomputeMemory:
         # by accident -- a full-chunk sum equals the global sum).
         assert x_shape == (2, 1, 16)
         assert y_shape == (2, 1, 16)
+
+    def test_multi_reduction_callback_receives_all_reductions(self, env_setup_2workers):
+        """T-B2: a 3-reduction callback receives ALL THREE true values.
+
+        Pre-fix only the FIRST reduction's partials were delivered to the
+        callback (`darr = darr_chunks[0]`); the mean/max callbacks then ran on
+        the sum-stack artifact and returned values ~4e6 relative error from
+        the truth.
+        """
+        client, cluster = env_setup_2workers
+        chunk_shape = (2048, 2048)
+        global_shape = (chunk_shape[0] * 2, chunk_shape[1])
+        array_name = "temperature"
+
+        sim = TestSimulation(
+            client,
+            mpi_parallelism=(2, 1),
+            arrays_metadata={
+                array_name: {
+                    "global_shape": global_shape,
+                    "chunk_shape": chunk_shape,
+                },
+            },
+            wait_for_go=False,
+        )
+        deisa = Deisa(wait_for_go=False)
+
+        results: List[Any] = []
+        deisa.register(array_name)(
+            _make_compute_callback(
+                "arr = window[-1]\n"
+                "s = arr.sum().compute()\n"
+                "m = arr.mean().compute()\n"
+                "mx = arr.max().compute()\n"
+                "results.append((float(s), float(m), float(mx)))",
+                results,
+            )
+        )
+
+        time.sleep(0.5)
+        global_data = sim.generate_data(array_name, iteration=1, update_workers=True)
+
+        assert wait_for(lambda: len(results) >= 1, timeout=30), "callback was not called within 30s"
+        s, m, mx = results[0]
+        assert np.isclose(s, float(np.sum(global_data)), rtol=1e-5, atol=1e-9), f"sum {s} != {np.sum(global_data)}"
+        assert np.isclose(m, float(np.mean(global_data)), rtol=1e-5, atol=1e-9), f"mean {m} != {np.mean(global_data)}"
+        assert np.isclose(mx, float(np.max(global_data)), rtol=1e-5, atol=1e-9), f"max {mx} != {np.max(global_data)}"
+
+    def test_same_op_axis_pairs_survive_end_to_end(self, env_setup_2workers):
+        """T-B3 e2e: ``arr.sum()`` + ``arr.sum(axis=0)`` both correct.
+
+        Pre-fix both hints carried output_key ``f-sum`` (B3), one branch
+        overwrote the other in the bridge's ``output_key`` index, and the
+        callback received a wrong shape (or an exception) for the axis
+        reduction.
+        """
+        client, cluster = env_setup_2workers
+        chunk_shape = (2048, 2048)
+        global_shape = (chunk_shape[0] * 2, chunk_shape[1])
+        array_name = "temperature"
+
+        sim = TestSimulation(
+            client,
+            mpi_parallelism=(2, 1),
+            arrays_metadata={
+                array_name: {
+                    "global_shape": global_shape,
+                    "chunk_shape": chunk_shape,
+                },
+            },
+            wait_for_go=False,
+        )
+        deisa = Deisa(wait_for_go=False)
+
+        results: List[Any] = []
+        deisa.register(array_name)(
+            _make_compute_callback(
+                "arr = window[-1]\n"
+                "s = arr.sum().compute()\n"
+                "s0 = arr.sum(axis=0).compute()\n"
+                "results.append((float(s), np.asarray(s0)))",
+                results,
+            )
+        )
+
+        time.sleep(0.5)
+        global_data = sim.generate_data(array_name, iteration=1, update_workers=True)
+
+        assert wait_for(lambda: len(results) >= 1, timeout=30), "callback was not called within 30s"
+        s, s0 = results[0]
+        truth0 = np.sum(global_data, axis=0)
+        assert np.isclose(s, float(np.sum(global_data)), rtol=1e-5, atol=1e-9), f"sum {s} != {np.sum(global_data)}"
+        assert s0.shape == truth0.shape, f"sum(axis=0) shape {s0.shape} != truth {truth0.shape}"
+        assert np.allclose(s0, truth0, rtol=1e-5, atol=1e-9), "sum(axis=0) values differ from truth"
+
+    def test_axis_reductions_end_to_end(self, env_setup_2workers):
+        """T-B4 e2e: ``arr.mean(axis=0)`` and ``arr.sum(axis=1)`` on the
+        (2, 1) grid.
+
+        ``mean(axis=0)`` reduces over the 2 row-strips (red grid level 0,
+        kept level extent 1); ``sum(axis=1)`` keeps grid level 0 (Phase B
+        concatenation over the 2 row-strips along data axis 0). Pre-fix these
+        crashed or silently returned wrong shapes/values.
+        """
+        client, cluster = env_setup_2workers
+        chunk_shape = (2048, 2048)
+        global_shape = (chunk_shape[0] * 2, chunk_shape[1])
+        array_name = "temperature"
+
+        sim = TestSimulation(
+            client,
+            mpi_parallelism=(2, 1),
+            arrays_metadata={
+                array_name: {
+                    "global_shape": global_shape,
+                    "chunk_shape": chunk_shape,
+                },
+            },
+            wait_for_go=False,
+        )
+        deisa = Deisa(wait_for_go=False)
+
+        results: List[Any] = []
+        deisa.register(array_name)(
+            _make_compute_callback(
+                "arr = window[-1]\n"
+                "m0 = arr.mean(axis=0).compute()\n"
+                "s1 = arr.sum(axis=1).compute()\n"
+                "results.append((np.asarray(m0), np.asarray(s1)))",
+                results,
+            )
+        )
+
+        time.sleep(0.5)
+        global_data = sim.generate_data(array_name, iteration=1, update_workers=True)
+
+        assert wait_for(lambda: len(results) >= 1, timeout=30), "callback was not called within 30s"
+        m0, s1 = results[0]
+        truth_m0 = np.mean(global_data, axis=0)
+        truth_s1 = np.sum(global_data, axis=1)
+        assert m0.shape == truth_m0.shape, f"mean(axis=0) shape {m0.shape} != truth {truth_m0.shape}"
+        assert np.allclose(m0, truth_m0, rtol=1e-5, atol=1e-9), "mean(axis=0) values differ from truth"
+        assert s1.shape == truth_s1.shape, f"sum(axis=1) shape {s1.shape} != truth {truth_s1.shape}"
+        assert np.allclose(s1, truth_s1, rtol=1e-5, atol=1e-9), "sum(axis=1) values differ from truth"
+
+    def test_multiple_callbacks_same_array_each_correct(self, env_setup_2workers):
+        """T-B5: TWO callbacks on the SAME array each get their OWN result.
+
+        Pre-fix ``set_task_branches`` blindly overwrote the per-array branch
+        list, so only the LAST registered callback's branches were executed
+        and the first callback computed ``sum()`` of the other's mean blobs.
+        """
+        client, cluster = env_setup_2workers
+        chunk_shape = (2048, 2048)
+        global_shape = (chunk_shape[0] * 2, chunk_shape[1])
+        array_name = "temperature"
+
+        sim = TestSimulation(
+            client,
+            mpi_parallelism=(2, 1),
+            arrays_metadata={
+                array_name: {
+                    "global_shape": global_shape,
+                    "chunk_shape": chunk_shape,
+                },
+            },
+            wait_for_go=False,
+        )
+        deisa = Deisa(wait_for_go=False)
+
+        sum_results: List[float] = []
+        mean_results: List[float] = []
+        deisa.register(array_name)(_make_callback("sum", sum_results))
+        deisa.register(array_name)(_make_callback("mean", mean_results))
+
+        time.sleep(0.5)
+        global_data = sim.generate_data(array_name, iteration=1, update_workers=True)
+
+        assert wait_for(lambda: len(sum_results) >= 1 and len(mean_results) >= 1, timeout=30), (
+            "callbacks were not both called within 30s"
+        )
+        assert np.isclose(sum_results[0], float(np.sum(global_data)), rtol=1e-5, atol=1e-9), (
+            f"sum callback {sum_results[0]} != {np.sum(global_data)}"
+        )
+        assert np.isclose(mean_results[0], float(np.mean(global_data)), rtol=1e-5, atol=1e-9), (
+            f"mean callback {mean_results[0]} != {np.mean(global_data)}"
+        )
+
+    @pytest.mark.parametrize("expr", ["(arr * arr).sum()", "arr[2:5].sum()"])
+    def test_registration_refuses_chained_reduction(self, env_setup_2workers, expr):
+        """T-F1: registration REFUSES non-direct reductions loudly.
+
+        ``(arr * arr).sum()`` and ``arr[2:5].sum()`` cannot be reconstructed
+        on the callback side (the unrewritten callback re-applies the chain on
+        the partials, e.g. ``(sum x)^2`` instead of ``sum x^2``). Pre-fix,
+        registration SUCCEEDED and the value was silently wrong end-to-end;
+        now it raises ``UnsupportedReductionError`` at registration time.
+        """
+        from deisa.dask.precompute_analyzer import UnsupportedReductionError
+
+        client, cluster = env_setup_2workers
+        chunk_shape = (2048, 2048)
+        global_shape = (chunk_shape[0] * 2, chunk_shape[1])
+        array_name = "temperature"
+
+        # The bridges must be alive for Deisa(wait_for_go=False) to handshake;
+        # they are never sent data in this test (registration itself raises).
+        _sim = TestSimulation(
+            client,
+            mpi_parallelism=(2, 1),
+            arrays_metadata={
+                array_name: {
+                    "global_shape": global_shape,
+                    "chunk_shape": chunk_shape,
+                },
+            },
+            wait_for_go=False,
+        )
+        deisa = Deisa(wait_for_go=False)
+
+        results: List[Any] = []
+        cb = _make_compute_callback(
+            f"arr = window[-1]\ns = ({expr}).compute()\nresults.append(float(s))",
+            results,
+        )
+        with pytest.raises(UnsupportedReductionError):
+            deisa.register(array_name)(cb)
