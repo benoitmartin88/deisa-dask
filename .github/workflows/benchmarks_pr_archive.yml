@@ -13,8 +13,15 @@ jobs:
     steps:
       - uses: bencherdev/bencher@main
       - name: Archive closed PR branch with Bencher
+        env:
+          # Bound through env, never interpolated into the shell: github.head_ref is
+          # attacker-controlled for fork PRs, and a `${{ }}` expression inside `run:`
+          # still undergoes command substitution, so a branch named `$(cmd)` would
+          # execute on this privileged runner. See CVE-2023-49291.
+          PR_HEAD: ${{ github.head_ref }}
+          BENCHER_API_KEY: ${{ secrets.BENCHER_API_KEY }}
         run: |
           bencher archive \
           --project deisa-dask \
-          --key "${{ secrets.BENCHER_API_KEY }}" \
-          --branch "${{ github.head_ref }}"
+          --key "$BENCHER_API_KEY" \
+          --branch "$PR_HEAD"

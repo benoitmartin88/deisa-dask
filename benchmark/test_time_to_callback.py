@@ -149,7 +149,7 @@ def _mpi_bridge_main(array_name: str, n_sends: int):
             if remaining <= 0:
                 raise RuntimeError(
                     f"[{rank}/{size}] timeout waiting for feedback on timestep {i} "
-                    f"after {t0 - t0_total:.1f}s total (total send loop {time.monotonic() - t0_total:.1f}s)"
+                    f"timestep {i}; send loop has run {time.monotonic() - t0_total:.1f}s"
                 )
             time.sleep(FEEDBACK_POLL_INTERVAL)
 
@@ -266,10 +266,14 @@ def test_time_to_callback_mpi(nb_bridges: int, benchmark, env_setup):
                 # Signal back to the bridge that this timestep's callback has
                 # completed. The bridge.get() call on the MPI side waits for
                 # this entry in the feedback queue.
-                deisa.set(array_name, iteration, timestep=iteration)  # noqa: F821
+                # NOTE: do NOT `del deisa` after execute_callbacks() below. This
+                # callback closes over `deisa`, so deleting the name empties the
+                # closure cell and any late/retried topic message would raise
+                # NameError. Letting the local fall out of scope at function exit
+                # releases the object identically.
+                deisa.set(array_name, iteration, timestep=iteration)
 
             deisa.execute_callbacks()
-            del deisa
 
         thread = threading.Thread(target=deisa_side)
         thread.start()
@@ -300,38 +304,41 @@ def test_time_to_callback_mpi(nb_bridges: int, benchmark, env_setup):
     benchmark.extra_info["n_sends_per_round"] = N_SENDS
 
     if results and len(results) > 0:
-        # Report in nanoseconds (true send -> callback latency).
-        avg_ms = np.mean(results)
-        median_ms = np.median(results)
-        min_ms = np.min(results)
-        max_ms = np.max(results)
-        std_ms = np.std(results)
+        # The raw samples are in nanoseconds (true send -> callback latency).
+        avg_ns = np.mean(results)
+        median_ns = np.median(results)
+        min_ns = np.min(results)
+        max_ns = np.max(results)
+        std_ns = np.std(results)
         seventyfive = np.quantile(results, 0.75)
         ninty = np.quantile(results, 0.90)
         nintynine = np.quantile(results, 0.99)
         nintyninenine = np.quantile(results, 0.999)
 
-        # add results to pytest-benchmark in milliseconds
-        benchmark.extra_info["true_latency_ms"] = {
-            "avg": avg_ms / 1e6,
-            "median": median_ms / 1e6,
-            "min": min_ms / 1e6,
-            "max": max_ms / 1e6,
-            "std": std_ms / 1e6,
+        # Human-readable summary in milliseconds.
+        true_latency_ms = {
+            "avg": avg_ns / 1e6,
+            "median": median_ns / 1e6,
+            "min": min_ns / 1e6,
+            "max": max_ns / 1e6,
+            "std": std_ns / 1e6,
             "75": seventyfive / 1e6,
             "90": ninty / 1e6,
             "99": nintynine / 1e6,
             "99.9": nintyninenine / 1e6,
             "n": len(results),
         }
+        benchmark.extra_info["true_latency_ms"] = true_latency_ms
 
         print(
             f"\nsend->callback ({nb_bridges} MPI bridges, "
             f"{N_SENDS} sends/round): "
-            f"avg={avg_ms:.3f}ms, median={median_ms:.3f}ms, "
-            f"min={min_ms:.3f}ms, max={max_ms:.3f}ms, std={std_ms:.3f}ms, "
-            f"75={seventyfive}ms, 90={ninty}ms, 99={nintynine}ms, 99.9={nintyninenine}ms, "
-            f"(n={len(results)})"
+            f"avg={true_latency_ms['avg']:.3f}ms, median={true_latency_ms['median']:.3f}ms, "
+            f"min={true_latency_ms['min']:.3f}ms, max={true_latency_ms['max']:.3f}ms, "
+            f"std={true_latency_ms['std']:.3f}ms, "
+            f"75={true_latency_ms['75']:.3f}ms, 90={true_latency_ms['90']:.3f}ms, "
+            f"99={true_latency_ms['99']:.3f}ms, 99.9={true_latency_ms['99.9']:.3f}ms, "
+            f"(n={true_latency_ms['n']})"
         )
 
         # output the results using Bencher Metric Format (https://bencher.dev/docs/reference/bencher-metric-format)
@@ -343,13 +350,15 @@ def test_time_to_callback_mpi(nb_bridges: int, benchmark, env_setup):
         except (FileNotFoundError, json.JSONDecodeError):
             bencher = {}
 
+        # Bencher's built-in `latency` measure is in NANOSECONDS, so the raw ns
+        # samples are used here deliberately (do NOT feed it the ms values).
         bencher[f"time-to-callback-{nb_bridges}"] = {
             "latency": {
-                "value": avg_ms,
-                "lower_value": min_ms,
-                "upper_value": max_ms,
+                "value": avg_ns,
+                "lower_value": min_ns,
+                "upper_value": max_ns,
             },
-            "50": {"value": median_ms},
+            "50": {"value": median_ns},
             "75": {"value": seventyfive},
             "90": {"value": ninty},
             "99": {"value": nintynine},
