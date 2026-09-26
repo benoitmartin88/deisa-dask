@@ -34,7 +34,6 @@ mpi = [
 benchmark = [
     "pytest",
     "pytest-benchmark",
-    "pytest-timeout",
 ]
 
 [project.urls]
