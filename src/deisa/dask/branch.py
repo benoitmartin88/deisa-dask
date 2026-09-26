@@ -57,7 +57,12 @@ import numpy as np
 import dask.array as da
 from dask import delayed
 from dask.array.reductions import mean_agg, moment_agg
-from deisa.dask.precompute_analyzer import PrecomputeError, analyze_callback
+from deisa.dask.precompute_analyzer import (
+    PrecomputeError,
+    UnsupportedReductionError,
+    _match_source_arrays,
+    analyze_callback,
+)
 from deisa.dask.task_branches import (
     _aggregate_output_feeds_other_reduction,
     _base_for_aggregate,
@@ -90,6 +95,11 @@ class BranchSpec:
         bridge uses it to namespace its scatter key and the Deisa
         topic handler uses it to route the per-bridge partials back to
         the same branch.
+    input_name : str
+        Registered array name the branch is rooted at (e.g. ``"a"``).
+        The Deisa side groups branches per array using this field
+        (never by parsing ``output_key``) and files each group with
+        ``set_task_branches`` under its own array name.
     output_kind : str
         One of ``"scalar"`` / ``"mean"`` / ``"moment"``. Drives the
         Deisa-side combine graph: ``scalar`` -> ``da.stack`` + dask sum,
@@ -122,6 +132,7 @@ class BranchSpec:
     """
 
     output_key: str
+    input_name: str
     output_kind: str
     branch_func: Callable[[Any], Any]
     chunk_axis: Optional[Tuple[int, ...]]
@@ -159,12 +170,12 @@ def _analyze_callback_for_branches(callback: Callable, registered_arrays: Dict[s
         # global shape into uniform chunks of ``chunk_shape``.
         chunk_shape = meta.get("chunk_shape")
         if global_shape is not None and chunk_shape is not None:
-            array_stub = da.zeros(global_shape, chunks=chunk_shape, dtype=np.float64)
+            array_stub = da.zeros(global_shape, chunks=chunk_shape, dtype=np.float64, name=f"deisa-stub-{arr_name}")
         else:
             # Fallback for arrays without full metadata (e.g. opaque helpers or dynamically constructed arrays).
             # The stub's exact size doesn't matter. Only the graph structure matters for precompute analysis.
             # Shape and chunks must be consistent (same dimensionality).
-            array_stub = da.zeros((10, 10), chunks=(5, 5), dtype=np.float64)
+            array_stub = da.zeros((10, 10), chunks=(5, 5), dtype=np.float64, name=f"deisa-stub-{arr_name}")
         # Wrap in DeisaArray so the analyzer sees the full attribute surface (.t, .timestep, dask Array methods)
         # that the callback uses at runtime.
         stubs[arr_name] = build_deisa_array(array_stub, timestep=0)
@@ -372,14 +383,6 @@ def _analyze_branch(callback: Callable, registered_arrays: Dict[str, Any], preco
     if not hints:
         return []
 
-    # Pick the registered-array ndim to attach to branches.
-    primary_arr: Optional[Any] = None
-    array_ndim = 0
-    try:
-        primary_arr = next(iter(registered_arrays.values()))
-        array_ndim = int(getattr(primary_arr, "ndim", 0))
-    except Exception:
-        pass
     # The chain walker needs at least one dask expression to walk. The AST walker builds one dask_arrays entry per
     # compute boundary. If there's nothing in the list, the registered placeholder is the only thing available,
     # but its graph is the root layer (no chain). We fall back to the length-1 path in that case.
@@ -387,19 +390,24 @@ def _analyze_branch(callback: Callable, registered_arrays: Dict[str, Any], preco
     # several graphs (one per boundary, e.g. ``s=arr.sum(); m=arr.mean()``) or one graph with several aggregate
     # layers (e.g. ``(arr*arr).sum() + arr.max()``). Each candidate maps the aggregate layer's canonical op name
     # (matching the hint's ``op_name``) to the (layer_name, graph) pair it belongs to.
-    aggregate_candidates: Dict[str, List[Tuple[str, Any]]] = {}
+    # Candidates are keyed by (array_name, op_name): two registered arrays each doing the same reduction
+    # (e.g. ``arr_a.sum()`` + ``arr_b.sum()``) contribute their OWN aggregate layers, so each folds its own
+    # chain instead of colliding on the bare op name.
+    aggregate_candidates: Dict[Tuple[str, str], List[Tuple[str, Any]]] = {}
     for arr_info in walker_dask_arrays:
         candidate = arr_info.get("array")
         if not hasattr(candidate, "__dask_graph__"):
             continue
         graph = candidate.__dask_graph__()
+        matched, _ = _match_source_arrays(candidate, registered_arrays)
+        candidates_array_name = matched[0] if matched else next(iter(registered_arrays), "f")
         for layer_name in graph.layers:
             if not _is_aggregate_layer(layer_name):
                 continue
             op_name = _op_for_aggregate_layer(graph, layer_name)
             if op_name is None:
                 continue
-            aggregate_candidates.setdefault(op_name, []).append((layer_name, graph))
+            aggregate_candidates.setdefault((candidates_array_name, op_name), []).append((layer_name, graph))
 
     # The chain walker folds multi-layer pointwise chains into one branch_func. A chain is unique by its
     # (agg-layer-name, length). Hints MUST be folded with their OWN aggregate layer (matched by op_name via the
@@ -410,6 +418,29 @@ def _analyze_branch(callback: Callable, registered_arrays: Dict[str, Any], preco
 
     branches: List[BranchSpec] = []
     for branch_dict in hints:
+        # Cross-array expressions (descending from >1 registered array) cannot be rebuilt from a single array's
+        # chunk-local partials -- the bridge only owns its own array's chunk. Refuse them up front (precompute=True)
+        # or fall back to the legacy full-chunk path (precompute=False, where the callback runs on workers with the
+        # full chunk present, so dask can compute the cross-array expression correctly).
+        if branch_dict.get("multi_source"):
+            if not precompute:
+                logger.warning(
+                    "analyze_branch: skipping cross-array reduction %s: the expression descends from registered "
+                    "array %r AND at least one other registered array; a chunk-local branch cannot compute it. "
+                    "Falling back to the full-chunk scatter path.",
+                    branch_dict.get("output_key"),
+                    branch_dict.get("array_name"),
+                )
+                continue
+            raise UnsupportedReductionError(
+                f"Cannot precompute reduction {branch_dict.get('output_key')!r} "
+                f"(op {branch_dict.get('op_name')!r}): the expression descends from registered array "
+                f"{branch_dict.get('array_name')!r} AND at least one other registered array. A chunk-local branch "
+                f"cannot compute a cross-array expression because each bridge only owns its own array's chunk. "
+                f"Redesign the callback so every reduction descends from exactly one registered array, or register "
+                f"with precompute=False to use the legacy full-chunk scatter path."
+            )
+
         try:
             chunk_func = pickle.loads(branch_dict["chunk_func_pickle"])
         except Exception as e:  # pragma: no cover - safety net
@@ -418,10 +449,14 @@ def _analyze_branch(callback: Callable, registered_arrays: Dict[str, Any], preco
                 continue
             raise
 
-        # Discover the partial's shape and dtype by running the branch_func on a numpy placeholder. The placeholder is
-        # the dask array's first chunk, materialized via .compute() so the numpy ops return numpy values (chunk_funcs
-        # are numpy ops, not callback code).
-        placeholder = primary_arr
+        # Resolve THIS hint's own registered-array stub: placeholder and ndim are per-array, so a multi-array
+        # callback (e.g. ``arr_a.sum()`` + ``arr_b.sum()``) builds each branch with its OWN array's placeholder and
+        # ndim instead of the first registered array's. The placeholder is the dask array's first chunk, materialized
+        # via .compute() so the numpy ops return numpy values (chunk_funcs are numpy ops, not callback code).
+        hint_arr = branch_dict.get("array_name") or next(iter(registered_arrays), None)
+        array_stub = registered_arrays.get(hint_arr)
+        array_ndim = int(getattr(array_stub, "ndim", 0)) if array_stub is not None else 0
+        placeholder = array_stub
         if hasattr(placeholder, "compute"):
             try:
                 placeholder = placeholder.compute()
@@ -431,8 +466,8 @@ def _analyze_branch(callback: Callable, registered_arrays: Dict[str, Any], preco
                 # representative partial.
                 try:
                     placeholder = np.zeros(
-                        getattr(placeholder, "shape", (4, 4)),
-                        dtype=getattr(placeholder, "dtype", np.float64),
+                        getattr(array_stub, "shape", (4, 4)),
+                        dtype=getattr(array_stub, "dtype", np.float64),
                     )
                 except Exception:
                     placeholder = np.zeros((4, 4), dtype=np.float64)
@@ -477,25 +512,27 @@ def _try_chain_branch(
     branch: Dict[str, Any],
     array_ndim: int,
     placeholder: Optional[Any],
-    aggregate_candidates: Dict[str, List[Tuple[str, Any]]],
+    aggregate_candidates: Dict[Tuple[str, str], List[Tuple[str, Any]]],
     seen_chains: Dict[Tuple[str, int], Any],
 ) -> Optional[BranchSpec]:
     """Try to fold the branch's reduction into a chain-folded BranchSpec.
 
     Folding must use the aggregate layer that belongs to THIS branch:
-    the hint carries its canonical op name (``op_name``), and we match
-    it against the candidate aggregate layers collected from all walker
+    the hint carries its canonical op name (``op_name``) and its source
+    array (``array_name``), and we match the (array_name, op_name) pair
+    against the candidate aggregate layers collected from all walker
     graphs. Zero candidates (no foldable graph) or more than one
-    (duplicate op across boundaries, e.g. two ``sum`` reductions) make
-    the assignment ambiguous, so folding is refused and the caller
-    falls back to the length-1 path, which computes the branch's OWN
-    ``chunk_func``. Cross-array / constant upstreams also return
-    ``None`` via ``_walk_chain``.
+    (duplicate op across boundaries, e.g. two ``sum`` reductions on the
+    same array) make the assignment ambiguous, so folding is refused and
+    the caller falls back to the length-1 path, which computes the
+    branch's OWN ``chunk_func``. Cross-array / constant upstreams also
+    return ``None`` via ``_walk_chain``.
     """
     op_name = branch.get("op_name")
+    array_name = branch.get("array_name")
     if op_name is None:
         return None
-    candidates = aggregate_candidates.get(op_name, [])
+    candidates = aggregate_candidates.get((array_name, op_name), [])
     if len(candidates) != 1:
         return None
     agg_name, graph = candidates[0]
@@ -602,6 +639,7 @@ def _build_branch(
 
     return BranchSpec(
         output_key=branch["output_key"],
+        input_name=branch.get("array_name", ""),
         output_kind=kind,
         branch_func=chain_branch_func,
         chunk_axis=chunk_axis,
