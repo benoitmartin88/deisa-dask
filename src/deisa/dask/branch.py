@@ -459,7 +459,13 @@ def _analyze_branch(callback: Callable, registered_arrays: Dict[str, Any], preco
         placeholder = array_stub
         if hasattr(placeholder, "compute"):
             try:
-                placeholder = placeholder.compute()
+                # Always compute on the synchronous scheduler. Analysis is pure
+                # graph/partial bookkeeping and must never touch an ambient
+                # distributed client: if another test (or the caller) left
+                # dask.config scheduler at "dask.distributed" with a stale or
+                # unreachable Client, a bare .compute() blocks in the client's
+                # reconnect loop instead of failing fast.
+                placeholder = placeholder.compute(scheduler="sync")
             except Exception:
                 # If .compute() fails (e.g. no dask client in the CI worker process), fall back to a synthetic numpy
                 # array that matches the dask array's shape/dtype/chunks so the chunk_func still produces a

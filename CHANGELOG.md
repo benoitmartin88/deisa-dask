@@ -30,6 +30,9 @@ Types of changes:
 
 - Missing first callback(s) due to not waiting for `Deisa.execute_callbacks()`
 - Deisa: avoid exceptions raised from `__del__()`
+- Precompute: analyze branches on the synchronous scheduler, so branch analysis
+  never blocks on an ambient distributed `Client` (a stale client left by the
+  surrounding process made analysis hang instead of failing fast).
 
 ## [0.6.3]
 
