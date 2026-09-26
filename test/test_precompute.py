@@ -160,7 +160,7 @@ def test_compute_single_array_hints(source, expected_hint_keys, expected_axis) -
     assert _hint_keys(hints) == expected_hint_keys
     if expected_axis is not None:
         assert len(hints) == 1
-        assert hints[0]["keywords"].get("axis") == expected_axis
+        assert hints[0]["chunk_kwargs"].get("axis") == expected_axis
 
 
 @pytest.mark.parametrize(

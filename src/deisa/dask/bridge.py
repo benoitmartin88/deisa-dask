@@ -33,7 +33,7 @@ import uuid
 import zlib
 from collections import defaultdict, deque
 from numbers import Number
-from typing import Any, Deque, Dict, Final, Iterator, List, Mapping, Optional, Tuple, Union
+from typing import Any, Deque, Dict, Final, Iterator, List, Mapping, Optional, Union
 
 import numpy as np
 from deisa.core import IBridge, ICommunicator, validate_arrays_metadata
@@ -104,8 +104,6 @@ class Bridge(IBridge):
 
         # array_name -> branches for local execution (None = "not fetched yet")
         self._task_branches: Dict[str, Optional[List[BranchSpec]]] = {}
-        #  array_name -> output_key -> chunk_axis (derived once from branches; static)
-        self._chunk_axis_by_key: Dict[str, Dict[str, Optional[Tuple[int, ...]]]] = {}
         #  array_name -> output_key -> branch (BranchSpec)
         self._branch_by_key: Dict[str, Dict[str, Any]] = {}
 
@@ -380,7 +378,6 @@ class Bridge(IBridge):
                 chunk,
                 timestep,
                 precomputed_meta=precomputed_meta,
-                branches=branches,
             )
             return
 
@@ -424,9 +421,8 @@ class Bridge(IBridge):
             # Each entry pointing to the partial's reduced shape and dtype. The Deisa side reconstructs the dask graph
             # from these small partials. The full chunk never reaches the workers.
             #
-            # Build a per-output_key chunk_axis lookup. BranchSpec objects carry ``chunk_axis`` directly.
-            # Cached per array (static after registration) so it is not rebuilt on every send().
-            chunk_axis_by_key = self._get_chunk_axis_by_key(array_name, branches)
+            # Build a per-output_key chunk_axis lookup passed through the partial metadata
+            # (recorded by _scatter_partials from each BranchSpec).
             futures_payload: List[Dict[str, Any]]
             if all_partials_meta:
                 # Precompute path: emit one entry per (bridge, reduction). ``chunk_position`` here is the MPI coords of
@@ -440,7 +436,6 @@ class Bridge(IBridge):
                     futures_payload.extend(
                         _build_futures_payload(
                             partial_meta,
-                            chunk_axis_by_key,
                             gathered_data[bridge_idx]["chunk_position"],
                         )
                     )
@@ -480,7 +475,6 @@ class Bridge(IBridge):
         chunk: np.ndarray,
         timestep: int,
         precomputed_meta: Optional[Dict[str, Dict]] = None,
-        branches: Optional[List[BranchSpec]] = None,
     ):
         """
         Handle single-bridge array send without collective.
@@ -511,13 +505,8 @@ class Bridge(IBridge):
         # Build the topic event. On the precompute path, emit one entry per partial (with its reduced shape).
         # On the non-precompute path, emit one entry pointing at the full chunk.
         if precomputed_meta:
-            # BranchSpec carries the reduction's ``chunk_axis`` directly.
-            # The per-output_key lookup is cached per array (static after registration), so it is not rebuilt on every
-            # send.
-            chunk_axis_by_key = self._get_chunk_axis_by_key(array_name, branches or [])
             futures_payload = _build_futures_payload(
                 precomputed_meta,
-                chunk_axis_by_key,
                 self.arrays_metadata[array_name]["chunk_position"],
             )
         else:
@@ -636,6 +625,21 @@ class Bridge(IBridge):
             out = list(out.values())[0]
         return out
 
+    def _fetch_branches_bcast(self, array_name: str) -> Optional[List[BranchSpec]]:
+        """Mirror of the per-array bcast protocol: sub-comm rank 0 reads from the
+        handshake actor and broadcasts; every other participating rank receives via
+        bcast(None). Returns None when this bridge does not participate in the
+        array's sub-comm. Callers decide caching (None is NOT a cached result)."""
+        sub_comm = self._array_comms.get(array_name)
+        if sub_comm is None or sub_comm is _COMM_NULL:
+            return None
+        if sub_comm.Get_rank() == 0 and self.handshake is not None:
+            branches = self.handshake.get_task_branches(array_name)
+            sub_comm.bcast(branches, root=0)
+        else:
+            branches = sub_comm.bcast(None, root=0)
+        return branches
+
     def _get_task_branches(self, array_name: str) -> List[BranchSpec]:
         """
         Retrieve stored task hints for an array.
@@ -645,7 +649,7 @@ class Bridge(IBridge):
 
         - ``:param array_name:`` The array name to get hints for.
         - ``:return:`` List of reduction hints (each carrying a pickled chunk
-            callable, pickled aggregator, and the dask kwargs to apply).
+            callable and the dask kwargs to apply).
         """
         # Check cache first. Branches are fixed after registration. Once fetched (rank 0 reads from the handshake actor
         # and broadcasts to all ranks in the sub_comm), subsequent sends hit the cache and never touch the handshake or
@@ -654,26 +658,16 @@ class Bridge(IBridge):
         if cached is not None:
             return cached
 
-        # Cache miss -> rank 0 of the sub_comm reads branches from the handshake actor (only rank 0 has a
-        # client/handshake connection) and broadcasts to every rank. Branches are set by the analytics side during
-        # register_callback, which happens after bridge setup, so they are only available here (first send),
-        # not in __init__.
-        sub_comm = self._array_comms.get(array_name)
-        branches: List[BranchSpec] = []
-
-        if sub_comm is not None and sub_comm is not _COMM_NULL:
-            if sub_comm.Get_rank() == 0 and self.handshake is not None:
-                branches = self.handshake.get_task_branches(array_name)
-                sub_comm.bcast(branches, root=0)
-            else:
-                branches = sub_comm.bcast(None, root=0)
-
+        # Cache miss -> fetch via the shared per-array bcast protocol. On the wait_for_go path branches were
+        # already prefetched in __init__ (post-registration barrier + per-array bcast); this lazy path is the
+        # fallback for wait_for_go=False or a cache miss.
+        branches = self._fetch_branches_bcast(array_name)
+        if branches is not None:
             # Store unconditionally, including empty lists: a genuinely branch-less
             # array ([]) is a valid cached result meaning "no precompute, full-chunk
             # scatter" and must not be re-fetched on every send.
             self._task_branches[array_name] = branches
-
-        return branches
+        return branches or []
 
     def _prefetch_task_branches(self) -> None:
         """Prefetch static task-branches for every global array into the local cache.
@@ -691,35 +685,9 @@ class Bridge(IBridge):
         the array entirely (no bcast, cache left at the None sentinel).
         """
         for array_name in self._global_array_names:
-            sub_comm = self._array_comms.get(array_name)
-            if sub_comm is None or sub_comm is _COMM_NULL:
-                # This bridge does not participate in this array's sub-comm.
-                continue
-            if sub_comm.Get_rank() == 0 and self.handshake is not None:
-                branches = self.handshake.get_task_branches(array_name)
-                sub_comm.bcast(branches, root=0)
-            else:
-                branches = sub_comm.bcast(None, root=0)
-            self._task_branches[array_name] = branches
-
-    def _get_chunk_axis_by_key(
-        self, array_name: str, branches: List[BranchSpec]
-    ) -> Dict[str, Optional[Tuple[int, ...]]]:
-        """Return the ``output_key -> chunk_axis`` map for an array, building and caching it on first use.
-
-        The chunk_axis of each reduction depends only on the branches, which are static after registration.
-        Building it fresh on every ``send()`` is wasted work on the critical path. Cache it once per array.
-        """
-        cached = self._chunk_axis_by_key.get(array_name)
-        if cached is not None:
-            return cached
-
-        build: Dict[str, Optional[Tuple[int, ...]]] = {}
-        for b in branches:
-            build[b.output_key] = b.chunk_axis
-
-        self._chunk_axis_by_key[array_name] = build
-        return build
+            branches = self._fetch_branches_bcast(array_name)
+            if branches is not None:
+                self._task_branches[array_name] = branches
 
     def _get_branch_by_key(self, array_name: str, branches: List[BranchSpec]) -> Dict[str, Any]:
         """Return the ``output_key -> branch`` lookup for an array, building and caching it on first use.
@@ -794,6 +762,7 @@ class Bridge(IBridge):
                 "shape": red_shape,
                 "dtype": red_dtype,
                 "finalize": finalize,
+                "chunk_axis": branch.chunk_axis,
             }
 
         # Serialize for scatter (handles numpy arrays in dict values).
@@ -803,9 +772,9 @@ class Bridge(IBridge):
         # Mirrors the legacy ``_better_scatter`` pattern: client.sync when a Client is available, asyncio.run otherwise
         # (rank-0 only has the Client; non-rank-0 bridges run the scatter from a fresh event loop).
         if self.client is not None:
-            _, who_has, nbytes = self.client.sync(self._scatter_to_workers_async, target_worker, payload2)
+            who_has, nbytes = self.client.sync(self._scatter_to_workers_async, target_worker, payload2)
         else:
-            _, who_has, nbytes = asyncio.run(self._scatter_to_workers_async(target_worker, payload2))
+            who_has, nbytes = asyncio.run(self._scatter_to_workers_async(target_worker, payload2))
 
         future_keys = list(payload.keys())
         return {
@@ -818,9 +787,9 @@ class Bridge(IBridge):
         }
 
     async def _scatter_to_workers_async(self, worker: str, data: Dict[str, Any]):
-        """Async helper: scatter ``data`` to a single worker. Returns (ok, who_has, nbytes)."""
+        """Async helper: scatter ``data`` to a single worker. Returns (who_has, nbytes)."""
         _, who_has, nbytes = await scatter_to_workers([worker], data)
-        return True, who_has, nbytes
+        return who_has, nbytes
 
     def _execute_operations_on_chunk(self, chunk: np.ndarray, branches: List["BranchSpec"]) -> Dict[str, Any]:
         """
@@ -852,22 +821,19 @@ class Bridge(IBridge):
 
 def _build_futures_payload(
     meta: Mapping[str, Mapping[str, Any]],
-    chunk_axis_by_key: Mapping[str, Any],
     chunk_position: Any,
 ) -> List[Dict[str, Any]]:
     """Build per-reduction ``futures`` entries for a precompute topic event.
 
     One entry per reduction in ``meta`` (``{output_key: {future, shape, dtype,
-    kind?, finalize?}}``), carrying the partial's reduced shape/dtype, the
-    reduction's ``chunk_axis`` and the caller-provided ``chunk_position``.
-    Shared by :meth:`Bridge.send` (multi-bridge gather) and
+    kind?, finalize?, chunk_axis?}}``), carrying the partial's reduced
+    shape/dtype, the reduction's ``chunk_axis`` and the caller-provided
+    ``chunk_position``. Shared by :meth:`Bridge.send` (multi-bridge gather) and
     :meth:`Bridge._direct_send` (single-bridge fast path) so both emit
-    byte-identical payloads. ``chunk_axis_by_key`` is the cached per-array
-    ``output_key -> chunk_axis`` map from :meth:`Bridge._get_chunk_axis_by_key`.
+    byte-identical payloads.
 
     - ``:param meta:`` Per-reduction precompute metadata
-        (``{output_key: {"future", "shape", "dtype", "kind"?, "finalize"?}}``).
-    - ``:param chunk_axis_by_key:`` Cached ``output_key -> chunk_axis`` map.
+        (``{output_key: {future, shape, dtype, kind?, finalize?, chunk_axis?}}``).
     - ``:param chunk_position:`` The MPI coordinates of the bridge that
         contributed this partial (used to rebuild the nested chunk-grid layout).
     - ``:return:`` The ``futures`` payload list for the topic event.
@@ -880,7 +846,7 @@ def _build_futures_payload(
             "kind": info.get("kind", "scalar"),
             "finalize": info.get("finalize"),
             "chunk_position": chunk_position,
-            "chunk_axis": chunk_axis_by_key.get(output_key),
+            "chunk_axis": info.get("chunk_axis"),
             "output_key": output_key,
         }
         for output_key, info in meta.items()

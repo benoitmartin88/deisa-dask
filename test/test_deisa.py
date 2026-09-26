@@ -385,7 +385,6 @@ class TestUsingDaskCluster:
             self.check_array("pressure", state, i, expected)
             self.check_array("density", state, i, expected)
 
-
     class MapBlocks(RegisterAndCheck):
         def register_cb(self, state, deisa, expected_window_size: dict[str, int | None]):
             def map_block_function(block, block_info=None):
