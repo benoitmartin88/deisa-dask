@@ -45,6 +45,8 @@ the bridge side (local chunk execution)):
         "chunk_func_pickle": ...,  # pickle of the chunk callable
         "chunk_kwargs": {...},  # kwargs for the chunk callable
         "finalize": "sqrt" | None,  # post-step (sqrt for std)
+        "array_name": "a",  # registered array the reduction descends from
+        "multi_source": False,  # True when the expression descends from >1 registered array
     }
 
 This module is purely about reading the dask graph; it never executes user

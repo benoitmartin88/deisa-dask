@@ -291,3 +291,63 @@ class TestPrecomputeMemory:
         assert len(callback_results) == 1
         # See note in test_precompute_worker_only_sees_partials about
         # why we do not call execute_callbacks() here.
+
+    def test_multi_array_precompute_end_to_end(self, env_setup_2workers):
+        """Two arrays registered in ONE callback with precompute=True.
+
+        Each array must get its OWN precompute branch (``x-sum`` for the reduction on
+        ``x``, ``y-sum`` for the reduction on ``y``), so the callback receives
+        per-bridge partial stacks -- shape ``(2,)`` with two bridges -- for BOTH
+        arrays. Regression: before per-array hints/branches, both reductions were
+        keyed ``x-sum`` and array ``y`` had NO branches, so its bridge fell back to
+        the legacy full-chunk scatter and the callback received the tiled full
+        ``(16, 16)`` chunk.
+
+        The ``(2,)`` shape asserts are the pre-fix discriminator: value-only asserts
+        would pass pre-fix by accident (a full-chunk sum equals the global sum).
+        """
+        client, cluster = env_setup_2workers
+        chunk_shape = (8, 16)
+        global_shape = (16, 16)
+
+        sim = TestSimulation(
+            client,
+            mpi_parallelism=(2, 1),
+            arrays_metadata={
+                "x": {"global_shape": global_shape, "chunk_shape": chunk_shape},
+                "y": {"global_shape": global_shape, "chunk_shape": chunk_shape},
+            },
+            wait_for_go=False,
+        )
+
+        deisa = Deisa(wait_for_go=False)
+
+        results: List[Any] = []
+
+        @deisa.register("x", "y")
+        def _cb(x_windows, y_windows):
+            x = x_windows[-1]
+            y = y_windows[-1]
+            results.append((float(x.sum().compute()), float(y.sum().compute()), tuple(x.shape), tuple(y.shape)))
+
+        time.sleep(0.5)
+
+        x_global, y_global = sim.generate_data("x", "y", iteration=1, update_workers=True)
+
+        assert wait_for(lambda: len(results) >= 1, timeout=30), "callback was not called within 30s"
+
+        x_sum, y_sum, x_shape, y_shape = results[0]
+        # Float64 summation ORDER differs between the per-bridge partial stack and a
+        # direct full-array sum, so compare with a loose relative tolerance.
+        assert np.isclose(x_sum, float(np.sum(x_global)))
+        assert np.isclose(y_sum, float(np.sum(y_global)))
+        # Post-fix both arrays go through precompute: the callback sees the stack of
+        # per-bridge partials. The window[-1] subscript makes the analyzed reduction
+        # axis-0 (the stub is sliced to its last row before .sum()), so each bridge
+        # ships a (1, 16) row-sum partial and the stack over 2 bridges is (2, 1, 16).
+        # Pre-fix, array y had no branches and fell back to the legacy full-chunk
+        # scatter: the callback received the tiled full chunk ((16, 16)). The shape
+        # assert is the pre-fix discriminator (value-only asserts would pass pre-fix
+        # by accident -- a full-chunk sum equals the global sum).
+        assert x_shape == (2, 1, 16)
+        assert y_shape == (2, 1, 16)
