@@ -60,6 +60,7 @@ import pickle
 from typing import Any, Dict, List, Optional, Tuple
 
 import dask.array as da
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +107,225 @@ _REDUCTION_KIND = {
     "var": "moment",
     "std": "moment",
 }
+
+
+def _axis_signature(axis) -> Tuple[int, ...]:
+    """Sortable signature of the chunk's axis, used ONLY for output-key uniqueness.
+
+    Deliberately ndim-free: the chunk layer's axis is relative to the input
+    (root) array, but ``extract_reduction_hints`` sees the reduction OUTPUT's
+    ndim (0 for a scalar full reduction). Dask normalizes reduction axes to
+    non-negative before building the chunk layer, so no clamping is needed
+    here. Full reductions (``(0, 1)`` on 2-D) and explicit covers-all calls
+    share the signature --- they are semantically identical.
+    """
+    if axis is None:
+        return ()
+    if isinstance(axis, (int, np.integer)):
+        return (int(axis),)
+    return tuple(sorted(int(a) for a in axis))
+
+
+def _normalize_reduction_axis(axis, ndim: int) -> Tuple[int, ...]:
+    """Normalize a reduction axis to a signature tuple used for dispatch.
+
+    ``None`` (full reduction with no explicit axis) and an axis that covers
+    ALL data axes (dask's chunk layer always carries the full axis tuple for
+    a no-axis call, e.g. ``(0, 1)`` for a 2-D ``arr.sum()``) both map to the
+    empty tuple ``()`` -- they are the same reduction. Any partial axis maps
+    to its sorted tuple of non-negative axes.
+
+    - ``:param axis:`` ``None``, an int, or a tuple/list of ints.
+    - ``:param ndim:`` The reduced array's dimensionality.
+    - ``:return:`` ``()`` for the full reduction, else the sorted axis tuple.
+    """
+    if axis is None:
+        return ()
+    if isinstance(axis, (int, np.integer)):
+        axes = (int(axis) % ndim,)
+    else:
+        axes = tuple(sorted(int(a) % ndim for a in axis))
+    if axes == tuple(range(ndim)):
+        return ()
+    return axes
+
+
+# ---------------------------------------------------------------------------
+# Window-read detection (the ``param[-1]`` idiom)
+# ---------------------------------------------------------------------------
+# At runtime every registered-array callback parameter is a list of
+# DeisaArrays (the sliding window). ``param[-1]`` is Python-level list
+# indexing that returns the CURRENT iteration's delivered array -- the
+# reduction then runs on the WHOLE delivered array. The analyzer models the
+# subscript as a dask getitem on the stub, but the delivered view is the
+# whole array: the branch machinery must treat such getitems as a WINDOW
+# READ, not as a real slice of the reduction input (``arr[2:5]`` /
+# ``arr[:, 0]`` are real slices and cannot be reconstructed on the callback
+# side -- they are refused by the F1 gate).
+#
+# A dask getitem layer produced by ``stub[-1]`` has tasks whose index is an
+# int in the first position and full slices elsewhere -- selecting a whole
+# row-plane of the array. That shape is the window-read signature.
+def _is_window_read_index(index) -> bool:
+    """True when ``index`` selects a whole row-plane (the ``param[-1]`` idiom).
+
+    An int, or a tuple whose first element is an int and every other element
+    is a full slice (``slice(None)`` / ``None``). This is the shape produced
+    by ``stub[-1]`` / ``stub[-1, :]``; ``stub[2:5]`` (slice first), ``stub[:,
+    0]`` (int in a non-first position) and ``stub[-1, 0]`` (int in a
+    non-first position as well) are NOT window reads.
+    """
+    if isinstance(index, (int, np.integer)):
+        return True
+    if isinstance(index, tuple) and index:
+        first, rest = index[0], index[1:]
+        if not isinstance(first, (int, np.integer)):
+            return False
+        for s in rest:
+            if s is None:
+                continue
+            if not isinstance(s, slice) or (s.start, s.stop, s.step) != (None, None, None):
+                return False
+        return True
+    return False
+
+
+def _is_window_read_layer(layer) -> bool:
+    """True when ``layer`` is a MaterializedLayer of ``getitem`` tasks whose
+    index is a whole-row-plane selection (see :func:`_is_window_read_index`).
+
+    Every task in the layer must be a window-read getitem; the layer must
+    read from exactly one upstream array.
+    """
+    mapping = getattr(layer, "mapping", None)
+    if mapping is None:
+        return False
+    upstream_names = set()
+    for value in mapping.values():
+        func = getattr(value, "func", None)
+        if getattr(func, "__name__", "") != "getitem":
+            return False
+        args = getattr(value, "args", None)
+        if not args or len(args) < 2:
+            return False
+        if not _is_window_read_index(args[1]):
+            return False
+        # The array operand is the first task argument (a TaskRef key).
+        ref = args[0]
+        key = getattr(ref, "key", ref)
+        if isinstance(key, (list, tuple)) and key:
+            upstream_names.add(key[0])
+        elif isinstance(key, str):
+            upstream_names.add(key)
+    return len(upstream_names) == 1
+
+
+def _window_read_upstream_name(layer) -> Optional[str]:
+    """Return the single upstream layer name of a window-read getitem layer
+    (the array operand's layer), or ``None`` if the layer cannot be read.
+    """
+    mapping = getattr(layer, "mapping", None)
+    if not mapping:
+        return None
+    for value in mapping.values():
+        args = getattr(value, "args", None)
+        if not args:
+            return None
+        ref = args[0]
+        key = getattr(ref, "key", ref)
+        if isinstance(key, (list, tuple)) and key:
+            return str(key[0])
+        if isinstance(key, str):
+            return key
+        return None
+    return None
+
+
+# Root stub layers created by the analyzer (``_analyze_callback_for_branches``
+# names the placeholder ``deisa-stub-<array>``).
+_STUB_LAYER_PREFIX = "deisa-stub-"
+
+
+def _is_stub_layer_name(layer_name: str) -> bool:
+    """True when the layer is the analyzer's registered-array root stub."""
+    return layer_name.startswith(_STUB_LAYER_PREFIX)
+
+
+def _chain_has_window_read(graph, chunk_layer_name: str) -> bool:
+    """True when the reduction's chunk stage reads the root through ONLY
+    whole-row-plane getitem layers (the window-read idiom).
+
+    Walks upstream from ``chunk_layer_name``. Any layer that is neither the
+    reduction chunk stage nor a window-read getitem layer (a pointwise op, a
+    real slice, an unwalkable input, ...) makes the chain NOT a window read
+    (conservative: such chains are refused by the F1 gate anyway).
+
+    - ``:param graph:`` The dask graph containing the reduction.
+    - ``:param chunk_layer_name:`` The reduction's chunk layer.
+    - ``:return:`` True only for ``root[-1].op()``-style expressions.
+    """
+    # Imported lazily to avoid a circular import at module load time
+    # (branch.py imports task_branches and defines _find_single_upstream).
+    from deisa.dask.branch import _find_single_upstream
+
+    current = chunk_layer_name
+    seen = set()
+    found_window_getitem = False
+    while current is not None and current not in seen:
+        seen.add(current)
+        layer = graph.layers[current]
+        if _is_stub_layer_name(current):
+            # Reached the registered-array root stub.
+            return found_window_getitem
+        if _is_window_read_layer(layer):
+            found_window_getitem = True
+            upstream = _window_read_upstream_name(layer)
+            if upstream is None:
+                return False
+            if upstream not in graph.layers:
+                return found_window_getitem  # root data node
+            current = upstream
+            continue
+        # Ordinary layer: only the reduction chunk stage itself is allowed.
+        upstream = _find_single_upstream(layer)
+        if upstream is None:
+            return False
+        upstream_name, _ = upstream
+        if upstream_name not in graph.layers:
+            return found_window_getitem  # root data node
+        current = upstream_name
+    return False
+
+
+def _assign_output_key(array_name: str, op_name: str, axes_sig: Tuple[int, ...], seen: Dict) -> str:
+    """Return a per-callback-unique ``output_key`` for one reduction.
+
+    The first occurrence of an op keeps the stable ``{array}-{op}`` key
+    (existing tests assert ``a-sum`` / ``f-sum`` / ``b-sum``); a later call
+    with a DIFFERENT axis signature appends a deterministic discriminator
+    (``-axis0``, ``-axis0x1``, ``-axisall`` for a second full reduction).
+    Two identical signatures (same op, same axis -- e.g. ``arr.sum()``
+    written twice) keep the SAME key: they are semantically identical and
+    dedup to one branch.
+
+    - ``:param seen:`` Mutable per-callback dict
+        ``{(array_name, op_name): {axes_sig: output_key}}`` shared across
+        every call of :func:`extract_reduction_hints` for one callback, so
+        keys stay unique across all compute boundaries of the callback.
+    """
+    per_op = seen.setdefault((array_name, op_name), {})
+    if not per_op:
+        key = f"{array_name}-{op_name}"
+    else:
+        existing = per_op.get(axes_sig)
+        if existing is not None:
+            key = existing
+        elif axes_sig == ():
+            key = f"{array_name}-{op_name}-axisall"
+        else:
+            key = f"{array_name}-{op_name}-axis{'x'.join(map(str, axes_sig))}"
+    per_op[axes_sig] = key
+    return key
 
 
 # ---------------------------------------------------------------------------
@@ -468,18 +688,28 @@ def _blockwise_upstream_layer_names(layer) -> List[str]:
     return names
 
 
-def extract_reduction_hints(darr: da.Array, array_name: str = "f") -> List[Dict[str, Any]]:
+def extract_reduction_hints(
+    darr: da.Array,
+    array_name: str = "f",
+    output_key_seen: Optional[Dict] = None,
+) -> List[Dict[str, Any]]:
     """Inspect ``darr``'s task graph and return a branch dict per reduction.
 
     - ``:param darr:`` A dask array whose graph contains at least one reduction
       (typically built symbolically by ``deisa.dask.precompute_analyzer``).
     - ``:param array_name:`` Base name for the reduction output keys.
+    - ``:param output_key_seen:`` Optional shared ``{seen}`` dict for
+      :func:`_assign_output_key`. Pass ONE dict per callback (across all its
+      compute boundaries) so ``output_key`` stays unique per reduction
+      signature; ``None`` allocates a fresh per-call dict.
     - ``:return:`` List of branch dicts matching the schema above.
 
     Note: this walks the graph but never executes any task; the dask arrays
     used at analysis time are zero-filled placeholders, and we don't run them.
     """
     hints: List[Dict[str, Any]] = []
+    if output_key_seen is None:
+        output_key_seen = {}  # fresh per-call seen map
     try:
         graph = darr.__dask_graph__()
     except Exception as e:  # pragma: no cover - safety net
@@ -559,7 +789,17 @@ def extract_reduction_hints(darr: da.Array, array_name: str = "f") -> List[Dict[
             logger.debug("extract_reduction_hints: failed to pickle chunk func: %s", e)
             continue
 
-        output_key = f"{array_name}-{op_name}"
+        # The window-read flag (``root[-1]``): the callback's reduction runs on
+        # the WHOLE delivered array, so the branch's runtime dispatch
+        # signature is the FULL reduction even though the stub-side chunk
+        # layer carries a partial axis (the getitem removed the other axes).
+        window_read = _chain_has_window_read(graph, chunk_layer_name)
+        output_key = _assign_output_key(
+            array_name,
+            op_name,
+            () if window_read else _axis_signature(chunk_kwargs.get("axis")),
+            output_key_seen,
+        )
         # Unwrap single-element axis tuples (dask normalizes ``axis=0`` to
         # ``axis=(0,)``) for the bridge's chunk execution path.
         chunk_kwargs = dict(chunk_kwargs) if chunk_kwargs else {}
@@ -573,6 +813,7 @@ def extract_reduction_hints(darr: da.Array, array_name: str = "f") -> List[Dict[
                 "chunk_func_pickle": chunk_func_pickle,
                 "chunk_kwargs": chunk_kwargs,
                 "finalize": finalize,
+                "window_read": window_read,
             }
         )
 
