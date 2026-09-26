@@ -60,7 +60,9 @@ from dask.array.reductions import mean_agg, moment_agg
 from deisa.dask.precompute_analyzer import PrecomputeError, analyze_callback
 from deisa.dask.task_branches import (
     _aggregate_output_feeds_other_reduction,
+    _base_for_aggregate,
     _blockwise_indices_inputs,
+    _chunk_func_and_kwargs,
     _find_chunk_layer,
     _is_aggregate_layer,
     _op_for_aggregate_layer,
@@ -83,8 +85,6 @@ class BranchSpec:
 
     Attributes
     ----------
-    input_name : str
-        Registered array name the branch is rooted at (e.g. ``"f"``).
     output_key : str
         Stable identifier for this branch (e.g. ``"f-mean"``). The
         bridge uses it to namespace its scatter key and the Deisa
@@ -119,17 +119,8 @@ class BranchSpec:
         event so the Deisa side knows what each bridge shipped.
     partial_dtype : str
         NumPy dtype string of the per-bridge partial.
-    output_shape : Tuple[int, ...]
-        Shape of the **combined** reduction output (after the Deisa
-        topic handler runs ``mean_agg`` / ``moment_agg`` / dask sum).
-        For ``mean()`` on a 2-D array this is ``()``; for
-        ``mean(axis=0)`` on ``(M, N)`` this is ``(N,)``. Used as the
-        ``shape=`` argument to ``da.from_delayed`` on the Deisa side.
-    output_dtype : str
-        NumPy dtype string of the combined output.
     """
 
-    input_name: str
     output_key: str
     output_kind: str
     branch_func: Callable[[Any], Any]
@@ -137,8 +128,6 @@ class BranchSpec:
     finalize: Optional[str]
     partial_shape: Tuple[int, ...]
     partial_dtype: str
-    output_shape: Tuple[int, ...]
-    output_dtype: str
 
 
 def _analyze_callback_for_branches(callback: Callable, registered_arrays: Dict[str, Any], precompute: bool = True):
@@ -298,27 +287,6 @@ def _combine_array_from_partials(
     return da.from_delayed(_combine(nested), shape=out_shape, dtype=out_dtype)
 
 
-def _derive_combined_output_shape(
-    chunk_axis: Optional[Tuple[int, ...]],
-    array_ndim: int,
-    partial_shape: Tuple[int, ...],
-) -> Tuple[int, ...]:
-    """Compute the shape of the combined reduction output.
-
-    For full reductions (``chunk_axis == (0, 1, ...)`` matching all axes), the output is scalar ``()``.
-
-    For axis reductions, the output keeps the un-reduced axes' sizes from the partial (each bridge's chunk has the full
-    size along non-reduced axes, so the partial shape encodes the combined shape).
-    """
-    if chunk_axis is None:
-        # output shape == partial shape.
-        return partial_shape
-    kept_axes = tuple(ax for ax in range(array_ndim) if ax not in chunk_axis)
-    if not kept_axes:
-        return ()
-    return tuple(partial_shape[ax] for ax in kept_axes)
-
-
 def _discover_partial_metadata(
     branch_func: Callable[[Any], Any],
     placeholder: Optional[Any],
@@ -404,8 +372,7 @@ def _analyze_branch(callback: Callable, registered_arrays: Dict[str, Any], preco
     if not hints:
         return []
 
-    # Pick the registered-array name and ndim to attach to branches.
-    primary = next(iter(registered_arrays)) if registered_arrays else "f"
+    # Pick the registered-array ndim to attach to branches.
     primary_arr: Optional[Any] = None
     array_ndim = 0
     try:
@@ -472,7 +439,6 @@ def _analyze_branch(callback: Callable, registered_arrays: Dict[str, Any], preco
 
         branch = _try_chain_branch(
             branch=branch_dict,
-            primary=primary,
             array_ndim=array_ndim,
             placeholder=placeholder,
             aggregate_candidates=aggregate_candidates,
@@ -484,7 +450,6 @@ def _analyze_branch(callback: Callable, registered_arrays: Dict[str, Any], preco
             branch = _try_length1_branch(
                 branch=branch_dict,
                 chunk_func=chunk_func,
-                primary=primary,
                 array_ndim=array_ndim,
                 placeholder=placeholder,
             )
@@ -510,7 +475,6 @@ def _analyze_branch(callback: Callable, registered_arrays: Dict[str, Any], preco
 
 def _try_chain_branch(
     branch: Dict[str, Any],
-    primary: str,
     array_ndim: int,
     placeholder: Optional[Any],
     aggregate_candidates: Dict[str, List[Tuple[str, Any]]],
@@ -550,7 +514,6 @@ def _try_chain_branch(
         return _build_branch(
             branch=branch,
             chain=chain,
-            input_name=primary,
             array_ndim=array_ndim,
             placeholder=placeholder,
             chain_branch_func=chain_branch_func,
@@ -562,7 +525,6 @@ def _try_chain_branch(
 def _try_length1_branch(
     branch: Dict[str, Any],
     chunk_func: Callable,
-    primary: str,
     array_ndim: int,
     placeholder: Optional[Any],
 ) -> Optional[BranchSpec]:
@@ -585,7 +547,6 @@ def _try_length1_branch(
         return _build_branch(
             branch=branch,
             chain=chain,
-            input_name=primary,
             array_ndim=array_ndim,
             placeholder=placeholder,
         )
@@ -609,7 +570,6 @@ def _try_length1_branch(
 def _build_branch(
     branch: Dict[str, Any],
     chain: List[Tuple[Callable, dict, int]],
-    input_name: str,
     array_ndim: int,
     placeholder: Optional[Any] = None,
     chain_branch_func: Optional[Callable] = None,
@@ -640,11 +600,7 @@ def _build_branch(
 
     partial_shape, partial_dtype = _discover_partial_metadata(chain_branch_func, placeholder, branch)
 
-    output_shape = _derive_combined_output_shape(chunk_axis, array_ndim, partial_shape)
-    output_dtype = partial_dtype  # mean/moment keep dtype through the agg
-
     return BranchSpec(
-        input_name=input_name,
         output_key=branch["output_key"],
         output_kind=kind,
         branch_func=chain_branch_func,
@@ -652,8 +608,6 @@ def _build_branch(
         finalize=finalize,
         partial_shape=partial_shape,
         partial_dtype=partial_dtype,
-        output_shape=output_shape,
-        output_dtype=output_dtype,
     )
 
 
@@ -667,11 +621,11 @@ def _walk_chain(graph, agg_name: str) -> Optional[List[Tuple[Callable, dict, int
     ``input_count`` records how many upstream references the layer has: 1 for a normal single-input pointwise op,
     2 for a self-referential op like ``arr * arr``.
     """
-    if "-aggregate-" not in agg_name:
+    if not _is_aggregate_layer(agg_name):
         return None
     # Match the chunk layer via the dedicated chunk/aggregate pairs (mean_chunk / mean_agg, chunk_max / max,
     # chunk_min / min, moment_agg / var) instead of requiring an exact base name.
-    chunk_layer_name = _find_chunk_layer(graph, agg_name.split("-aggregate-", 1)[0])
+    chunk_layer_name = _find_chunk_layer(graph, _base_for_aggregate(agg_name))
     if chunk_layer_name is None:
         return None
     # Refuse to fold an aggregate whose output feeds ANOTHER reduction's chunk stage (cross-reduction
@@ -687,9 +641,10 @@ def _walk_chain(graph, agg_name: str) -> Optional[List[Tuple[Callable, dict, int
         layer = graph.layers[current]
         if "-aggregate-" in current:
             break
-        func, kwargs = _extract_layer_func(layer)
-        if func is None:
+        chunk_info = _chunk_func_and_kwargs(layer)
+        if chunk_info is None:
             break
+        func, kwargs = chunk_info
         upstream = _find_single_upstream(layer)
         if upstream is None:
             return None
@@ -702,17 +657,6 @@ def _walk_chain(graph, agg_name: str) -> Optional[List[Tuple[Callable, dict, int
         current = upstream_name
     chain.reverse()
     return chain
-
-
-def _extract_layer_func(layer) -> Tuple[Optional[Callable], dict]:
-    """Pull the first task's ``func`` and ``kwargs`` out of a Blockwise layer.
-    Returns ``(None, {})`` if the layer has no task-shaped values.
-    """
-    for value in layer.values():
-        if hasattr(value, "func") and callable(value.func):
-            kwargs = dict(value.kwargs) if value.kwargs else {}
-            return value.func, kwargs
-    return None, {}
 
 
 def _find_single_upstream(layer) -> Optional[Tuple[str, int]]:
