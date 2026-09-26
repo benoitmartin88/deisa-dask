@@ -30,9 +30,6 @@ Types of changes:
 
 - Missing first callback(s) due to not waiting for `Deisa.execute_callbacks()`
 - Deisa: avoid exceptions raised from `__del__()`
-- benchmark: report send->callback latency in the unit each consumer expects (milliseconds
-  in the human-readable summary, nanoseconds to Bencher); drop a `del` that broke a live
-  closure and could raise `NameError` on a late callback.
 
 ## [0.6.3]
 
