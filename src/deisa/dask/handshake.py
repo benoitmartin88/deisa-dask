@@ -27,10 +27,11 @@
 # POSSIBILITY OF SUCH DAMAGE.
 # =============================================================================
 import logging
-from typing import Optional
+from typing import List, Optional
 
 from distributed import Client, Event, Future, get_client
 
+from deisa.dask.branch import BranchSpec
 from deisa.dask.constants import KEY_PREFIX
 from deisa.dask.utils import _get_actor
 
@@ -51,9 +52,9 @@ class Handshake:
             self.nb_bridges = 0
             self.arrays_metadata = {}
             self.bridges_ready = False
-            self.analytics_ready = False
             self.feedback_queue_size = 1024
             self.timestep: Optional[int] = None
+            self.task_branches = {}  # array_name -> List[Dict] for bridge-local execution
 
         def set_bridges_ready(self, nb_bridges: int, arrays_metadata: dict) -> None:
             logger.debug(
@@ -85,6 +86,13 @@ class Handshake:
 
         def get_feedback_queue_size(self) -> int | Future:
             return self.feedback_queue_size
+
+        def set_task_branches(self, array_name: str, hints: list) -> None:
+            logger.debug(f"set_task_branches(): array_name={array_name}, hints={hints}")
+            self.task_branches[array_name] = hints
+
+        def get_task_branches(self, array_name: str) -> List[BranchSpec] | Future:
+            return self.task_branches.get(array_name, [])
 
         def __go(self) -> None:
             logger.debug("Handshake go !")
@@ -134,6 +142,14 @@ class Handshake:
     def get_nb_bridges(self) -> int:
         assert self.__handshake_actor is not None
         return self.__handshake_actor.get_nb_bridges().result()
+
+    def set_task_branches(self, array_name: str, hints: list) -> None:
+        assert self.__handshake_actor is not None
+        self.__handshake_actor.set_task_branches(array_name, hints).result()
+
+    def get_task_branches(self, array_name: str) -> List[BranchSpec]:
+        assert self.__handshake_actor is not None
+        return self.__handshake_actor.get_task_branches(array_name).result()
 
     def __wait_for_go(self) -> None:
         Event(Handshake._DEISA_WAIT_FOR_GO_EVENT, client=self.client).wait()

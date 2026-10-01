@@ -45,6 +45,7 @@ from TestSimulator import TestSimulation
 from utils import (
     FakeCartComm,
     FakeComm,
+    _make_callback,
     async_close_bridges,
     async_map,
     dask_array_element_wise_equal,
@@ -54,9 +55,52 @@ from utils import (
 
 from deisa.dask import Bridge, Deisa
 from deisa.dask.deisa import DEFAULT_SLIDING_WINDOW_SIZE
+from deisa.dask.precompute_analyzer import RawFieldReadError, UnsupportedReductionError
 from deisa.dask.utils import build_deisa_array
 
 logging.basicConfig(level=logging.DEBUG)
+
+META_A = {"a": {"global_shape": (8, 8), "chunk_shape": (4, 4)}}
+
+
+class _FakeClient:
+    """Minimal client surface used by Deisa._register_callback_impl."""
+
+    def __init__(self):
+        self.subscribed = []
+
+    def subscribe_topic(self, name, handler):  # noqa: D102
+        self.subscribed.append(name)
+
+    def close(self):  # noqa: D102
+        pass
+
+
+class _FakeHandshake:
+    """Minimal handshake surface used by Deisa._register_callback_impl."""
+
+    def __init__(self):
+        self.branches: Dict[str, Any] = {}
+
+    def set_task_branches(self, array_name, hints):  # noqa: D102
+        self.branches[array_name] = hints
+
+
+def _make_deisa_stub() -> Deisa:
+    """A Deisa instance with the registration surfaces stubbed (no cluster)."""
+    d = Deisa.__new__(Deisa)
+    d.client = _FakeClient()
+    d.handshake = _FakeHandshake()
+    d.arrays_metadata = META_A
+    d._callbacks = {}
+    d._callbacks_by_array = {}
+    d._topic_handlers = {}
+    d._callback_reductions = {}
+    d._callback_seq = 0
+    d._branch_groups = {}
+    d._tasks = set()
+    d._execute_callbacks_called = False
+    return d
 
 
 @pytest.mark.timeout(10)
@@ -99,6 +143,69 @@ class TestDeisaCtor:
             f = os.path.abspath(os.path.dirname(__file__)) + os.path.sep + "test-scheduler-error.json"
             os.environ["DEISA_DASK_SCHEDULER_ADDRESS"] = f
             Deisa(wait_for_go=False)
+
+
+# ---------------------------------------------------------------------------
+# Deisa registration surface tests (cluster-free stubs)
+# ---------------------------------------------------------------------------
+class TestDeisaRegistration:
+    def test_registration_success_stores_callback_payload(self):
+        """A successful registration stores the payload in ``_callbacks``.
+
+        The topic handler can only fire a callback whose payload lives in ``_callbacks``; it must be stored once every
+        step that can raise has succeeded.
+        """
+        d = _make_deisa_stub()
+        cb = _make_callback("reg_ok", "s = arr.sum()\nreturn s.compute()")
+        cid = d._register_callback_impl(cb, [Window("a", size=1)], exception_handler=None, when="AND", precompute=True)
+        assert cid in d._callbacks
+        assert d._callbacks[cid]["callback"] is cb
+        assert d._callbacks[cid]["array_names"] == ["a"]
+        assert cid in d._callbacks_by_array["a"]
+        # Topic subscription happened for the registered array.
+        assert "a" in d.client.subscribed
+        # Branches are merged in memory at registration; the handshake actor is
+        # filed only by execute_callbacks (the per-cycle filing boundary).
+        assert d._branch_groups["a"]
+        d._flush_branches_to_handshake()
+        assert d.handshake.branches["a"]
+
+    def test_registration_failure_leaves_no_trace(self):
+        """A registration whose analysis raises leaks nothing.
+
+        ``_callbacks[callback_id]`` is written only AFTER the analysis; a raising analysis must leave no half-registered
+        entry that ``unregister_callback`` could never reach.
+        """
+        d = _make_deisa_stub()
+        cb = _make_callback("reg_fail", "s = (arr - arr.mean()).sum()\nreturn s.compute()")
+        with pytest.raises(UnsupportedReductionError):
+            d._register_callback_impl(cb, [Window("a", size=1)], exception_handler=None, when="AND", precompute=True)
+        assert d._callbacks == {}
+        assert d._callbacks_by_array == {}
+        assert d.client.subscribed == []
+
+    def test_raw_refusal_does_not_merge_branch_groups(self):
+        """A raw-read refusal must leave no partial branch state behind at registration."""
+        d = _make_deisa_stub()
+        cb = _make_callback("reg_raw_fail", "plot(arr)\ns = arr.sum()\nreturn s.compute()")
+        with pytest.raises(RawFieldReadError):
+            d._register_callback_impl(cb, [Window("a", size=1)], exception_handler=None, when="AND", precompute=True)
+        # Same no-trace contract as the UnsupportedReductionError case.
+        assert d._callbacks == {}
+        assert d._callbacks_by_array == {}
+        assert d._branch_groups == {}
+        assert d.client.subscribed == []
+
+    def test_precompute_false_allows_raw_reads_with_warning(self, caplog):
+        """``precompute=False`` skips the analysis entirely: raw reads are allowed with a warning."""
+        d = _make_deisa_stub()
+        cb = _make_callback("reg_raw_ok", "plot(arr)\ns = arr.sum()\nreturn s.compute()")
+        with caplog.at_level(logging.WARNING):
+            cid = d._register_callback_impl(
+                cb, [Window("a", size=1)], exception_handler=None, when="AND", precompute=False
+            )
+        assert cid in d._callbacks
+        assert "full-chunk scatter path" in caplog.text
 
 
 class TestUsingDaskCluster:
@@ -294,6 +401,7 @@ class TestUsingDaskCluster:
                 if expected_window_size["temperature"]
                 else "temperature",
                 exception_handler=self.exception_handler,
+                precompute=False,
             )
 
         def check(self, state, i, expected):
@@ -315,6 +423,7 @@ class TestUsingDaskCluster:
                 if expected_window_size["pressure"]
                 else "pressure",
                 exception_handler=self.exception_handler,
+                precompute=False,
             )
 
         def check(self, state, i, expected):
@@ -328,6 +437,7 @@ class TestUsingDaskCluster:
                 if expected_window_size["temperature"]
                 else "temperature",
                 exception_handler=self.exception_handler,
+                precompute=False,
             )
             def cb(temperature: List[DeisaArray]):
                 state["temperature"] = temperature
@@ -346,6 +456,7 @@ class TestUsingDaskCluster:
                 if expected_window_size["pressure"]
                 else "pressure",
                 exception_handler=self.exception_handler,
+                precompute=False,
             )
             def cb(temperature: List[DeisaArray], pressure: List[DeisaArray]):
                 state["temperature"] = temperature
@@ -367,6 +478,7 @@ class TestUsingDaskCluster:
                 else "pressure",
                 "density",
                 exception_handler=self.exception_handler,
+                precompute=False,
             )
             def cb(temperature: List[DeisaArray], pressure: List[DeisaArray], density: List[DeisaArray]):
                 state["temperature"] = temperature
@@ -383,7 +495,6 @@ class TestUsingDaskCluster:
     class MapBlocks(RegisterAndCheck):
         def register_cb(self, state, deisa, expected_window_size: dict[str, int | None]):
             def map_block_function(block, block_info=None):
-                # print(f"map_block_function() block={block}, block_info={block_info}", flush=True)
                 return np.array([[1]])
 
             @deisa.register(
@@ -391,6 +502,10 @@ class TestUsingDaskCluster:
                 if expected_window_size["temperature"]
                 else "temperature",
                 exception_handler=self.exception_handler,
+                # map_blocks(...).compute() materializes the array on the
+                # bridge (no chunk-local reduction to precompute), so this
+                # callback uses the legacy full-chunk path.
+                precompute=False,
             )
             def cb(temperature: List[DeisaArray]):
                 meta = np.array([[0]])
@@ -559,7 +674,7 @@ class TestUsingDaskCluster:
             raise RuntimeError("Throw from user exception handler.")
 
         # default exception_handler
-        callback_id = deisa.register_callback(window_callback, "my_array")
+        callback_id = deisa.register_callback(window_callback, "my_array", precompute=False)
         assert callback_id is not None, "callback was not registered"
         time.sleep(0.5)
         sim.generate_data("my_array", iteration=1)
@@ -568,7 +683,9 @@ class TestUsingDaskCluster:
 
         # custom error handler
         deisa.unregister_callback(callback_id)
-        callback_id = deisa.register_callback(window_callback, "my_array", exception_handler=custom_exception_handler)
+        callback_id = deisa.register_callback(
+            window_callback, "my_array", exception_handler=custom_exception_handler, precompute=False
+        )
         assert callback_id is not None, "callback was not registered"
         time.sleep(0.5)
         sim.generate_data("my_array", iteration=2)
@@ -578,7 +695,7 @@ class TestUsingDaskCluster:
         # custom error handler that throws
         deisa.unregister_callback(callback_id)
         callback_id = deisa.register_callback(
-            window_callback, "my_array", exception_handler=custom_exception_handler_raise
+            window_callback, "my_array", exception_handler=custom_exception_handler_raise, precompute=False
         )
         assert callback_id is not None, "callback was not registered"
         time.sleep(0.5)
@@ -621,7 +738,7 @@ class TestUsingDaskCluster:
 
         context = {"counter": 0, "exception_handler": 0}
 
-        @deisa.register("my_array")
+        @deisa.register("my_array", precompute=False)
         def window_callback(my_array: list[DeisaArray]):
             print(f"hello from window_callback. iteration={my_array[-1].t}", flush=True)
             context["counter"] += 1
@@ -644,7 +761,9 @@ class TestUsingDaskCluster:
 
         # custom error handler
         deisa.unregister_callback(window_callback)
-        deisa.register_callback(window_callback, "my_array", exception_handler=custom_exception_handler)
+        deisa.register_callback(
+            window_callback, "my_array", exception_handler=custom_exception_handler, precompute=False
+        )
         # assert window_callback.callback_id is not None, "callback was not registered"
         assert "my_array" in deisa._callbacks_by_array, "callback was not registered for my_array"
         assert len(deisa._callbacks_by_array["my_array"]) == 1, "expected exactly one callback registered"
@@ -655,7 +774,9 @@ class TestUsingDaskCluster:
 
         # custom error handler that throws
         deisa.unregister_callback(window_callback)
-        deisa.register_callback(window_callback, "my_array", exception_handler=custom_exception_handler_raise)
+        deisa.register_callback(
+            window_callback, "my_array", exception_handler=custom_exception_handler_raise, precompute=False
+        )
         # assert window_callback.callback_id is not None, "callback was not registered"
         assert "my_array" in deisa._callbacks_by_array, "callback was not registered for my_array"
         assert len(deisa._callbacks_by_array["my_array"]) == 1, "expected exactly one callback registered"
@@ -743,7 +864,7 @@ class TestUsingDaskCluster:
             context["counter"] += 1
             deisa.set("hello", "world", timestep=window[-1].t)
 
-        deisa.register_callback(window_callback, Window("my_array", size=1))
+        deisa.register_callback(window_callback, Window("my_array", size=1), precompute=False)
         sim.generate_data("my_array", iteration=1)
         assert wait_for(lambda: context["counter"] == 1)
         assert wait_for(lambda: sim.bridges[0].get("hello", timestep=1) == "world")
@@ -811,8 +932,8 @@ class TestUsingDaskCluster:
     def test_multi_array_callback_consistent_iterations(self, env_setup):
         """Regression test for issue #128: missing iterations when using multiple arrays in a callback.
 
-        When arrays arrive at different times (e.g., due to async topic handlers),
-        the callback must not fire until all arrays have data for the same iteration.
+        When arrays arrive at different times (e.g., due to async topic handlers), the callback must not fire until all
+        arrays have data for the same iteration.
         """
         client, cluster = env_setup
         global_grid_size = (8, 8)
@@ -845,7 +966,7 @@ class TestUsingDaskCluster:
         # Record iterations at which the callback actually fires
         called_iterations = []
 
-        @deisa.register("x", "y")
+        @deisa.register("x", "y", precompute=False)
         def cb(x_arrays, y_arrays):
             x_t = x_arrays[-1].timestep
             y_t = y_arrays[-1].timestep

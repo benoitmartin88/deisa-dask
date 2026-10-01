@@ -1,0 +1,1210 @@
+# =============================================================================
+# Copyright (C) 2026 Commissariat a l'energie atomique et aux energies alternatives (CEA)
+#
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+# * Redistributions of source code must retain the above copyright notice,
+#   this list of conditions and the following disclaimer.
+# * Redistributions in binary form must reproduce the above copyright notice,
+#   this list of conditions and the following disclaimer in the documentation
+#   and/or other materials provided with the distribution.
+# * Neither the names of CEA, nor the names of the contributors may be used
+#   to endorse or promote products derived from this software without specific
+#   prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+# =============================================================================
+"""Compute-boundary precompute analyzer (no AST pattern matching, no callback execution)."""
+
+from __future__ import annotations
+
+import ast
+import inspect
+import logging
+import operator
+import textwrap
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import numpy as np
+
+import dask.array as da
+from deisa.dask.task_branches import extract_reduction_hints
+
+logger = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------------------- Exception hierarchy
+# ---------------------------------------------------------------------------
+class PrecomputeError(Exception):
+    """Base class for precompute analysis errors."""
+
+
+class UnsupportedReductionError(PrecomputeError):
+    """A reduction is present but its input expression cannot be traced back to a dask array.
+
+    Covers opaque operands (``da.sum(opaque_object)``), wrapped reductions (a custom function around a dask call), and
+    untraceable parameters (``da.sum(f * v2)`` where ``v2`` is derived from a config object).
+    """
+
+
+class NoPrecomputableReductionError(PrecomputeError):
+    """The callback contains no reductions we can precompute.
+
+    Example: callback only does ``da.fft.fft2(arr)`` - FFTs don't reduce.
+    """
+
+
+class PrecomputeRuntimeError(PrecomputeError):
+    """A runtime (post-registration) precompute invariant was violated.
+
+    Raised on the Deisa side (topic handler, callback dispatch view) and the bridge side (executing a branch on the
+    local chunk) when a precompute contract breaks -- e.g. a failed branch dropped a partial, a reduction's partials do
+    not cover the full chunk grid, or a callback calls a reduction that the analyzer did not record. Always prefer
+    raising this over silently delivering a wrong number.
+    """
+
+
+class MaterializationError(PrecomputeError):
+    """A full data materialization was detected in the callback.
+
+    Example: ``np.array(dask_array)`` - forces gathering the whole array, defeating the purpose.
+    """
+
+
+class RawFieldReadError(PrecomputeError):
+    """The callback reads the registered array's raw data, which precompute does not deliver.
+
+    The precompute path only ships per-bridge reduction partials -- never the full chunk. Any callback that consumes
+    the raw data (binds it as a value, indexes it, plots it, or computes something that is not a recorded
+    chunk-local reduction) breaks the precompute contract: the data it needs is not on the network. Raised at
+    REGISTRATION time -- never mid-iteration. Remedy: register the callback with ``precompute=False``, which
+    switches it to the legacy full-chunk scatter path.
+    """
+
+
+class IncompatibleCallbackError(PrecomputeError):
+    """The callback pattern is not supported by the precompute system.
+
+    Example: dynamic dispatch (``getattr``), closures, ``exec``/``eval``, etc.
+    """
+
+
+class NoComputeBoundaryError(PrecomputeError):
+    """The callback contains dask operations but no compute boundaries.
+
+    We can't tell what the user wants computed. Without a ``.compute()``, ``client.compute(...)``, or similar, the
+    analyzer has no way to know which dask arrays to extract hints for.
+    """
+
+
+# --------------------------------------------------------------------------- Source-array attribution
+# ---------------------------------------------------------------------------
+def _match_source_arrays(darr: Any, registered_arrays: Dict[str, Any]) -> List[str]:
+    """Return the registered array names whose stub layer appears in the expression's task graph.
+
+    Only stub-tagged layers attribute the expression to a source array (an empty result covers e.g. a ``da.zeros``
+    created inside the callback). Stubs carry a unique layer-name tag ``deisa-stub-<name>`` so graph-layer membership
+    attributes an expression to its source array even when two registered arrays would otherwise collapse to one dask
+    name (identical metadata).
+    """
+    layers: set = set()
+    try:
+        layers = set(darr.__dask_graph__().layers)  # type: ignore[attr-defined]
+    except Exception:  # pragma: no cover - safety net
+        pass
+    return [name for name, value in registered_arrays.items() if isinstance(value, da.Array) and value.name in layers]
+
+
+# --------------------------------------------------------------------------- Public API
+# ---------------------------------------------------------------------------
+def _is_stub_derived(value: Any, registered_arrays: Dict[str, Any]) -> bool:
+    """True when ``value``'s task graph still contains a registered array's stub layer.
+
+    Reuses the provenance rule of :func:`_match_source_arrays`: every registered stub is built with the unique layer
+    tag ``deisa-stub-<name>``, so graph-layer membership attributes an expression to its source array. A value that
+    is stub-derived at a NON-reduction consumption point carries the raw chunk data (the partials thrown over the
+    network cannot reconstruct it) and must break the precompute contract -- see :class:`RawFieldReadError`.
+    """
+    try:
+        layers = set(value.__dask_graph__().layers)  # type: ignore[attr-defined]
+    except Exception:  # pragma: no cover - safety net
+        return False
+    return any(isinstance(v, da.Array) and v.name in layers for v in registered_arrays.values())
+
+
+def analyze_callback(
+    callback: Callable,
+    registered_arrays: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Analyze the callback's source and return ``(reduction_hints, dask_arrays)``.
+
+    Strict: every condition that makes the callback unanalyzable raises its own :class:`PrecomputeError`
+    subclass directly (there is no leniency left in the precompute path to defer an error to). ``dask_arrays``
+    carries the walker's boundary expressions (e.g. ``(arr*arr).sum()``) so
+    :func:`deisa.dask.branch._analyze_branch` can walk their graphs without a second AST pass.
+    """
+    # 1. Parse callback source
+    callback_src = _get_source(callback)
+    callback_tree = ast.parse(callback_src)
+    source_file = _SourceFile.from_tree(callback_tree)
+
+    # 2. Locate the callback's FunctionDef
+    callback_def = source_file.find_function(callback.__name__)
+    if callback_def is None:
+        raise IncompatibleCallbackError(f"Could not locate FunctionDef for {callback.__name__!r} in callback source.")
+
+    # 3. Build initial scope: callback params bound to registered arrays. The dict's first key is the FALLBACK array
+    # name for output keys when a boundary expression has no exact registered-array attribution.
+    primary_name: str = next(iter(registered_arrays)) if registered_arrays else "f"
+    reg_values = list(registered_arrays.values())
+    param_names = [a.arg for a in callback_def.args.args]
+
+    scope = _Scope()
+    # Pre-bind common aliases so callbacks can use ``da.sum(...)`` / ``np.array(...)`` without explicit imports (all
+    # lazy, never executed). ``dask_array`` is the module's own import alias; ``dask`` covers bare-``dask.array``
+    # attribute chains, both resolve to the same ``dask.array`` module.
+    for alias in ("da", "dask_array", "dask"):
+        scope.set(alias, da)
+    scope.set("np", np)
+
+    for idx, pname in enumerate(param_names):
+        if pname == "window":
+            scope.set(pname, _WindowProxy(reg_values))
+        elif idx < len(reg_values):
+            scope.set(pname, reg_values[idx])
+        else:
+            scope.set(pname, _UnboundParam(pname))
+
+    # 4. Walk the callback body and collect compute boundaries.
+    walker = _BoundaryWalker(source_file=source_file, primary_name=primary_name, registered_arrays=registered_arrays)
+    walker.walk_body(callback_def.body, scope)
+
+    # 6. Materialization takes priority: if any np.array/asarray on a dask array was found, the callback can't be
+    # precomputed at all.
+    if walker.had_materialization:
+        raise MaterializationError(
+            "Callback contains a full materialization (e.g. np.array(dask_array)) that defeats precomputation."
+        )
+
+    dask_arrays = walker.dask_arrays
+    had_boundaries = bool(walker.boundaries)
+
+    # One shared seen-map for the WHOLE callback: output_key must be unique per reduction signature across every compute
+    # boundary of the callback (e.g. ``arr.sum()`` + ``arr.sum(axis=0)`` must not both key ``f-sum``).
+    output_key_seen: Dict = {}
+
+    # 7. Walk the dask graphs to find reductions.
+    def _registered_ndim(name: str) -> Optional[int]:
+        value = registered_arrays.get(name)
+        if isinstance(value, dict):
+            shape = value.get("global_shape")
+            return len(tuple(shape)) if shape else None
+        ndim = getattr(value, "ndim", None) if value is not None else None
+        return int(ndim) if ndim is not None else None
+
+    hints: List[Dict[str, Any]] = []
+    covered_boundaries: set = set()
+    for arr_info in dask_arrays:
+        darr = arr_info["array"]
+        # Attribute each boundary expression to its registered array(s): the stub layer tag (``deisa-stub-<name>``) is
+        # reliable provenance even when arrays share identical metadata. A cross-array expression is attributed to the
+        # FIRST match and flagged ``multi_source`` so the branch builder refuses it.
+        matched = _match_source_arrays(darr, registered_arrays)
+        array_name = matched[0] if matched else primary_name
+        multi = len(matched) > 1
+        try:
+            new_hints = extract_reduction_hints(
+                darr, array_name, output_key_seen=output_key_seen, array_ndim=_registered_ndim(array_name)
+            )
+        except UnsupportedReductionError:
+            # Cross-reduction dependency detected. This is the signal we MUST propagate to the caller. The precompute
+            # path cannot produce correct per-bridge partials for an expression whose reduction depends on another
+            # reduction's output. Precompute=True users get an error here, recompute=False users get it handled by
+            # analyze_branch.
+            raise
+        except Exception as e:  # pragma: no cover - safety net
+            logger.debug("extract_reduction_hints failed: %s", e)
+            new_hints = []
+        if new_hints:
+            covered_boundaries.add(id(arr_info))
+        for hint in new_hints:
+            hint["array_name"] = array_name
+            hint["multi_source"] = multi
+        hints.extend(new_hints)
+
+    # Raw-data boundary check: a compute boundary on stub-derived data that produced NO reduction hint for its OWN
+    # expression means the callback reads (or computes) the raw chunk data without a chunk-local reduction --
+    # ``darr[0, 0].compute()`` alongside ``darr.sum().compute()``, a bare ``darr.compute()``, ``da.fft.fft2(darr)
+    # .compute()`` when dask built the FFT. The precompute path cannot serve it -- refuse loudly. Per-boundary (not
+    # per-callback): other reductions in the same callback do not excuse the raw read.
+    for arr_info in dask_arrays:
+        candidate = arr_info.get("array")
+        if (
+            id(arr_info) not in covered_boundaries
+            and isinstance(candidate, da.Array)
+            and _is_stub_derived(candidate, registered_arrays)
+        ):
+            raise RawFieldReadError(
+                f"Callback {callback.__name__!r} consumes the registered array's raw data without a chunk-local "
+                f"reduction (compute boundary at line {arr_info.get('lineno', '?')}). The precompute path only "
+                f"delivers per-bridge reduction partials, never the full chunk. Register it with precompute=False "
+                f"to switch it to the legacy full-chunk scatter path."
+            )
+
+    # 8. No hints means the callback is unanalyzable: raise the specific reason.
+    if not hints:
+        if not had_boundaries:
+            raise NoComputeBoundaryError(
+                f"Callback {callback.__name__!r} contains dask operations but no compute boundaries "
+                f"(.compute(), client.compute(), client.submit(), etc.). "
+                f"Cannot determine which arrays to precompute."
+            )
+        raise NoPrecomputableReductionError(
+            f"Callback {callback.__name__!r} contains compute boundaries but no reductions we can precompute."
+        )
+
+    return hints, dask_arrays
+
+
+# --------------------------------------------------------------------------- Source file: AST cache + helper lookup
+# ---------------------------------------------------------------------------
+class _SourceFile:
+    """Holds the AST of a source file with name -> FunctionDef/ClassDef indices."""
+
+    def __init__(self, tree: ast.AST):
+        self.tree = tree
+        self._functions: Dict[str, ast.FunctionDef] = {}
+        self._index_body(tree.body)
+
+    @classmethod
+    def from_tree(cls, tree: ast.AST) -> "_SourceFile":
+        return cls(tree)
+
+    def _index_body(self, body: List[ast.stmt]) -> None:
+        for node in body:
+            if isinstance(node, ast.FunctionDef):
+                self._functions[node.name] = node
+
+    def find_function(self, name: str) -> Optional[ast.FunctionDef]:
+        return self._functions.get(name)
+
+
+def _get_source(fn: Callable) -> str:
+    """Get the source code for a function, dedented.
+
+    Order of resolution: 1. ``fn.__source__`` attribute (set by test helpers that compile via ``exec``) 2.
+    ``inspect.getsource`` (works for real source files)
+    """
+    src_attr = getattr(fn, "__source__", None)
+    if src_attr is not None:
+        return textwrap.dedent(src_attr)
+    try:
+        src = inspect.getsource(fn)
+    except (OSError, TypeError) as e:
+        raise IncompatibleCallbackError(
+            f"Cannot read source of {getattr(fn, '__name__', fn)!r}: {e}. "
+            "The AST-based analyzer requires a real Python function with source."
+        ) from e
+    return textwrap.dedent(src)
+
+
+# --------------------------------------------------------------------------- Scope and value markers
+# ---------------------------------------------------------------------------
+class _Scope:
+    """Tracks variable bindings during symbolic evaluation."""
+
+    def __init__(self, parent: Optional["_Scope"] = None):
+        self.bindings: Dict[str, Any] = {}
+        self.parent = parent
+
+    def get(self, name: str) -> Any:
+        if name in self.bindings:
+            return self.bindings[name]
+        if self.parent is not None:
+            return self.parent.get(name)
+        return _Missing(name)
+
+    def set(self, name: str, value: Any) -> None:
+        self.bindings[name] = value
+
+    def child(self) -> "_Scope":
+        return _Scope(parent=self)
+
+
+class _Missing:
+    """Sentinel for unbound names."""
+
+    __slots__ = ("name",)
+
+    def __init__(self, name: str):
+        self.name = name
+
+    def __getattr__(self, attr: str) -> "_Missing":
+        return _Missing(f"{self.name}.{attr}")
+
+    def __getitem__(self, key: Any) -> "_Missing":
+        return _Missing(f"{self.name}[{key!r}]")
+
+    def __call__(self, *args: Any, **kwargs: Any) -> "_Missing":
+        return _Missing(f"{self.name}()")
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __contains__(self, item: Any) -> bool:
+        # ``_Missing`` is an empty container. Without this, ``in`` falls back to ``__getitem__`` with ever-increasing
+        # indices which ``_Missing`` never raises on -- an infinite loop on ``if "key" not in state:``.
+        return False
+
+    def __iter__(self):
+        # Match the empty-container contract so ``iter(_Missing)`` yields nothing rather than looping on ``__getitem__``
+        return iter(())
+
+    # Arithmetic: pass through as _Missing
+    def _binop(self, other: Any) -> "_Missing":
+        return _Missing(f"{self.name}")
+
+    __add__ = __radd__ = _binop
+    __sub__ = __rsub__ = _binop
+    __mul__ = __rmul__ = _binop
+    __truediv__ = __rtruediv__ = _binop
+    __floordiv__ = __rfloordiv__ = _binop
+    __mod__ = __rmod__ = _binop
+    __pow__ = __rpow__ = _binop
+    __lshift__ = __rlshift__ = _binop
+    __rshift__ = __rrshift__ = _binop
+    __and__ = __rand__ = _binop
+    __or__ = __ror__ = _binop
+    __xor__ = __rxor__ = _binop
+    __matmul__ = __rmatmul__ = _binop
+
+    def __neg__(self) -> "_Missing":
+        return _Missing(self.name)
+
+    def __pos__(self) -> "_Missing":
+        return _Missing(self.name)
+
+    def __invert__(self) -> "_Missing":
+        return _Missing(self.name)
+
+    # Comparisons must not crash: the walker's ``_apply_compare`` treats ``_Missing`` operands as UNKNOWN and walks both
+    # ``ast.If`` branches. These dunders are the backstop for direct comparisons outside the walker: return ``False``
+    # (same falsy behavior as ``__bool__``).
+    def _compare_op(self, other: Any) -> bool:
+        return False
+
+    __lt__ = __le__ = __gt__ = __ge__ = __eq__ = __ne__ = _compare_op
+
+    def __repr__(self) -> str:
+        return f"<Missing {self.name!r}>"
+
+
+class _UnboundParam:
+    """Marker for callback parameters the user did not pass to analyze_callback.
+
+    Behaves as a Python scalar in arithmetic so dask operations still build a valid graph (the actual value is
+    irrelevant - we only need the graph structure to extract reduction hints).
+    """
+
+    __slots__ = ("name",)
+
+    def __init__(self, name: str):
+        self.name = name
+
+    def __mul__(self, other):
+        return other * 0.0
+
+    __rmul__ = __mul__
+
+    def __add__(self, other):
+        return other
+
+    __radd__ = __add__
+    __sub__ = __add__
+    __rsub__ = __add__
+
+    def __truediv__(self, other):
+        return 0.0
+
+    __rtruediv__ = __truediv__
+
+    def __pow__(self, other):
+        return 0.0**other
+
+    def __rpow__(self, other):
+        return other**0.0
+
+    def __neg__(self):
+        return 0.0
+
+    __pos__ = __neg__
+
+    def __repr__(self) -> str:
+        return f"<UnboundParam {self.name!r}>"
+
+
+class _WindowProxy:
+    """List-like proxy used in place of the user's ``window`` parameter.
+
+    Supports integer subscripting (positive or negative) to return one of the registered arrays. Reading any other
+    attribute/method raises.
+    """
+
+    def __init__(self, arrays: List[Any]):
+        self._arrays = list(arrays)
+
+    def __len__(self) -> int:
+        return len(self._arrays)
+
+    def __getitem__(self, idx: int) -> Any:
+        return self._arrays[idx]
+
+    def __iter__(self):
+        return iter(self._arrays)
+
+
+# --------------------------------------------------------------------------- Boundary walker
+# ----------------------------------------------------------------------- Functions we recognize as materialization
+# (forbid precompute).
+_MATERIALIZING_FUNCS = {"array", "asarray", "save", "savetxt", "savez", "savez_compressed"}
+
+# Maximum iterations a ``for x in range(...)`` loop may statically unroll (one AST walk per iteration); beyond the cap
+# the loop is refused loudly instead of silently burning CPU.
+_MAX_FOR_UNROLL = 1000
+
+# Operator dispatch tables: each maps an ``ast`` operator node type to the :mod:`operator` function Python would
+# dispatch (same dunder semantics, so dask arrays build their graph lazily and placeholder propagation is unchanged).
+_BINOPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+    ast.LShift: operator.lshift,
+    ast.RShift: operator.rshift,
+    ast.BitOr: operator.or_,  # bitwise |; ast.And is a BoolOp, not here
+    ast.BitXor: operator.xor,
+    ast.BitAnd: operator.and_,  # bitwise &
+    ast.MatMult: operator.matmul,
+}
+
+
+def _unary_not(operand: Any) -> bool:
+    # ``not _truthy(operand)`` semantics -- NOT ``operator.not_``, which would call ``__bool__`` on a dask array and
+    # raise "ambiguous truth value".
+    return not _truthy(operand)
+
+
+_UNARYOPS = {
+    ast.USub: operator.neg,
+    ast.UAdd: operator.pos,
+    ast.Invert: operator.invert,
+    ast.Not: _unary_not,
+}
+
+_CMPOPS = {
+    ast.Eq: operator.eq,
+    ast.NotEq: operator.ne,
+    ast.Lt: operator.lt,
+    ast.LtE: operator.le,
+    ast.Gt: operator.gt,
+    ast.GtE: operator.ge,
+    ast.Is: operator.is_,
+    ast.IsNot: operator.is_not,
+    # operator.contains reverses its argument order (contains(b, a)); the lambda keeps ``a in b`` argument order.
+    ast.In: lambda a, b: a in b,
+    ast.NotIn: lambda a, b: a not in b,
+}
+
+# ----------------------------------------------------------------------- Effect-bearing bare names: calls that hit the
+# dask scheduler (defeating precompute) or perform I/O / mutation. Anything NOT here resolves as a dask reduction, a
+# pure builtin, a registered helper, or opaque (_Missing). Bare ``compute()``/``persist()`` are refused via this set;
+# the attribute-call branch handles ``arr.compute()`` separately. ``lambda`` is handled by the walker's open-world
+# degradation (extract to a module-level helper instead).
+_EFFECT_BEARING_NAMES = frozenset(
+    {
+        # Dask control flow that bypasses precompute.
+        "compute",
+        "persist",
+        # I/O and process spawning -- never safe in an analytical walker.
+        "open",
+        "exec",
+        "eval",
+        "compile",
+        "input",
+        # ``getattr`` makes the AST opaque; the attribute-call branch already resolves ``obj.attr`` statically, so this
+        # is redundant and a common source of dynamic-dispatch bugs.
+        "getattr",
+    }
+)
+
+
+# Pure-Python builtins: they cannot reach the dask scheduler and do not mutate outer state. Resolved locally, result
+# returned as a plain value. Missing keys fall to a generic type-conversion resolver. They propagate ``_Missing``
+# arguments (open-world: any builtin call on an unresolved sub-expression keeps the analysis alive, degrading to the
+# full-chunk path).
+def _safe_pure_call(fn, args, kwargs):
+    """Apply ``fn`` to args/kwargs, propagating ``_Missing`` instead of raising when an argument is opaque.
+    Any exception is caught and returns ``_Missing`` so the analyzer stays open-world."""
+    if any(isinstance(a, _Missing) for a in args) or any(isinstance(v, _Missing) for v in kwargs.values()):
+        return _Missing(f"{fn.__name__}(...)")
+    try:
+        return fn(*args, **kwargs)
+    except Exception:
+        return _Missing(f"{fn.__name__}(...)")
+
+
+_PURE_BUILTINS: dict = {
+    "len": lambda args, kwargs: _safe_pure_call(lambda x: len(x), args, kwargs),
+    "int": lambda args, kwargs: _safe_pure_call(lambda x: int(x), args, kwargs),
+    "float": lambda args, kwargs: _safe_pure_call(lambda x: float(x), args, kwargs),
+    "bool": lambda args, kwargs: _safe_pure_call(lambda x: bool(x), args, kwargs),
+    "abs": lambda args, kwargs: _safe_pure_call(lambda x: abs(x), args, kwargs),
+    "round": lambda args, kwargs: _safe_pure_call(round, args, kwargs),
+    "print": lambda args, kwargs: None,  # void -- always safe
+    "slice": lambda args, kwargs: _safe_pure_call(slice, args, kwargs),
+    "tuple": lambda args, kwargs: _safe_pure_call(lambda x: tuple(x) if x is not None else (), args, kwargs),
+    "list": lambda args, kwargs: _safe_pure_call(lambda x: list(x) if x is not None else [], args, kwargs),
+    # Predicate builtins: they inspect a value's type/attrs, never its data, so a raw array may reach them (e.g.
+    # ``assert isinstance(darr, DeisaArray)`` in a precompute callback) without breaking the raw-data contract.
+    "isinstance": lambda args, kwargs: _safe_pure_call(isinstance, args, kwargs),
+    "hasattr": lambda args, kwargs: _safe_pure_call(hasattr, args, kwargs),
+}
+
+
+class _BoundaryWalker:
+    """Walks the callback's AST looking for compute boundaries.
+
+    A compute boundary is a call that forces a dask array to materialize: - ``arr.compute()`` - ``client.compute(arr)``
+    / ``client.compute([arr1, ...])`` - ``client.submit(func, arr)`` - ``np.array(darr)`` / ``np.asarray(darr)``
+    (materialization - error)
+
+    When a boundary is found, the argument expression is symbolically evaluated to a dask array (lazy - no execution),
+    and the array is queued for graph extraction. For lists, every element is queued.
+    """
+
+    def __init__(
+        self, source_file: _SourceFile, primary_name: str = "f", registered_arrays: Optional[Dict[str, Any]] = None
+    ):
+        self.source_file = source_file
+        self.primary_name = primary_name
+        # Registered-array metadata: the raw-data provenance map for the taint check
+        # (:func:`_is_stub_derived`). ``None`` (unit-test walkers) disables the check.
+        self.registered_arrays = registered_arrays or {}
+        self.dask_arrays: List[Dict[str, Any]] = []
+        self.boundaries: List[Dict[str, Any]] = []
+        self.had_materialization: bool = False
+
+    def _check_taint(self, args: List[Any], node: ast.AST, ctx: str) -> None:
+        """Raise :class:`RawFieldReadError` when a raw-data value reaches a non-reduction consumer.
+
+        ``ctx`` names the consumer (the call form) for the error message. Conservative by design: any stub-derived
+        argument means the callback consumes the chunk's raw values, which the precompute path does not ship.
+        """
+        if not self.registered_arrays:
+            return
+        for a in args:
+            for item in a if isinstance(a, (list, tuple)) else (a,):
+                if isinstance(item, da.Array) and _is_stub_derived(item, self.registered_arrays):
+                    raise RawFieldReadError(
+                        f"Callback passes the registered array's raw data (line {getattr(node, 'lineno', -1)}) to "
+                        f"{ctx!r}. The precompute path only delivers per-bridge reduction partials, never the full "
+                        f"chunk, so this callback cannot run under precompute. Register it with precompute=False "
+                        f"to switch it to the legacy full-chunk scatter path."
+                    )
+
+    # -- Statement walking -------------------------------------------------
+    def walk_body(self, body: List[ast.stmt], scope: _Scope) -> None:
+        for stmt in body:
+            self.walk_stmt(stmt, scope)
+
+    def walk_stmt(self, stmt: ast.stmt, scope: _Scope) -> None:
+        if isinstance(stmt, ast.Assign):
+            value = self._eval(stmt.value, scope)
+            for target in stmt.targets:
+                self._assign_target(target, value, scope)
+            return
+        if isinstance(stmt, ast.AugAssign):
+            current = self._eval(stmt.target, scope)
+            rhs = self._eval(stmt.value, scope)
+            new_value = self._binop(stmt.op, current, rhs)
+            self._assign_target(stmt.target, new_value, scope)
+            return
+        if isinstance(stmt, ast.Expr):
+            # Expression statement: evaluate, but ignore result.
+            self._eval(stmt.value, scope)
+            return
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            # Bind imported modules/names so aliased numpy/dask are recognized by the materialization / reduction
+            # dispatchers (otherwise every alias resolves to ``_Missing`` and e.g. ``npy.array(dask_arr)`` bypasses
+            # materialization detection).
+            self._bind_import(stmt, scope)
+            return
+        if isinstance(stmt, ast.If):
+            test = self._eval(stmt.test, scope)
+            branch_value = _truthy(test)
+            if branch_value is True:
+                self.walk_body(stmt.body, scope)
+            elif branch_value is False:
+                self.walk_body(stmt.orelse, scope)
+            else:
+                # Both branches: walk them sequentially (defensive)
+                self.walk_body(stmt.body, scope)
+                self.walk_body(stmt.orelse, scope)
+            return
+        if isinstance(stmt, ast.For):
+            self._walk_for(stmt, scope)
+            return
+        if isinstance(stmt, ast.Return):
+            if stmt.value is not None:
+                self._eval(stmt.value, scope)
+            return
+        if isinstance(stmt, (ast.Pass, ast.Break, ast.Continue)):
+            return
+        if isinstance(stmt, ast.Try):
+            self.walk_body(stmt.body, scope)
+            for handler in stmt.handlers:
+                self.walk_body(handler.body, scope)
+            self.walk_body(stmt.orelse, scope)
+            self.walk_body(stmt.finalbody, scope)
+            return
+        if isinstance(stmt, ast.With):
+            for item in stmt.items:
+                ctx = self._eval(item.context_expr, scope)
+                if item.optional_vars is not None:
+                    self._assign_target(item.optional_vars, ctx, scope)
+            self.walk_body(stmt.body, scope)
+            return
+        # Anything else: best-effort evaluation. We don't need to surface IncompatibleCallbackError for rare AST shapes.
+        # The tests that need them can be added explicitly.
+        self._eval(stmt, scope)
+
+    # -- For-loop: static-range unroll, else fail --------------------------
+    def _bind_import(self, stmt: "ast.Import | ast.ImportFrom", scope: _Scope) -> None:
+        """Bind numpy / dask imports in the walker scope.
+
+        Only the modules the analyzer can resolve symbolically are bound: ``numpy`` (for materialization detection) and
+        ``dask.array`` (for reductions). Any other import is ignored (analysis continues treating the name as opaque).
+        ``from``-imports bind the resolved attribute (``from numpy import array`` binds ``array -> np.array``).
+        """
+        if isinstance(stmt, ast.Import):
+            for alias in stmt.names:
+                if alias.name == "numpy":
+                    scope.set(alias.asname or alias.name, np)
+                elif alias.name == "dask.array":
+                    scope.set(alias.asname or alias.name, da)
+            return
+        module_map = {"numpy": np, "dask.array": da}
+        target = module_map.get(stmt.module or "")
+        if target is None:
+            return
+        for alias in stmt.names:
+            if alias.name == "*":
+                continue
+            attr = getattr(target, alias.name, None)
+            if attr is not None:
+                scope.set(alias.asname or alias.name, attr)
+
+    def _walk_for(self, stmt: ast.For, scope: _Scope) -> None:
+        values = self._try_unroll_iter(stmt.iter, scope)
+        if values is None:
+            raise IncompatibleCallbackError(
+                f"For-loop over non-constant iterable at line {getattr(stmt, 'lineno', -1)}: "
+                "only `for x in range(<constant>)` or `for x in [<literal>]` is supported."
+            )
+        target = stmt.target
+        for value in values:
+            inner_scope = scope.child()
+            self._assign_target(target, value, inner_scope)
+            self.walk_body(stmt.body, inner_scope)
+            if stmt.orelse:
+                self.walk_body(stmt.orelse, inner_scope)
+
+    def _try_unroll_iter(self, iter_node: ast.AST, scope: _Scope) -> Optional[List[Any]]:
+        if isinstance(iter_node, ast.Call):
+            func = iter_node.func
+            if isinstance(func, ast.Name) and func.id == "range":
+                args = []
+                for a in iter_node.args:
+                    v = self._eval(a, scope)
+                    if isinstance(v, _Missing):
+                        return None
+                    args.append(v)
+                try:
+                    if not args:
+                        rng = range(0)
+                    elif len(args) == 1:
+                        rng = range(int(args[0]))
+                    elif len(args) == 2:
+                        rng = range(int(args[0]), int(args[1]))
+                    elif len(args) == 3:
+                        rng = range(int(args[0]), int(args[1]), int(args[2]))
+                    else:
+                        return None
+                except (TypeError, ValueError):
+                    return None
+                if len(rng) > _MAX_FOR_UNROLL:
+                    raise IncompatibleCallbackError(
+                        f"For-loop over range({', '.join(str(a) for a in args)}) at line "
+                        f"{getattr(iter_node, 'lineno', -1)} statically unrolls {len(rng)} iterations; "
+                        f"the precompute analyzer caps unrolling at {_MAX_FOR_UNROLL}. Reduce the loop "
+                        f"bound or extract the loop body into a helper."
+                    )
+                return list(rng)
+        if isinstance(iter_node, (ast.List, ast.Tuple)):
+            return [self._eval(elt, scope) for elt in iter_node.elts]
+        return None
+
+    # -- Assignment --------------------------------------------------------
+    def _assign_target(self, target: ast.AST, value: Any, scope: _Scope) -> None:
+        if isinstance(target, ast.Name):
+            scope.set(target.id, value)
+            return
+        if isinstance(target, (ast.Tuple, ast.List)):
+            if not isinstance(value, (list, tuple)):
+                raise IncompatibleCallbackError(
+                    f"Cannot unpack non-iterable value into tuple at line {getattr(target, 'lineno', -1)}"
+                )
+            if len(value) != len(target.elts):
+                raise IncompatibleCallbackError(
+                    f"Tuple/list assignment size mismatch at line {getattr(target, 'lineno', -1)}"
+                )
+            for elt, v in zip(target.elts, value):
+                self._assign_target(elt, v, scope)
+            return
+        if isinstance(target, ast.Subscript):
+            # obj[idx] = value -- not supported, but benign for closures.
+            return
+        if isinstance(target, ast.Attribute):
+            obj = self._eval(target.value, scope)
+            if isinstance(obj, (_Missing, _UnboundParam)):
+                return  # benign
+            setattr(obj, target.attr, value)
+            return
+        raise IncompatibleCallbackError(
+            f"Unsupported assignment target: {type(target).__name__} at line {getattr(target, 'lineno', -1)}"
+        )
+
+    # -- Expression evaluation -------------------------------------------- Registry of AST node type -> handler
+    # (open-world: unknown falls through)
+    _EVAL_HANDLERS = {
+        ast.Constant: lambda self, n, s: n.value,
+        ast.Name: lambda self, n, s: s.get(n.id),
+        ast.BinOp: lambda self, n, s: self._binop(n.op, self._eval(n.left, s), self._eval(n.right, s)),
+        ast.UnaryOp: lambda self, n, s: self._unaryop(n.op, self._eval(n.operand, s)),
+        ast.BoolOp: lambda self, n, s: self._boolop(n.op, n.values, s),
+        ast.Compare: lambda self, n, s: self._compare(n, s),
+        ast.Subscript: lambda self, n, s: self._apply_subscript(self._eval(n.value, s), self._slice(n.slice, s)),
+        ast.Call: lambda self, n, s: self._call_map_blocks(n, s) if self._is_map_blocks_call(n) else self._call(n, s),
+        ast.Attribute: lambda self, n, s: self._attr(n, s),
+        ast.IfExp: lambda self, n, s: self._ifexp(n, s),
+        ast.List: lambda self, n, s: [self._eval(e, s) for e in n.elts],
+        ast.Tuple: lambda self, n, s: tuple(self._eval(e, s) for e in n.elts),
+        ast.Dict: lambda self, n, s: {self._eval(k, s): self._eval(v, s) for k, v in zip(n.keys, n.values)},
+        ast.Assert: lambda self, n, s: (self._eval(n.test, s), None)[1],
+        ast.Starred: lambda self, n, s: self._eval(n.value, s),
+    }
+    # JoinedStr handled separately (iterates over mixed constant/interpolated parts)
+
+    def _eval(self, node: ast.AST, scope: _Scope) -> Any:
+        # Open-world dispatcher: exact match first, then fall through to the registry, then degrade unknown nodes to
+        # _Missing or raise.
+        if isinstance(node, ast.JoinedStr):
+            parts = []
+            for v in node.values:
+                if isinstance(v, ast.Constant):
+                    parts.append(v.value)
+                elif isinstance(v, ast.FormattedValue):
+                    # f-string interpolation: evaluate embedded expression but discard result (string fragment only).
+                    parts.append(str(self._eval(v.value, scope)))
+                else:
+                    parts.append(self._eval(v, scope))
+            return "".join(parts)
+        handler = self._EVAL_HANDLERS.get(type(node))
+        if handler is not None:
+            return handler(self, node, scope)
+        # Open-world default: anything unrecognized degrades gracefully instead of raising. This is consistent with
+        # b001780.
+        return _Missing(f"unsupported AST node: {type(node).__name__}")
+
+    def _slice(self, slc: ast.AST, scope: _Scope) -> Any:
+        if isinstance(slc, ast.Slice):
+            lower = self._eval(slc.lower, scope) if slc.lower is not None else None
+            upper = self._eval(slc.upper, scope) if slc.upper is not None else None
+            step = self._eval(slc.step, scope) if slc.step is not None else None
+            return slice(lower, upper, step)
+        if isinstance(slc, ast.Tuple):
+            return tuple(self._slice(e, scope) for e in slc.elts)
+        return self._eval(slc, scope)
+
+    def _apply_subscript(self, value: Any, slc: Any) -> Any:
+        if isinstance(value, _Missing):
+            return _Missing(f"{value.name}[...]")
+        if isinstance(value, _UnboundParam):
+            # An unbound callback parameter is a placeholder scalar; subscripting it is as opaque as subscripting
+            # ``_Missing`` (previously raised ``TypeError`` and crashed analysis).
+            return _Missing(f"{value.name}[...]")
+        if isinstance(value, da.Array):
+            return value[slc]
+        if isinstance(value, _WindowProxy):
+            if isinstance(slc, int):
+                return value[slc]
+            raise IncompatibleCallbackError("window subscript must be an integer")
+        if isinstance(value, (list, tuple, np.ndarray)):
+            return value[slc]
+        # Other types: try to subscript and hope for the best
+        return value[slc]
+
+    def _ifexp(self, node: ast.IfExp, scope: _Scope) -> Any:
+        test = _truthy(self._eval(node.test, scope))
+        if test is True:
+            return self._eval(node.body, scope)
+        if test is False:
+            return self._eval(node.orelse, scope)
+        # Unknown/None test: walk the body as a defensive default.
+        return self._eval(node.body, scope)
+
+    # -- Operators ---------------------------------------------------------
+    def _binop(self, op: ast.AST, left: Any, right: Any) -> Any:
+        fn = _BINOPS.get(type(op))
+        if fn is None:
+            raise IncompatibleCallbackError(f"Unsupported binary operator: {type(op).__name__}")
+        return fn(left, right)
+
+    def _unaryop(self, op: ast.AST, operand: Any) -> Any:
+        fn = _UNARYOPS.get(type(op))
+        if fn is None:
+            raise IncompatibleCallbackError(f"Unsupported unary operator: {type(op).__name__}")
+        return fn(operand)
+
+    def _boolop(self, op: ast.AST, values: List[Any], scope: _Scope) -> Any:
+        """Evaluate ``and``/``or`` with three-valued logic."""
+        saw_unknown = False
+        if isinstance(op, ast.And):
+            for v in values:
+                tv = _truthy(self._eval(v, scope))
+                if tv is False:
+                    return False
+                if tv is None:
+                    saw_unknown = True
+            return None if saw_unknown else True
+        if isinstance(op, ast.Or):
+            for v in values:
+                tv = _truthy(self._eval(v, scope))
+                if tv is True:
+                    return True
+                if tv is None:
+                    saw_unknown = True
+            return None if saw_unknown else False
+        raise IncompatibleCallbackError(f"Unsupported boolean op: {type(op).__name__}")
+
+    def _compare(self, node: ast.Compare, scope: _Scope) -> Any:
+        left = self._eval(node.left, scope)
+        for op, comp_node in zip(node.ops, node.comparators):
+            right = self._eval(comp_node, scope)
+            ok = self._apply_compare(op, left, right)
+            if ok is None:
+                # Unknown operand: the whole comparison is UNKNOWN. The walker's ``ast.If`` handler then explores both
+                # branches; it never assumes the comparison's outcome.
+                return None
+            if not ok:
+                return False
+            left = right
+        return True
+
+    def _apply_compare(self, op: ast.AST, left: Any, right: Any) -> Optional[bool]:
+        """Return ``True``/``False``, or ``None`` when the comparison is UNKNOWN.
+
+        ``_Missing`` / ``_UnboundParam`` operands, unknown comparison nodes, or operators that raise (ambiguity,
+        unsupported operand types) all yield ``None`` -- never an assumed outcome: an opaque condition must not emit
+        degradation must not mean "assume a branch and emit a wrong hint".
+        """
+        if isinstance(left, (_Missing, _UnboundParam)) or isinstance(right, (_Missing, _UnboundParam)):
+            return None
+        fn = _CMPOPS.get(type(op))
+        if fn is None:
+            return None
+        try:
+            return bool(fn(left, right))
+        except Exception:
+            return None
+
+    # -- Attribute access --------------------------------------------------
+    def _attr(self, node: ast.Attribute, scope: _Scope) -> Any:
+        obj = self._eval(node.value, scope)
+        attr = node.attr
+        if isinstance(obj, _Missing):
+            return _Missing(f"{obj.name}.{attr}")
+        try:
+            return getattr(obj, attr)
+        except AttributeError:
+            # The placeholder is a dask Array and the user's callback is reading a domain attribute we don't know about
+            # (e.g. ``window[-1].t`` on a DeisaArray wrapper that hasn't been resolved at registration time). Degrade to
+            # ``_Missing`` so f-string formatting and other open-world paths can still consume the result. The
+            # precompute analysis continues; the bridge will fall back to the full-chunk scatter for that callback.
+            logger.debug(
+                "attribute %r not present on %s at line %d; treating the access as opaque.",
+                attr,
+                type(obj).__name__,
+                getattr(node, "lineno", -1),
+            )
+            return _Missing(f"<obj>.{attr}")
+
+    # -- Calls: this is where compute boundaries are detected --------------
+    def _is_map_blocks_call(self, node: ast.Call) -> bool:
+        # Detect ``arr.map_blocks(...)`` method calls for MapBlocks fixtures
+        return isinstance(node.func, ast.Attribute) and node.func.attr == "map_blocks"
+
+    def _call_map_blocks(self, node: ast.Call, scope: _Scope) -> Any:
+        # Placeholder must be the MAPPED array, never the receiver (analysis on the receiver emits ``sum(arr)`` where
+        # the user asked for ``sum(2*arr)``). Build the mapped placeholder when symbolically evaluable; otherwise
+        # ``_Missing`` (refused, not mis-attributed).
+        if not isinstance(node.func, ast.Attribute):
+            return _Missing("map_blocks")
+        obj = self._eval(node.func.value, scope)
+        if not isinstance(obj, da.Array):
+            return _Missing("map_blocks")
+        args = [self._eval(a, scope) for a in node.args]
+        kwargs = self._eval_kwargs(node.keywords, scope)
+        # Refuse if ANY argument is opaque: a ``_Missing`` func is callable, so dask would build a graph executing it on
+        # the bridge -- a garbage partial. Only resolvable funcs build the placeholder.
+        if any(isinstance(v, (_Missing, _UnboundParam)) for v in args) or any(
+            isinstance(v, (_Missing, _UnboundParam)) for v in kwargs.values()
+        ):
+            return _Missing("map_blocks")
+        try:
+            return obj.map_blocks(*args, **kwargs)
+        except Exception as e:
+            # dask refused to build the map (bad chunks/dtype combination, etc.). Treat the whole expression as opaque:
+            # the surrounding code keeps working and this branch reports no hint (NoPrecomputableReductionError /
+            # precompute=False fallback).
+            logger.debug("map_blocks call failed: %s", e)
+            return _Missing("map_blocks")
+
+    def _call(self, node: ast.Call, scope: _Scope) -> Any:
+        func = node.func
+
+        # ---- Materialization detection (np.array/asarray/save on dask arrays) ---- Resolve the receiver through the
+        # SCOPE, not a literal ``np`` name match: aliased numpy (``import numpy as npy``) binds under another name and a
+        # bare ``recv.id == "np"`` check would miss it (an undetected full gather analysed as a chunk-local reduction).
+        if isinstance(func, ast.Attribute) and func.attr in _MATERIALIZING_FUNCS:
+            recv = func.value
+            if self._eval(recv, scope) is np:
+                arg_vals = [self._eval(a, scope) for a in node.args]
+                if any(isinstance(v, da.Array) for v in arg_vals):
+                    self.had_materialization = True
+                    self.boundaries.append({"kind": "materialize", "lineno": node.lineno, "func": f"np.{func.attr}"})
+                    return _Missing(f"np.{func.attr}(...)")
+                # Materializing call on PLAIN data (e.g. np.array([1, 2])): not a dask materialization; keep the
+                # existing opaque-return behavior so the analysis continues without executing the call.
+                return _Missing(f"np.{func.attr}(...)")
+
+        # ---- Compute boundary: client.compute(...) / client.submit(...) ---- We don't know the client's identity
+        # statically; the user typically does ``client = get_client()``. We treat any ``.compute``/``.submit`` method
+        # call on a non-dask-array receiver as a compute boundary and register any dask arrays found in the arguments.
+        if isinstance(func, ast.Attribute) and func.attr in {"compute", "submit"}:
+            recv_value = self._eval(func.value, scope)
+            if not isinstance(recv_value, da.Array):
+                args = [self._eval(a, scope) for a in node.args]
+                for a in args:
+                    self._register_args_as_dask_arrays(a, f"client.{func.attr}", node.lineno)
+                self.boundaries.append({"kind": func.attr, "lineno": node.lineno, "func": f"client.{func.attr}"})
+                return _Missing(f"client.{func.attr}(...)")
+            # Otherwise it's ``arr.compute()`` -- fall through to the dask array method branch below, which will
+            # register the boundary and return _Missing.
+
+        # ---- Compute boundary: arr.compute() (receiver is a dask array) ----
+        if isinstance(func, ast.Attribute) and func.attr == "compute":
+            recv_value = self._eval(func.value, scope)
+            if isinstance(recv_value, da.Array):
+                self._register_compute_boundary(recv_value, "compute", node.lineno)
+            return _Missing(f"{func.value}.compute()")
+
+        # ---- dask/np submodule calls (e.g. da.fft.fft2(arr)) ----
+        if isinstance(func, ast.Attribute):
+            recv_value = self._eval(func.value, scope)
+            # dask array method calls
+            if isinstance(recv_value, da.Array):
+                attr = func.attr
+                if attr in {"compute", "persist"}:
+                    # Already handled above
+                    return _Missing(f"arr.{attr}()")
+                kwargs = self._eval_kwargs(node.keywords, scope)
+                args = [self._eval(a, scope) for a in node.args]
+                try:
+                    return getattr(recv_value, attr)(*args, **kwargs)
+                except Exception as e:
+                    # Dask may refuse to build the graph (e.g. FFT on multi-chunk axes, slicing out of bounds, etc.).
+                    # Treat as opaque -- the surrounding code keeps working and the absence of a compute boundary in
+                    # this branch is reported as NoPrecomputableReductionError.
+                    logger.debug("dask method call failed: %s", e)
+                    return _Missing(f"arr.{attr}(...)")
+            # Forward to the object (e.g. arr.shape, op.func, da.fft.fft2). Dask operations like da.fft.fft2(arr) may
+            # raise on stub arrays (e.g. multi-chunk axes); we catch and degrade to _Missing so analysis can continue.
+            kwargs = self._eval_kwargs(node.keywords, scope)
+            args = [self._eval(a, scope) for a in node.args]
+            if isinstance(recv_value, _Missing):
+                # Opaque receiver consuming the callback's arguments: if a raw-data value reaches it (e.g.
+                # ``plt.imshow(darr)`` or ``np.linalg.norm(darr)``), that is a raw-field read -- refuse loudly
+                # instead of returning ``_Missing`` and silently registering nothing.
+                self._check_taint(args, node, f"{getattr(recv_value, 'name', '<unknown>')}.{func.attr}")
+            try:
+                return getattr(recv_value, func.attr)(*args, **kwargs)
+            except Exception as e:
+                logger.debug("call failed: %s", e)
+                return _Missing(f"{recv_value}.{func.attr}(...)")
+
+        # ---- bare-name calls ----
+        if isinstance(func, ast.Name):
+            name = func.id
+
+            # 1. Effect-bearing names are always refused with a clear error -- they would either hit the scheduler
+            #    (defeating precompute) or perform I/O / mutation outside the analyzer's purview.
+            if name in _EFFECT_BEARING_NAMES:
+                raise IncompatibleCallbackError(
+                    f"Calling {name}() at line {node.lineno} is not supported: "
+                    f"this call would bypass precompute or perform side effects "
+                    f"the analyzer cannot reason about."
+                )
+
+            # 2. Dask reduction builtins -- the analyzer detects these specifically because the resulting dask Array is
+            #    the target of precompute analysis. They must be called as bare names (``sum(arr)``) or as methods
+            #    (``arr.sum()``) on a dask array.
+            if name in {"sum", "min", "max"}:
+                args = [self._eval(a, scope) for a in node.args]
+                kwargs = self._eval_kwargs(node.keywords, scope)
+                if args and isinstance(args[0], da.Array):
+                    return getattr(args[0], name)(**kwargs)
+                # Non-dask first arg: degrade to a plain Python call so analysis continues (e.g. ``sum([1, 2, 3])`` in a
+                # helper).
+                py_fn = {"sum": sum, "min": min, "max": max}[name]
+                return py_fn(*args, **kwargs) if args else None
+
+            # 3. Pure Python builtins -- always safe (cannot reach the scheduler, cannot mutate outer state). Resolved
+            #    locally; the result is a plain Python value.
+            if name in _PURE_BUILTINS:
+                args = [self._eval(a, scope) for a in node.args]
+                kwargs = self._eval_kwargs(node.keywords, scope)
+                return _PURE_BUILTINS[name](args, kwargs)
+
+            # 4. User-defined helper (same source file). The walker descends into the helper's body recursively.
+            helper_def = self.source_file.find_function(name)
+            if helper_def is not None:
+                return self._call_helper(helper_def, node, scope)
+
+            # 5. Unknown bare name -- treat as opaque (_Missing) so analysis can continue. This is the **default** for
+            #    anything the analyzer doesn't recognize: logging calls, custom modules, etc. The callback may still
+            #    produce a result (the bridge falls back to the full chunk scatter path for that callback), but it does
+            #    not fail the registration.
+            args = [self._eval(a, scope) for a in node.args]
+            # A raw-data value passed to an unrecognized call (e.g. ``helper(darr)``, ``custom(darr)``) is a raw-field
+            # read: refuse loudly rather than swallowing the argument into ``_Missing``.
+            self._check_taint(args, node, name)
+            logger.debug(
+                "bare-name %r at line %d is opaque to the analyzer; "
+                "the surrounding call is treated as a non-precompute "
+                "boundary.",
+                name,
+                node.lineno,
+            )
+            return _Missing(f"{name}(...)")
+
+        raise IncompatibleCallbackError(f"Unsupported call form: {type(func).__name__} at line {node.lineno}")
+
+    def _eval_kwargs(self, keywords: List[ast.keyword], scope: _Scope) -> Dict[str, Any]:
+        result: Dict[str, Any] = {}
+        for kw in keywords:
+            if kw.arg is None:
+                raise IncompatibleCallbackError(f"**kwargs expansion is not supported at line {kw.lineno}")
+            result[kw.arg] = self._eval(kw.value, scope)
+        return result
+
+    # -- Helpers -----------------------------------------------------------
+    def _register_compute_boundary(self, darr: da.Array, kind: str, lineno: int) -> None:
+        if isinstance(darr, da.Array):
+            self.dask_arrays.append({"array": darr, "kind": kind, "lineno": lineno})
+            self.boundaries.append({"kind": kind, "lineno": lineno, "func": "compute"})
+
+    def _register_args_as_dask_arrays(self, value: Any, kind: str, lineno: int) -> None:
+        """Recursively register dask arrays found in a boundary argument.
+
+        Handles: - a single dask array - a list/tuple of dask arrays - other values (skipped silently)
+        """
+        if isinstance(value, da.Array):
+            self.dask_arrays.append({"array": value, "kind": kind, "lineno": lineno})
+            return
+        if isinstance(value, (list, tuple)):
+            for v in value:
+                if isinstance(v, da.Array):
+                    self.dask_arrays.append({"array": v, "kind": kind, "lineno": lineno})
+            return
+        # _Missing / _UnboundParam / other: skip. We only need to find the dask arrays being computed.
+
+    def _call_helper(self, helper_def: ast.FunctionDef, node: ast.Call, scope: _Scope) -> Any:
+        helper_scope = scope.child()
+        args_nodes = list(node.args)
+        kwargs_nodes = {kw.arg: kw.value for kw in node.keywords if kw.arg is not None}
+
+        # Bind positional args
+        for i, param in enumerate(helper_def.args.args):
+            if i < len(args_nodes):
+                value = self._eval(args_nodes[i], scope)
+            elif param.arg in kwargs_nodes:
+                value = self._eval(kwargs_nodes[param.arg], scope)
+            elif param.arg in scope.bindings:
+                value = scope.get(param.arg)
+            else:
+                raise IncompatibleCallbackError(
+                    f"Helper {helper_def.name!r} parameter {param.arg!r} is not bound at line {node.lineno}"
+                )
+            helper_scope.set(param.arg, value)
+
+        # *args, **kwargs in helper: not supported
+        if helper_def.args.vararg or helper_def.args.kwarg or helper_def.args.kwonlyargs:
+            raise IncompatibleCallbackError(
+                f"Helper {helper_def.name!r} uses *args/**kwargs; not supported at line {node.lineno}"
+            )
+
+        # Defaults
+        defaults = helper_def.args.defaults
+        positional_args = helper_def.args.args
+        for i, default in enumerate(defaults):
+            param = positional_args[len(positional_args) - len(defaults) + i]
+            if param.arg not in helper_scope.bindings:
+                helper_scope.set(param.arg, self._eval(default, scope))
+
+        # Execute the helper body in helper_scope
+        return_value = None
+        for stmt in helper_def.body:
+            if isinstance(stmt, ast.Return):
+                if stmt.value is not None:
+                    return_value = self._eval(stmt.value, helper_scope)
+                break
+            self.walk_stmt(stmt, helper_scope)
+        return return_value
+
+
+# --------------------------------------------------------------------------- Small helpers
+# ---------------------------------------------------------------------------
+def _truthy(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float, str, list, tuple, np.ndarray)):
+        return bool(value)
+    # A dask array (would require materializing to answer) and _Missing (an open-world unknown) both leave the value
+    # genuinely unresolvable -- walk both branches downstream.
+    return None
