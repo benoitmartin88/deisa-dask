@@ -69,6 +69,43 @@ samples; the summary *size* is not independent of ``d`` and of the local rank, o
 Exactness. With full local rank the merged summary is not an approximation of the pooled PCA: it reproduces the
 singular values and the principal subspace of a batch SVD of the whole centered array, up to roundoff.
 
+n-dimensional input: the axis policy
+------------------------------------
+PCA needs two kinds of axis -- SAMPLES (rows) and FEATURES (columns) -- and an array of more than two dimensions does
+not say which is which. This module never guesses. Three constructor parameters say so explicitly:
+
+- ``axis_names``: what each axis is called, positionally. A Dask array carries no axis names of its own, so the
+  caller is the only place the names can come from; they then appear verbatim in every refusal message.
+- ``feature_axes``: which of those axes are features. Defaults to the VELOCITY axes ``("vpar", "mu")`` when
+  ``axis_names`` names them, which is the layout a gyrokinetic distribution wants (Layout A below).
+- ``sample_axes``: which axes are samples. Defaults to every axis that is not a feature, so giving ``feature_axes``
+  alone is enough.
+
+Both ``feature_axes`` and ``sample_axes`` accept names or positions, and if BOTH are given they must partition the
+axes exactly: an axis claimed by neither, by both, or twice, is refused rather than guessed. A 2-D array needs none of
+this -- its last axis is the feature axis -- so the existing 2-D call sites are untouched.
+
+Two layouts, measured, and they behave OPPOSITELY
+-------------------------------------------------
+For a gyrokinetic distribution indexed ``(species, tor1, tor2, tor3, vpar, mu)`` split across MPI ranks by the three
+spatial axes (each rank therefore owns a contiguous spatial box with the COMPLETE velocity space):
+
+- **Layout A -- PCA over velocity space, per spatial cell.** The features are ``(vpar, mu)``, so ``d = Nvpar * Nmu``
+  is fixed by the physics and INDEPENDENT of the rank count. Samples are the spatial cells of the rank's own box.
+  Measured on ``(tor1, tor2, tor3, vpar, mu) = (512, 128, 64, 128, 8)``, i.e. ``d = 1024``: a full-rank leaf summary
+  is 8.0 MiB against a 4096 MiB slab at 8 ranks (511x) and against a 512 MiB slab at 64 ranks (64x). It compresses at
+  every rank count measured, so full local rank is viable and the merge is EXACT.
+- **Layout B -- PCA over the spatial box, per velocity cell.** The features are ``(tor1, tor2, tor3)``, so
+  ``d`` is the LOCAL box size and GROWS AS RANKS DECREASE -- the opposite of the usual scaling intuition. Measured on
+  the same field at 8 ranks: ``d = 524288`` features, ``n_samples = 1024`` velocity cells, and the merged full-rank
+  summary reaches rank 8199, i.e. 32800 MiB against a distributed slab of 32768 MiB: 1.00x, NO compression at all.
+  (Sizing the leaf at the naive ``r = d`` rather than the true ``min(n_block, d) = 1024`` gives the 2097156 MiB
+  figure some write-ups quote; either way the summary is not smaller than the data.)
+
+Consequence for the API: the axis policy makes the difference explicit instead of hiding it, and a full-rank summary
+that is not smaller than its input is REFUSED rather than produced -- see :class:`MergeablePCA` for the guard and its
+measured reason. There is no auto-default that hides the trade.
+
 Repository constraints honoured here
 -------------------------------------
 - ``ruff`` line length is 120 and it applies to docstring prose and to ``raise`` literals too, so long messages are
@@ -247,8 +284,8 @@ def merge_tree(summaries: Sequence[PCASummary]) -> PCASummary:
     return level[0]
 
 
-# The technical spec (MERGEABLE_PCA_SPEC.md section 5) spells these with a leading underscore. Both spellings are
-# module level and pickle identically, so keep them as plain aliases instead of wrappers.
+# The internal API of the design spells these with a leading underscore. Both spellings are module level and pickle
+# identically, so keep them as plain aliases instead of wrappers.
 _PCASummary = PCASummary
 _local_pca = local_pca
 _merge_pca = merge_pca
@@ -271,6 +308,150 @@ def _validate_optional_positive_int(name: str, value: object) -> None:
         return
     if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value <= 0:
         raise ValueError(f"MergeablePCA: {name} must be None or a positive integer, got {value!r}.")
+
+
+# The velocity axes a gyrokinetic distribution is indexed by. They are the DEFAULT feature axes, because the feature
+# dimension of a mergeable summary must stay complete on one rank for summaries to be stackable, and the spatial split
+# is exactly what leaves the velocity space whole on every rank. Named as constants so the error messages, the
+# docstrings and the tests cannot drift apart.
+VELOCITY_AXES: tuple[str, ...] = ("vpar", "mu")
+"""The velocity axes of a ``(species, tor1, tor2, tor3, vpar, mu)`` distribution, in that order."""
+
+
+def _describe_axes(axis_names: Sequence[str] | None, ndim: int) -> tuple[str, ...]:
+    """Return one label per axis, using the caller's names where given and a generic fallback otherwise.
+
+    The fallback is deliberately NOT ``"axis0"``/``"axis1"``: those labels end up inside refusal messages, and a
+    message that says "axis2" tells a physics reader nothing. When no names were supplied the message instead names
+    the position and the extent, which is still unambiguous.
+
+    - ``:param axis_names:`` Caller-supplied names, positionally, or ``None``.
+    - ``:param ndim:`` Number of axes of the array being described.
+    """
+    if axis_names is None:
+        return tuple(f"dimension {i}" for i in range(ndim))
+    return tuple(str(name) for name in axis_names)
+
+
+def _resolve_axes(
+    spec: object,
+    ndim: int,
+    axis_names: Sequence[str] | None,
+    parameter: str,
+) -> tuple[int, ...]:
+    """Turn a caller-supplied axis specification into validated, sorted positions.
+
+    Accepts a single name or position, or any sequence of them. Names are looked up in ``axis_names``; a name the
+    caller never declared is refused rather than matched positionally, because matching it positionally would be
+    exactly the silent guess this whole axis policy exists to prevent.
+
+    - ``:param spec:`` The specification: a name, a position, or a sequence of them.
+    - ``:param ndim:`` Number of axes of the array the positions index into.
+    - ``:param axis_names:`` Caller-supplied axis names, positional, or ``None``.
+    - ``:param parameter:`` Constructor parameter name, quoted verbatim in the message.
+    """
+    labels = _describe_axes(axis_names, ndim)
+    if isinstance(spec, (str, int, np.integer)) and not isinstance(spec, bool):
+        items: list[object] = [spec]
+    elif isinstance(spec, Sequence):
+        items = list(spec)
+    else:
+        raise ValueError(
+            f"MergeablePCA: {parameter} must be axis names or positions, or a sequence of them, got {spec!r} of type "
+            f"{type(spec).__name__}."
+        )
+    resolved: list[int] = []
+    for item in items:
+        if isinstance(item, str):
+            if axis_names is None or item not in axis_names:
+                declared = ", ".join(labels) if axis_names is not None else "none declared"
+                raise ValueError(
+                    f"MergeablePCA: {parameter} names the axis {item!r}, which is not among the axis_names "
+                    f"declared by the caller ({declared}). Name an axis that exists, or pass positions."
+                )
+            position = tuple(axis_names).index(item)
+        elif isinstance(item, (int, np.integer)) and not isinstance(item, bool):
+            position = int(item)
+            if not -ndim <= position < ndim:
+                raise ValueError(
+                    f"MergeablePCA: {parameter} position {position} is out of range for an array with {ndim} "
+                    f"axes ({', '.join(labels)}). Use a negative position or one below {ndim}."
+                )
+            position %= ndim
+        else:
+            raise ValueError(
+                f"MergeablePCA: {parameter} entries must be axis names or positions, got {item!r} of type "
+                f"{type(item).__name__}."
+            )
+        if position in resolved:
+            raise ValueError(
+                f"MergeablePCA: {parameter} names the axis {labels[position]} twice. Each axis may appear at most once."
+            )
+        resolved.append(position)
+    if not resolved:
+        raise ValueError(
+            f"MergeablePCA: {parameter} is empty, so no axis would be classified. Name at least one axis, or pass "
+            "None to classify every remaining axis as a sample."
+        )
+    return tuple(sorted(resolved))
+
+
+def _partition_axes(
+    ndim: int,
+    axis_names: Sequence[str] | None,
+    feature_axes: object,
+    sample_axes: object,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Decide which axes are features and which are samples, refusing every ambiguous or overlapping spec.
+
+    The rules, in order:
+
+    1. A 1-D array is refused by the caller before this runs: one axis cannot be both kinds.
+    2. ``feature_axes`` defaults to the VELOCITY axes when ``axis_names`` names them, else to the LAST axis.
+    3. ``sample_axes`` defaults to every axis that is not a feature.
+    4. If BOTH are given explicitly they must partition the axes exactly. An axis in neither set, in both, or named
+       twice, is a refusal: the alternatives are a silently wrong PCA or a guess the caller never made.
+
+    - ``:param ndim:`` Number of axes of the array being classified.
+    - ``:param axis_names:`` Caller-supplied axis names, positional, or ``None``.
+    - ``:param feature_axes:`` The ``feature_axes`` constructor argument, verbatim.
+    - ``:param sample_axes:`` The ``sample_axes`` constructor argument, verbatim.
+    """
+    labels = _describe_axes(axis_names, ndim)
+    named_velocity = axis_names is not None and all(name in axis_names for name in VELOCITY_AXES)
+    if feature_axes is None:
+        if named_velocity:
+            # Layout A: the velocity space is the feature basis, which is complete on every rank under a spatial split.
+            features = _resolve_axes(VELOCITY_AXES, ndim, axis_names, "feature_axes")
+        else:
+            features = (ndim - 1,)
+    else:
+        features = _resolve_axes(feature_axes, ndim, axis_names, "feature_axes")
+
+    remaining = tuple(i for i in range(ndim) if i not in features)
+    samples_given = sample_axes is not None
+    samples = _resolve_axes(sample_axes, ndim, axis_names, "sample_axes") if samples_given else remaining
+
+    if len(set(samples) & set(features)):
+        overlap = ", ".join(labels[i] for i in sorted(set(samples) & set(features)))
+        raise ValueError(
+            f"MergeablePCA: sample_axes and feature_axes both claim {overlap}, but an axis cannot be both a sample "
+            "and a feature. Give each axis to exactly one of the two sets."
+        )
+    claimed = set(samples) | set(features)
+    if claimed != set(range(ndim)):
+        missing = sorted(set(range(ndim)) - claimed)
+        raise ValueError(
+            f"MergeablePCA: the axis specification leaves {', '.join(labels[i] for i in missing)} unclassified "
+            f"({', '.join(labels)}). Every axis must be a sample or a feature; drop sample_axes to let the remaining "
+            "axes default to samples."
+        )
+    if not remaining and not samples_given:
+        raise ValueError(
+            "MergeablePCA: every axis was declared as a feature, so there are no samples and PCA is undefined. "
+            f"Leave at least one axis out of feature_axes ({', '.join(labels)})."
+        )
+    return features, samples
 
 
 class MergeablePCA:
@@ -318,9 +499,55 @@ class MergeablePCA:
     vanish at ``R >= d``. There is no universally safe ``R``; :meth:`fit` refuses the one combination that cannot work
     at all (a root rank below ``n_components``) instead of silently returning fewer components.
 
+    n-dimensional input: the axis policy
+    ------------------------------------
+    An array of more than two dimensions does not say which axes are SAMPLES (rows) and which are FEATURES (columns),
+    and PCA gives a different answer for each choice, so the choice is never guessed. Three constructor parameters
+    state it explicitly:
+
+    - ``axis_names``: what each axis is called, positionally. A Dask array carries no axis names of its own (it has no
+      ``dims`` attribute), so the caller is the only place names can come from -- and they then appear verbatim in
+      every refusal message, so a message can say ``vpar`` rather than ``axis4``.
+    - ``feature_axes``: which axes are features. Defaults to ``("vpar", "mu")`` when ``axis_names`` names them
+      (Layout A, the default the measurements below justify), else to the last axis.
+    - ``sample_axes``: which axes are samples. Defaults to every axis that is not a feature.
+
+    Both ``feature_axes`` and ``sample_axes`` accept names or positions, and when BOTH are given they must partition
+    the axes exactly. An axis in neither set, in both, or named twice is refused with a message naming it. A 2-D array
+    needs none of this -- its last axis is the feature axis -- so existing 2-D call sites are unaffected, and for 2-D
+    input ``axis_names`` is accepted and used only in messages.
+
+    The array is transposed so the feature axes come last, then reshaped to ``(n_samples, n_features)``. That reshape
+    is the ONLY flattening performed, it is value-preserving, and it is explicit in the reported shapes: with
+    ``axis_names=("species", "tor1", "tor2", "tor3", "vpar", "mu")`` and the default feature axes, the features are
+    ``vpar * mu`` and the samples are ``species * tor1 * tor2 * tor3``. One leaf is built per Dask block of the SAMPLE
+    axes, which is exactly one leaf per rank: a rank's contiguous spatial box is one leaf, complete in velocity space,
+    as a spatial split guarantees.
+
+    Why Layout A is the default and Layout B is refused
+    ---------------------------------------------------
+    For a gyrokinetic distribution split across MPI ranks by the three spatial axes, each rank holds a contiguous
+    ``(tor1, tor2, tor3)`` box with the COMPLETE velocity space. Which axes are the features therefore decides the
+    whole regime, and the two choices behave oppositely. Measured on
+    ``(tor1, tor2, tor3, vpar, mu) = (512, 128, 64, 128, 8)``, a leaf summary being ``(rank, d) + d`` float64:
+
+    - **Layout A, features ``(vpar, mu)``** -- ``d = 1024``, fixed by the physics and INDEPENDENT of the rank count. A
+      full-rank leaf summary is 8.0 MiB against a 4096 MiB slab at 8 ranks (511x) and a 512 MiB slab at 64 ranks
+      (64x): it compresses at every rank count measured, so full local rank is viable and the merge is EXACT.
+    - **Layout B, features ``(tor1, tor2, tor3)``** -- ``d`` is the LOCAL box size and GROWS AS RANKS DECREASE, the
+      opposite of the usual scaling intuition. At 8 ranks ``d = 524288`` with ``n_samples = 1024`` velocity cells, and
+      the merged full-rank summary reaches rank 8199: 32800 MiB against a distributed slab of 32768 MiB, i.e. 1.00x.
+      No compression. (Sizing a leaf at the naive ``r = d`` rather than the true ``min(n_block, d) = 1024`` yields
+      the 2097156 MiB figure quoted elsewhere; either way the summary is not smaller than the data.)
+
+    A summary that is not smaller than its input is refused by :meth:`_check_summary_smaller_than_input`, which names
+    the measured reason and the remedy (``local_rank=R``). Under Layout B ``local_rank`` is therefore effectively
+    mandatory and is documented as such; there is no auto-default that hides the trade. Under Layout A the default
+    ``local_rank=None`` is the right answer.
+
     Repository constraints honoured here
     -------------------------------------
-    - ``ruff`` line length is 120 and it applies to docstring prose and ``raise`` literals too, so long messages are
+    - ``ruff`` line length is 120 and it applies to docstring prose and to ``raise`` literals too, so long messages are
       wrapped across lines.
     - Zero new runtime dependencies: ``dask`` and ``numpy`` only. scipy and scikit-learn are used in the TESTS as
       reference implementations, never imported by ``src/``.
@@ -335,7 +562,15 @@ class MergeablePCA:
       set, each row chunk is split into leaves of at most this many rows before the local PCA. Merging is associative,
       so this only reshapes the tree and does not change the result above roundoff.
     - ``:param local_rank:`` Maximum rank of each leaf summary, or ``None`` for the full local rank
-      ``min(n_block, n_features)``.
+      ``min(n_block, n_features)``. Optional, and ``None`` (full rank, exact) is the right default under Layout A.
+      Under Layout B it is effectively MANDATORY: the feature dimension is the local spatial box, so a full-rank
+      summary is not smaller than its input and :meth:`_check_summary_smaller_than_input` refuses it.
+    - ``:param axis_names:`` Optional name per axis, positionally, used in messages and in the ``feature_axes`` /
+      ``sample_axes`` lookup. ``None`` for 2-D input, or to select the last axis as the feature axis by default.
+    - ``:param feature_axes:`` Which axes are features, by name or position. ``None`` defaults to
+      :data:`VELOCITY_AXES` when ``axis_names`` names them, else to the last axis.
+    - ``:param sample_axes:`` Which axes are samples, by name or position. ``None`` defaults to every axis that is
+      not a feature. Give it only when the features do NOT cover the rest, because giving both partitions exactly.
     """
 
     def __init__(
@@ -345,6 +580,9 @@ class MergeablePCA:
         copy: bool = True,
         batch_size: int | None = None,
         local_rank: int | None = None,
+        axis_names: Sequence[str] | None = None,
+        feature_axes: object = None,
+        sample_axes: object = None,
     ):
         _validate_optional_positive_int("n_components", n_components)
         _validate_optional_positive_int("local_rank", local_rank)
@@ -353,27 +591,131 @@ class MergeablePCA:
             raise ValueError(f"MergeablePCA: whiten must be a bool, got {type(whiten).__name__}.")
         if not isinstance(copy, bool):
             raise ValueError(f"MergeablePCA: copy must be a bool, got {type(copy).__name__}.")
+        if axis_names is not None and not isinstance(axis_names, Sequence):
+            raise ValueError(
+                f"MergeablePCA: axis_names must be a sequence of names or None, got {type(axis_names).__name__}."
+            )
+        if (
+            axis_names is not None
+            and all(isinstance(name, str) for name in axis_names)
+            and len(set(axis_names)) != len(axis_names)
+        ):
+            raise ValueError(
+                f"MergeablePCA: axis_names must not repeat a name, got {tuple(axis_names)}. Names identify axes "
+                "uniquely, so a duplicate makes an axis ambiguous."
+            )
         self.n_components = n_components
         self.whiten = whiten
         self.copy = copy
         self.batch_size = batch_size
         self.local_rank = local_rank
+        self.axis_names = None if axis_names is None else tuple(str(name) for name in axis_names)
+        self.feature_axes = feature_axes
+        self.sample_axes = sample_axes
+
+    # ---------------------------------------------------------------------------- axis policy
+    def _as_2d(self, X):
+        """Flatten ``X`` to ``(n_samples, n_features)`` under the axis policy, or refuse.
+
+        This is the single place a multi-dimensional array becomes 2-D, and it is deliberately explicit: it
+        transposes so the feature axes are LAST, then calls ``reshape``, which is value-preserving. Nothing is
+        inferred beyond the axis partition, so the mapping from a cell to its feature column is fixed and reported.
+
+        The 2-D case is returned untouched -- no transpose, no reshape -- so a plain ``(n_samples, n_features)`` array
+        costs nothing and existing call sites keep byte-identical graphs.
+
+        - ``:param X:`` Array of any dimensionality, already wrapped in ``dask.array``.
+        """
+        ndim = int(X.ndim)
+        if self.axis_names is not None and len(self.axis_names) != ndim:
+            # Without this, an axis_names list of the wrong length resolves to positions that do not exist in this
+            # array: names would index past ndim and the classification would be silently wrong.
+            raise ValueError(
+                f"MergeablePCA: axis_names has {len(self.axis_names)} names but X has {ndim} axes. Give exactly one "
+                f"name per axis, or None to classify the axes by position. Got {self.axis_names}."
+            )
+        labels = _describe_axes(self.axis_names, ndim)
+        if ndim == 0:
+            raise ValueError(
+                "MergeablePCA: X must be 2-dimensional or more, at least one sample axis and one feature axis, got a "
+                "0-dimensional scalar. Provide an array with a sample axis and a feature axis."
+            )
+        if ndim == 1:
+            # One axis cannot be both a sample axis and a feature axis, so there is nothing to classify and nothing to
+            # guard against. PCA on a bare vector is undefined, so this is the same refusal as before with the
+            # remedy spelled out: "2-dimensional" is kept in the message because callers match on it.
+            raise ValueError(
+                f"MergeablePCA: X must be 2-dimensional (one sample axis, one feature axis), got ndim=1. "
+                f"Add the axis you meant, e.g. X.reshape(1, -1) for a single sample ({', '.join(labels)})."
+            )
+        features, samples = _partition_axes(ndim, self.axis_names, self.feature_axes, self.sample_axes)
+
+        if ndim == 2 and features == (1,) and samples == (0,):
+            return X
+
+        permutation = samples + features
+        transposed = X if permutation == tuple(range(ndim)) else da.moveaxis(X, list(range(ndim)), list(permutation))
+        n_features = 1
+        for axis in features:
+            n_features *= int(X.shape[axis])
+        n_samples = 1
+        for axis in samples:
+            n_samples *= int(X.shape[axis])
+        # Reshape needs the sample axes contiguous in the flat row order and the whole feature dimension in ONE chunk,
+        # otherwise dask silently produces a feature-split array whose summaries cannot be stacked. Refusing here names
+        # the axes, which is far more actionable than a later "summaries span different feature dimensions".
+        self._check_feature_chunks(X, features, labels)
+        return transposed.reshape((n_samples, n_features))
+
+    def _check_feature_chunks(self, X, features: tuple[int, ...], labels: tuple[str, ...]) -> None:
+        """Refuse a FEATURE axis split across Dask chunks, naming the axes and the gysela remedy.
+
+        This guard applies only where it genuinely applies: the feature dimension of a mergeable summary must be
+        complete on the rank that holds it, because a merge stacks summaries by feature position. Under Layout A that is
+        satisfied NATURALLY -- a spatial MPI split leaves the whole ``(vpar, mu)`` space on one rank, so ``chunks`` of a
+        bridge's slab has one entry per feature axis and this guard never fires. It fires only when the caller
+        rechunked across velocity, i.e. exactly when the summaries really would be unstackerable.
+
+        Note the asymmetry with the SAMPLE axes, which may be split freely (that is the whole point): this guard
+        ignores them entirely.
+
+        - ``:param X:`` The unflattened array, read for its per-axis chunk counts.
+        - ``:param features:`` Resolved positions of the feature axes.
+        - ``:param labels:`` One label per axis, for the message.
+        """
+        split = [axis for axis in features if len(X.chunks[axis]) != 1]
+        if not split:
+            return
+        chunks = ", ".join(f"{labels[axis]}={tuple(X.chunks[axis])}" for axis in split)
+        remedy = "{" + ", ".join(str(axis) for axis in split) + ": -1}"
+        named = ", ".join(labels[axis] for axis in split)
+        raise ValueError(
+            f"MergeablePCA: the feature axes ({named}) are split across Dask chunks, got {chunks}. A mergeable PCA "
+            "needs the COMPLETE feature dimension on one rank, because a merge stacks summaries by feature position. "
+            f"Rechunk the feature axes together: X = X.rechunk({remedy}). If those axes are the velocity axes "
+            "(vpar, mu) you may not need to rechunk at all: an MPI split over the spatial axes keeps the whole "
+            "velocity space on one rank by construction, so a bridge's slab satisfies this already."
+        )
 
     # ---------------------------------------------------------------------------- fitting
     def fit(self, X, y=None) -> MergeablePCA:
         """Fit the estimator and return ``self``.
 
         A dask array is fitted through :meth:`_fit_dask_delayed`; a numpy array takes the in-memory path, which is the
-        single-leaf base case of the same tree.
+        single-leaf base case of the same tree. Input of any dimensionality is accepted under the axis policy described
+        in this class's docstring: the array is transposed so the feature axes come last, then reshaped to
+        ``(n_samples, n_features)`` before anything else happens.
 
-        - ``:param X:`` 2-D ``(n_samples, n_features)`` dask array, or a numpy array of the same shape.
+        - ``:param X:`` Array of ``n_samples * n_features`` values, dask or numpy, 2-D or more. For more than two
+          dimensions, ``axis_names`` / ``feature_axes`` / ``sample_axes`` say which axes are which.
         - ``:param y:`` Accepted and ignored, for scikit-learn parity.
         """
         array = X if isinstance(X, da.Array) else da.asarray(X)
-        self._validate_input(array)
+        flat = self._as_2d(array)
+        self._validate_input(flat)
 
-        n_samples = int(array.shape[0])
-        n_features = int(array.shape[1])
+        n_samples = int(flat.shape[0])
+        n_features = int(flat.shape[1])
         self.n_features_in_ = n_features
         # Checked against min(n_samples, n_features) before any work, so an impossible request fails fast and free.
         if self.n_components is not None and self.n_components > min(n_samples, n_features):
@@ -384,13 +726,16 @@ class MergeablePCA:
             )
 
         if isinstance(X, da.Array):
+            # The RAW array goes in, not ``flat``: _fit_dask_delayed flattens it itself, and flattening twice would
+            # apply the axis policy to an array that is already 2-D (and re-run the guard on reshaped chunks).
             summary = self._fit_dask(array)
         else:
             # In-memory: one leaf, the base case of the merge tree. Still routed through the same primitive.
-            summary = local_pca(np.asarray(X), rank=self.local_rank)
+            summary = local_pca(np.asarray(flat), rank=self.local_rank)
 
         self._summary_ = summary
         self._check_root_rank(summary)
+        self._check_summary_smaller_than_input(summary, n_features)
         self._materialize_public_attributes(summary)
         return self
 
@@ -415,10 +760,12 @@ class MergeablePCA:
         the parallelism; the shape built here is the same pairwise fold, odd level carried up unchanged, that
         :func:`merge_tree` implements.
 
-        - ``:param X:`` 2-D ``(n_samples, n_features)`` dask array whose features are in one chunk.
+        - ``:param X:`` Array of any dimensionality. It is flattened by :meth:`_as_2d` first, so the graph below is
+          always over ``(n_samples, n_features)`` leaves.
         """
-        self._validate_input(X)
-        level = [delayed(local_pca)(block, rank=self.local_rank) for block in self._leaf_blocks(X)]
+        flat = self._as_2d(X)
+        self._validate_input(flat)
+        level = [delayed(local_pca)(block, rank=self.local_rank) for block in self._leaf_blocks(flat)]
         while len(level) > 1:
             merged = [delayed(merge_pca)(level[i], level[i + 1]) for i in range(0, len(level) - 1, 2)]
             if len(level) % 2:
@@ -444,15 +791,11 @@ class MergeablePCA:
         """Refuse input this estimator cannot answer exactly, naming the condition and the remedy.
 
         Every branch here is a case where the alternative is a silently wrong answer rather than an error, so all of
-        them are refusals rather than warnings.
+        them are refusals rather than warnings. ``X`` here is ALREADY flattened to 2-D by :meth:`_as_2d`, which owns
+        the axis policy and the feature-chunk guard; this method covers only the shape conditions that survive it.
 
-        - ``:param X:`` Candidate input array (already wrapped in ``dask.array`` by the caller).
+        - ``:param X:`` Candidate 2-D ``(n_samples, n_features)`` array (already wrapped in ``dask.array``).
         """
-        if X.ndim != 2:
-            raise ValueError(
-                f"MergeablePCA: X must be 2-dimensional, got ndim={X.ndim}. "
-                "Reshape with X.reshape(n_samples, -1) or pass a 2-D array."
-            )
         n_samples, n_features = int(X.shape[0]), int(X.shape[1])
         if n_samples == 0:
             raise ValueError(
@@ -464,12 +807,53 @@ class MergeablePCA:
                 "MergeablePCA: X has zero features, PCA is undefined. "
                 "Provide at least one feature (fit is refused rather than returning an empty component set)."
             )
-        # Checked after ndim, so a 1-D input reports the ndim error rather than an IndexError on chunks[1].
+        # The 2-D feature-chunk precondition, kept for the case where the input arrived already 2-D and therefore
+        # never went through _as_2d's per-axis check. Same condition, message now names the axis and the remedy.
         if len(X.chunks[1]) != 1:
             raise ValueError(
                 "MergeablePCA requires the complete feature dimension in a single Dask chunk, "
-                f"got chunks={X.chunks}. Rechunk with X = X.rechunk({{1: -1}}) before fitting."
+                f"got chunks={X.chunks}. Rechunk with X = X.rechunk({{1: -1}}) before fitting -- for an array with "
+                "named axes, rechunk the velocity axes (vpar, mu) together rather than the axis position alone."
             )
+
+    def _check_summary_smaller_than_input(self, summary: PCASummary, n_features: int) -> None:
+        """Refuse a summary that is not smaller than the data it summarizes, naming the measured reason.
+
+        This is the guard that makes the axis choice safe. A merged full-rank summary holds
+        ``rank * d + d`` float64 elements against ``n_samples * d`` for the data, so it compresses exactly when
+        ``n_samples > d``. Under Layout A (``d = Nvpar * Nmu``, fixed by the physics) that holds comfortably: on
+        ``(tor1, tor2, tor3, vpar, mu) = (512, 128, 64, 128, 8)`` a full-rank leaf summary is 8.0 MiB against a
+        4096 MiB slab at 8 ranks (511x) and a 512 MiB slab at 64 ranks (64x).
+
+        Under Layout B (``d`` = the local spatial box, which GROWS as ranks decrease) it fails: at 8 ranks
+        ``d = 524288`` with ``n_samples = 1024``, the merged summary reaches rank 8199 and needs 32800 MiB against a
+        distributed slab of 32768 MiB -- 1.00x, no compression at all. Producing that silently would spend more
+        memory than the data it summarizes, which is worse than refusing, so it is refused by default.
+
+        ``local_rank`` is the remedy and the caller knows the trade: ``local_rank=R`` shrinks the summary to
+        ``~R * d`` elements per leaf, so ``R`` below ``n_samples`` restores compression at the cost of the discarded
+        leaf variance. There is deliberately NO auto-default: choosing ``R`` for the caller would hide a real accuracy
+        trade, so the refusal names it instead.
+
+        - ``:param summary:`` The merged root summary, before the public attributes are materialized.
+        - ``:param n_features:`` Feature dimension of the flattened array, i.e. ``d``.
+        """
+        n_samples = int(summary.n_samples)
+        payload = summary.components.size + summary.mean.size
+        data = n_samples * n_features
+        if payload <= 0 or payload < data:
+            return
+        ratio = data / payload if payload else 0.0
+        raise ValueError(
+            f"MergeablePCA: the merged summary would not compress the data -- {payload} float64 elements "
+            f"(rank {summary.rank} x d {n_features} + d) against {data} for n_samples={n_samples}, d={n_features}, "
+            f"a ratio of {ratio:.2f}x. This happens when the FEATURE axes outnumber the samples: with velocity "
+            "axes (vpar, mu) as features d is fixed by the physics and this never triggers, but with the spatial axes "
+            "(tor1, tor2, tor3) as features d is the local box and grows as the rank count drops (measured: d=524288 "
+            "against n_samples=1024 at 8 ranks, 32800 MiB of summary for a 32768 MiB distributed slab). "
+            "Remedy: pass local_rank=R with R well below n_samples to truncate each leaf summary, or make the "
+            "velocity axes the features instead."
+        )
 
     def _check_root_rank(self, summary: PCASummary) -> None:
         """Refuse a root summary too small for the requested components, instead of returning fewer.
@@ -495,7 +879,7 @@ class MergeablePCA:
         each row chunk is further split into row slices of at most that many rows. Empty leaves are dropped, since a
         0-row block has no PCA.
 
-        - ``:param X:`` 2-D dask array whose features are in one chunk.
+        - ``:param X:`` 2-D ``(n_samples, n_features)`` dask array whose features are in one chunk.
         """
         blocks = X.to_delayed().ravel()
         if self.batch_size is None:
@@ -575,22 +959,21 @@ class MergeablePCA:
         components already carry the ``1 / sqrt(explained_variance)`` scale, so the columns come out with unit sample
         variance; this is scikit-learn's formulation, expressed as one matrix product so Dask fuses it into the graph.
 
-        - ``:param X:`` 2-D ``(n_samples, n_features)`` array, dask or numpy, matching ``n_features_in_``.
+        ``X`` goes through the SAME axis policy as ``fit``, so a caller can project a 5-D field with the axis names
+        they fitted with. Only the feature dimension has to match the fitted one: the sample axes may be anything, as
+        usual for a projection.
+
+        - ``:param X:`` Array matching ``n_features_in_``, dask or numpy, 2-D or more under the same axis policy as fit.
         """
         self._check_fitted("transform")
-        array = X if isinstance(X, da.Array) else da.asarray(X)
-        if array.ndim != 2:
+        flat = self._as_2d(X if isinstance(X, da.Array) else da.asarray(X))
+        if int(flat.shape[1]) != self.n_features_in_:
             raise ValueError(
-                f"MergeablePCA: X must be 2-dimensional, got ndim={array.ndim}. "
-                "Reshape with X.reshape(n_samples, -1) or pass a 2-D array."
-            )
-        if int(array.shape[1]) != self.n_features_in_:
-            raise ValueError(
-                f"MergeablePCA: X has {int(array.shape[1])} features but this estimator was fitted on "
+                f"MergeablePCA: X has {int(flat.shape[1])} features but this estimator was fitted on "
                 f"{self.n_features_in_}. Provide the same number of features as in fit, or refit on X."
             )
         # mean_ @ components_.T is a (n_components,) row vector; dask broadcasts it over the rows.
-        return (array - self.mean_) @ self.components_.T
+        return (flat - self.mean_) @ self.components_.T
 
     def inverse_transform(self, Z):
         """Map projected data back to the original feature space: ``X_hat = Z @ components_ + mean_``.

@@ -746,15 +746,18 @@ def test_constructor_refuses_bad_values(kwargs, expected_fragment):
         MergeablePCA(**kwargs)
 
 
-def test_fit_refuses_non_2d_dask_input():
-    """A 1-D or 3-D array is refused on its dimensionality, before any indexing of ``chunks[1]``."""
+def test_fit_refuses_1d_dask_input():
+    """A 1-D array is refused before any indexing of ``chunks``, because one axis cannot be both kinds.
+
+    Only the 1-D case remains here. The 3-D case this test used to assert alongside it is no longer a refusal: input
+    of more than two dimensions is now supported through an explicit axis policy (``axis_names`` / ``feature_axes`` /
+    ``sample_axes``), which the dedicated tests in ``test_mergeable_pca_axes.py`` cover, including the rule that the
+    feature axes come LAST by default.
+    """
     flat = da.from_array(make_data(10, 1).ravel(), chunks=5)
-    cubic = da.from_array(np.zeros((4, 6, 2)), chunks=(4, 6, 2))
 
     with pytest.raises(ValueError, match="2-dimensional"):
         MergeablePCA(n_components=1).fit(flat)
-    with pytest.raises(ValueError, match="2-dimensional"):
-        MergeablePCA(n_components=1).fit(cubic)
 
 
 def test_fit_refuses_features_split_across_chunks_and_names_the_remedy():
