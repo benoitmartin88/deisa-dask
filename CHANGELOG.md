@@ -30,6 +30,17 @@ Types of changes:
   attributed as such in the module docstring: the between-block mean-correction term is the Chan-Golub-LeVeque (1979)
   covariance merge and the merge-and-truncate tree shape is Qin & Yan (arXiv:1601.07010) / Kjolstad, Demmel et al.
   (arXiv:1710.02812).
+- `deisa.dask.mergeable_pca.MergeablePCA`: a scikit-learn-style PCA estimator for Dask arrays, built on those
+  primitives. `fit` reduces one `local_pca` summary per input block with a balanced tree of `merge_pca` tasks, so no
+  source sample reaches a merge node and the result is the exact batch PCA at full local rank. `local_rank=R`
+  truncates each leaf summary to rank `R` before merging, shrinking what crosses a process boundary at the cost of a
+  retained subspace that drifts from the batch one; both effects are documented in the class docstring. `fit` refuses
+  rather than approximates: input that is not 2-D, a feature dimension split across chunks, a zero-size axis, or an
+  `n_components` above the achievable rank each raise a `ValueError` naming the condition and the remedy.
+  `_fit_dask_delayed` builds the tree WITHOUT computing and returns a real Dask graph, so it can be inspected or
+  `.visualize()`d; `_fit_dask` is the `.compute()` on top. The merged root summary is kept as `_summary_` for further
+  merging (and for the bridge to emit), separate from the truncated public `components_` / `singular_values_` /
+  `explained_variance_`, so nothing destroys mergeability mid-tree.
 
 ### Changed
 
