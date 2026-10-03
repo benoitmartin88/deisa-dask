@@ -23,6 +23,13 @@ Types of changes:
   `min`, `max`, `prod`) are analyzed at registration time and shipped to Dask workers as small per-bridge partials 
   instead of the full array chunk. Branches are registered per array, so a multi-array callback gets one branch set per 
   array. Expressions whose reduction depends on another reduction's output are refused with`UnsupportedReductionError`.
+- `deisa.dask.mergeable_pca`: exact mergeable PCA primitives. A local summary of one data block
+  (`n_samples`, `mean`, `components`, `singular_values`) merges with another summary into the exact summary of their
+  union, without either source sample ever reaching a merge node, so only a compact summary has to cross a process or
+  network boundary. `merge_tree` reduces summaries with a balanced pairwise tree. The merge algebra is classical and is
+  attributed as such in the module docstring: the between-block mean-correction term is the Chan-Golub-LeVeque (1979)
+  covariance merge and the merge-and-truncate tree shape is Qin & Yan (arXiv:1601.07010) / Kjolstad, Demmel et al.
+  (arXiv:1710.02812).
 
 ### Changed
 
