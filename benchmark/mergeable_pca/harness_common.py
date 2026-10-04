@@ -133,6 +133,21 @@ def _library_version(name: str) -> str:
         return f"MISSING ({type(exc).__name__})"
 
 
+def _repo_root(start: Path) -> Path:
+    """Walk up from ``start`` to the nearest ancestor holding a ``.git`` entry, else return ``start``.
+
+    A fixed ``parents[N]`` is wrong the moment the harness moves, and it fails SILENTLY: ``git rev-parse`` in a
+    non-repository directory returns non-zero and the artifact records ``UNAVAILABLE (git rev-parse failed)``, which
+    looks like a missing git rather than a wrong index. Searching for the marker makes the stamp self-locating.
+
+    - ``:param start:`` Resolved path inside the repository, normally this module's own file.
+    """
+    for candidate in (start, *start.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return start
+
+
 def _git_commit(repo: Path) -> str:
     """Return a repository's HEAD commit, or a marked UNAVAILABLE string.
 
@@ -154,6 +169,60 @@ def _git_commit(repo: Path) -> str:
     if out.returncode != 0:
         return "UNAVAILABLE (git rev-parse failed)"
     return out.stdout.strip()
+
+
+def enforce_consistent_repeat_counts(payload: Mapping[str, Any]) -> None:
+    """Refuse to emit an artifact whose recorded repeat counts contradict each other or the timed samples.
+
+    ``provenance()`` always stamps ``timing_policy`` with :data:`TIMING_POLICY`'s DEFAULT ``timed_repeats``, so a
+    script invoked with ``--repeats 3`` writes ``timing_policy.timed_repeats = 5`` next to
+    ``inputs.timed_repeats = 3``. That is a provenance defect: a reader cannot tell how many timed samples produced a
+    median. It also hides the consequence, which is worse -- with ONE repeat there is no spread to report, so every
+    ``seconds_iqr`` and ``seconds_stddev`` is a structural 0.0 that reads as "perfectly reproducible" when in fact
+    nothing was repeated.
+
+    Three counts must agree: the timing policy default, the count the script recorded under ``inputs``, and the
+    length of each timed sample list. This compares them and raises naming the field that disagrees.
+
+    - ``:param payload:`` The artifact about to be written.
+    """
+    policy = payload.get("provenance", {}).get("timing_policy", {})
+    declared = policy.get("timed_repeats")
+    inputs = payload.get("provenance", {}).get("inputs", {})
+    used = inputs.get("timed_repeats")
+    if declared is not None and used is not None and int(declared) != int(used):
+        raise ValueError(
+            f"enforce_consistent_repeat_counts: timing_policy.timed_repeats={declared} contradicts "
+            f"provenance.inputs.timed_repeats={used}. provenance() stamps the DEFAULT policy, so a run with a "
+            f"different repeat count must override it explicitly; otherwise the artifact reports a repeat count it "
+            f"did not use and the median has no dispersion behind it."
+        )
+
+    seen: set[int] = set()
+
+    def _walk(node: Any) -> None:
+        if isinstance(node, Mapping):
+            reps, samples = node.get("timed_repeats"), node.get("seconds_all")
+            if reps is not None and isinstance(samples, list):
+                if int(reps) != len(samples):
+                    raise ValueError(
+                        f"enforce_consistent_repeat_counts: timing block claims timed_repeats={reps} but carries "
+                        f"{len(samples)} sample(s) in seconds_all. A single sample makes seconds_iqr and "
+                        f"seconds_stddev structural zeros, which is not evidence of reproducibility."
+                    )
+                seen.add(int(reps))
+            for value in node.values():
+                _walk(value)
+        elif isinstance(node, (list, tuple)):
+            for item in node:
+                _walk(item)
+
+    _walk(payload.get("results", []))
+    if used is not None and seen and int(used) not in seen:
+        raise ValueError(
+            f"enforce_consistent_repeat_counts: provenance.inputs.timed_repeats={used} but the measured rows timed "
+            f"{sorted(seen)} sample(s). The declared repeat count is not what ran."
+        )
 
 
 def _total_memory_bytes() -> int:
@@ -228,6 +297,11 @@ def provenance(script: str, description: str, extra: Mapping[str, Any] | None = 
     depends on, the seed, the timing policy, the deisa-dask commit, and the pinned gysela sources. A reader can
     re-run the script and compare like for like.
 
+    ``timing_policy`` reports :data:`TIMING_POLICY`'s DEFAULTS, so a script that runs fewer repeats than the default
+    MUST restate it or the artifact claims a repeat count it did not use. The repeat count actually in force is
+    stamped by the caller under ``inputs``; ``timed_repeats_matches_measured`` cross-checks the two at write time so
+    the contradiction cannot ship unnoticed.
+
     - ``:param script:`` Name of the experiment script, e.g. ``"b1_bytes"``.
     - ``:param description:`` One line stating what the artifact measures.
     - ``:param extra:`` Optional additional provenance (inputs, sweep definition, policy overrides).
@@ -249,7 +323,7 @@ def provenance(script: str, description: str, extra: Mapping[str, Any] | None = 
             "dask-ml": _library_version("dask-ml"),
             "psutil": _library_version("psutil"),
         },
-        "deisa_dask_commit": _git_commit(Path(__file__).resolve().parents[3]),
+        "deisa_dask_commit": _git_commit(_repo_root(Path(__file__).resolve())),
         "gysela_sources": GYSELA_SOURCES,
         "disclaimer": (
             "The gysela mesh extents used by the sizing experiments are SYNTHETIC parameter points chosen to span "
@@ -303,6 +377,7 @@ def write_result(script: str, payload: Mapping[str, Any]) -> Path:
     - ``:param payload:`` The full artifact, provenance block included.
     """
     enforce_sign_invariant_results(payload)
+    enforce_consistent_repeat_counts(payload)
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     path = RESULTS_DIR / f"{script}.json"
     with path.open("w", encoding="utf-8") as fp:
