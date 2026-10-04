@@ -44,9 +44,10 @@ Nothing in this module is a new algorithm, and both the paper and this docstring
   ``M_AB = M_A + M_B + (n_A * n_B / (n_A + n_B)) * delta * delta.T`` with ``delta = mean_A - mean_B``. It is the
   standard scatter-matrix identity behind parallel BLAS. Here it enters as the extra ``correction`` row of the
   compact matrix in :func:`merge_pca`, whose outer product reproduces the ``delta * delta.T`` term.
-- The merge-plus-tree-reduction shape (merging rank-``r`` summaries pairwise, re-truncating at each node) is **Qin &
-  Yan, arXiv:1601.07010** -- their Lemma 1 states the merge and their hierarchical Algorithm 1 the reduction tree --
-  and **Kjolstad, Demmel et al., arXiv:1710.02812** -- merge-and-truncate.
+- The merge-plus-tree-reduction shape (merging rank-``r`` summaries pairwise, re-truncating at each node) is **Iwen &
+  Ong, arXiv:1601.07010** (SIAM J. Matrix Anal. Appl. 37(4):1699-1718, 2016, DOI 10.1137/16M1058467) -- their
+  Lemma 1 states the merge and their hierarchical Algorithm 1 the reduction tree -- and **Vasudevan &
+  Ramakrishna, arXiv:1710.02812** -- merge-and-truncate.
 - The only thing claimed as ours is the *placement*: the local PCA runs on the MPI bridge, where the data already
   resides, and only the summary crosses to Dask.
 
@@ -259,7 +260,7 @@ def merge_pca(a: PCASummary, b: PCASummary) -> PCASummary:
 
 def merge_tree(summaries: Sequence[PCASummary]) -> PCASummary:
     """
-    Reduce summaries with a balanced pairwise tree, the reduction shape of Qin & Yan (arXiv:1601.07010, Algorithm 1).
+    Reduce summaries with a balanced pairwise tree, the reduction shape of Iwen & Ong (arXiv:1601.07010, Algorithm 1).
 
     Each level merges neighbours pairwise; an odd level carries its last summary up unchanged to the next level, so
     the tree stays balanced instead of degenerating into a chain. A single summary is returned as-is (base case) and
@@ -466,7 +467,7 @@ class MergeablePCA:
     How it works
     ------------
     :meth:`_fit_dask_delayed` builds one ``dask.delayed(local_pca)`` task per input block and reduces those summaries
-    with a balanced tree of ``dask.delayed(merge_pca)`` tasks (the shape of Qin & Yan, arXiv:1601.07010, Algorithm 1).
+    with a balanced tree of ``dask.delayed(merge_pca)`` tasks (the shape of Iwen & Ong, arXiv:1601.07010, Algorithm 1).
     The reduction consumes ONLY summaries: no source sample ever reaches a merge node, so the summary is a valid
     stand-in for the data it describes. With full local rank the result is not an approximation -- it reproduces the
     batch SVD of the whole centered array to roundoff, because the merge carries the Chan-Golub-LeVeque (1979)
