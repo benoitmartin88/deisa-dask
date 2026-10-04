@@ -1,0 +1,3854 @@
+{
+  "provenance": {
+    "script": "b1_bytes_crossing",
+    "description": "Bytes crossing the bridge->worker boundary: legacy full-chunk scatter vs bridge-side mergeable PCA summary, swept over n_block/d with tall and flat regimes reported separately.",
+    "generated_utc": "2026-10-04T07:32:35.455512+00:00",
+    "seed": 20261004,
+    "machine": {
+      "hostname": "5627397aad86",
+      "platform": "Linux-6.1.0-47-amd64-x86_64-with-glibc2.41",
+      "processor": "unknown",
+      "machine": "x86_64",
+      "python": "3.13.5",
+      "cpu_count_logical": 40,
+      "cpu_count_physical": 20,
+      "total_memory_bytes": 135048007680,
+      "numpy_blas": "scipy-openblas",
+      "numpy_lapack": "scipy-openblas",
+      "thread_env": {
+        "OMP_NUM_THREADS": null,
+        "OPENBLAS_NUM_THREADS": null,
+        "MKL_NUM_THREADS": null,
+        "NUMEXPR_NUM_THREADS": null,
+        "VECLIB_MAXIMUM_THREADS": null
+      }
+    },
+    "timing_policy": {
+      "clock": "time.perf_counter",
+      "warmup_rounds": 1,
+      "timed_repeats": 5,
+      "statistic": "median",
+      "dispersion": "min/max/iqr/stddev reported alongside the median",
+      "note": "one warmup round is discarded before timing so BLAS thread pools and page faults are not charged to the measurement; the median of the timed repeats is the headline and the spread is reported"
+    },
+    "versions": {
+      "numpy": "2.5.1",
+      "dask": "2026.7.1",
+      "distributed": "2026.7.1",
+      "deisa-dask": "0.6.3",
+      "scipy": "1.18.1",
+      "scikit-learn": "1.9.1",
+      "dask-ml": "2025.1.0",
+      "psutil": "7.2.2"
+    },
+    "deisa_dask_commit": "UNAVAILABLE (git rev-parse failed)",
+    "gysela_sources": {
+      "gyselalibxx": {
+        "repository": "https://github.com/gyselax/gyselalibxx",
+        "branch": "devel",
+        "commit": "b9aad37bc0d174ce37e95021573d9b846251d86a",
+        "role": "MPILayout distribution semantics (src/mpi_parallelisation/mpilayout.hpp)"
+      },
+      "gysela-mini-app_io": {
+        "repository": "https://github.com/gyselax/gysela-mini-app_io",
+        "branch": "(detached)",
+        "commit": "f39e2a57456e82aabefed140ccd97bd06453f747",
+        "role": "field and MPI layout types (src/C++/geometry.hpp)"
+      }
+    },
+    "disclaimer": "The gysela mesh extents used by the sizing experiments are SYNTHETIC parameter points chosen to span a range of shapes in the same family as the application's index ranges. They are NOT read from a production input file and no gysela build was run on this machine; the arrays are simulated in numpy from the TYPE and LAYOUT semantics of the pinned C++ sources.",
+    "inputs": {
+      "feature_dims": [
+        32,
+        128,
+        512
+      ],
+      "n_block_over_d_ratios": [
+        0.25,
+        0.5,
+        1.0,
+        2.0,
+        4.0,
+        8.0
+      ],
+      "local_ranks": [
+        4,
+        16,
+        64,
+        null
+      ],
+      "intrinsic_rank_fraction_of_d": 0.25,
+      "max_block_elements": 24000000
+    },
+    "serialization": "distributed.protocol.serialize(to_serialize(...)), the same call Bridge._scatter_partials makes before scatter_to_workers; numbers are on-the-wire payload sizes including pickle framing"
+  },
+  "invariant_check": {
+    "claim": "on the PCA path only a compact summary crosses bridge->worker; the full chunk never does",
+    "how_verified": "for every configuration the scattered payload is asserted to be a PCASummary whose arrays are the summary's own, i.e. the block object itself is neither the payload nor contained in it; any regression to shipping the chunk fails the run",
+    "note_on_size": "the check is on IDENTITY, not size: on the flat side a full-rank summary legitimately holds as many elements as the block it summarizes, which is the regime boundary reported separately as summary_not_smaller_than_block and not a violation",
+    "configurations_checked": 72,
+    "configurations_satisfying_invariant": 72,
+    "configurations_shipping_chunk": 0,
+    "configurations_with_no_size_reduction": 16
+  },
+  "regimes_separately": {
+    "full_rank_tall": {
+      "n_configurations": 9,
+      "best_ratio": 7.967906580680213,
+      "min_ratio": 1.8325519089082385
+    },
+    "full_rank_flat_or_square": {
+      "n_configurations": 9,
+      "best_ratio": 0.9960016204384208,
+      "min_ratio": 0.7932875667429443,
+      "note": "ratios at or below 1.0 here are the design's boundary, not a defect: a full-rank summary of a block with n_block <= d holds min(n_block,d)*d elements against n_block*d and cannot compress"
+    }
+  },
+  "results": [
+    {
+      "n_block": 8,
+      "n_features": 32,
+      "n_block_over_d": 0.25,
+      "regime": "flat",
+      "local_rank_requested": 4,
+      "local_rank_effective": 4,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 8,
+      "block_elements": 256,
+      "block_bytes": {
+        "bytes": 2048.0,
+        "KiB": 2.0,
+        "MiB": 0.001953125,
+        "GiB": 1.9073486328125e-06
+      },
+      "summary_elements": 164,
+      "summary_bytes": {
+        "bytes": 1312.0,
+        "KiB": 1.28125,
+        "MiB": 0.001251220703125,
+        "GiB": 1.2218952178955078e-06
+      },
+      "legacy_wire_bytes": {
+        "bytes": 2080.0,
+        "KiB": 2.03125,
+        "MiB": 0.001983642578125,
+        "GiB": 1.9371509552001953e-06
+      },
+      "pca_wire_bytes": {
+        "bytes": 1566.0,
+        "KiB": 1.529296875,
+        "MiB": 0.0014934539794921875,
+        "GiB": 1.4584511518478394e-06
+      },
+      "compression_ratio_full_rank_vs_data": 1.5609756097560976,
+      "compression_ratio_legacy_vs_pca_wire": 1.3282247765006385,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 128,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 4,
+      "merged_root_n_samples": 8
+    },
+    {
+      "n_block": 8,
+      "n_features": 32,
+      "n_block_over_d": 0.25,
+      "regime": "flat",
+      "local_rank_requested": 16,
+      "local_rank_effective": 8,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 8,
+      "block_elements": 256,
+      "block_bytes": {
+        "bytes": 2048.0,
+        "KiB": 2.0,
+        "MiB": 0.001953125,
+        "GiB": 1.9073486328125e-06
+      },
+      "summary_elements": 296,
+      "summary_bytes": {
+        "bytes": 2368.0,
+        "KiB": 2.3125,
+        "MiB": 0.00225830078125,
+        "GiB": 2.205371856689453e-06
+      },
+      "legacy_wire_bytes": {
+        "bytes": 2080.0,
+        "KiB": 2.03125,
+        "MiB": 0.001983642578125,
+        "GiB": 1.9371509552001953e-06
+      },
+      "pca_wire_bytes": {
+        "bytes": 2622.0,
+        "KiB": 2.560546875,
+        "MiB": 0.0025005340576171875,
+        "GiB": 2.4419277906417847e-06
+      },
+      "compression_ratio_full_rank_vs_data": 0.8648648648648649,
+      "compression_ratio_legacy_vs_pca_wire": 0.7932875667429443,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 256,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": true,
+        "note": "expected whenever n_block <= d at full local rank: the summary holds min(n_block,d)*d elements against n_block*d for the data, so it cannot be smaller. This is the design's boundary and is why local_rank < d exists."
+      },
+      "merged_root_rank": 8,
+      "merged_root_n_samples": 8
+    },
+    {
+      "n_block": 8,
+      "n_features": 32,
+      "n_block_over_d": 0.25,
+      "regime": "flat",
+      "local_rank_requested": 64,
+      "local_rank_effective": 8,
+      "local_rank_saturated_at_d": true,
+      "intrinsic_rank": 8,
+      "block_elements": 256,
+      "block_bytes": {
+        "bytes": 2048.0,
+        "KiB": 2.0,
+        "MiB": 0.001953125,
+        "GiB": 1.9073486328125e-06
+      },
+      "summary_elements": 296,
+      "summary_bytes": {
+        "bytes": 2368.0,
+        "KiB": 2.3125,
+        "MiB": 0.00225830078125,
+        "GiB": 2.205371856689453e-06
+      },
+      "legacy_wire_bytes": {
+        "bytes": 2080.0,
+        "KiB": 2.03125,
+        "MiB": 0.001983642578125,
+        "GiB": 1.9371509552001953e-06
+      },
+      "pca_wire_bytes": {
+        "bytes": 2622.0,
+        "KiB": 2.560546875,
+        "MiB": 0.0025005340576171875,
+        "GiB": 2.4419277906417847e-06
+      },
+      "compression_ratio_full_rank_vs_data": 0.8648648648648649,
+      "compression_ratio_legacy_vs_pca_wire": 0.7932875667429443,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 256,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": true,
+        "note": "expected whenever n_block <= d at full local rank: the summary holds min(n_block,d)*d elements against n_block*d for the data, so it cannot be smaller. This is the design's boundary and is why local_rank < d exists."
+      },
+      "merged_root_rank": 8,
+      "merged_root_n_samples": 8
+    },
+    {
+      "n_block": 8,
+      "n_features": 32,
+      "n_block_over_d": 0.25,
+      "regime": "flat",
+      "local_rank_requested": null,
+      "local_rank_effective": 8,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 8,
+      "block_elements": 256,
+      "block_bytes": {
+        "bytes": 2048.0,
+        "KiB": 2.0,
+        "MiB": 0.001953125,
+        "GiB": 1.9073486328125e-06
+      },
+      "summary_elements": 296,
+      "summary_bytes": {
+        "bytes": 2368.0,
+        "KiB": 2.3125,
+        "MiB": 0.00225830078125,
+        "GiB": 2.205371856689453e-06
+      },
+      "legacy_wire_bytes": {
+        "bytes": 2080.0,
+        "KiB": 2.03125,
+        "MiB": 0.001983642578125,
+        "GiB": 1.9371509552001953e-06
+      },
+      "pca_wire_bytes": {
+        "bytes": 2622.0,
+        "KiB": 2.560546875,
+        "MiB": 0.0025005340576171875,
+        "GiB": 2.4419277906417847e-06
+      },
+      "compression_ratio_full_rank_vs_data": 0.8648648648648649,
+      "compression_ratio_legacy_vs_pca_wire": 0.7932875667429443,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 256,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": true,
+        "note": "expected whenever n_block <= d at full local rank: the summary holds min(n_block,d)*d elements against n_block*d for the data, so it cannot be smaller. This is the design's boundary and is why local_rank < d exists."
+      },
+      "merged_root_rank": 8,
+      "merged_root_n_samples": 8
+    },
+    {
+      "n_block": 16,
+      "n_features": 32,
+      "n_block_over_d": 0.5,
+      "regime": "flat",
+      "local_rank_requested": 4,
+      "local_rank_effective": 4,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 8,
+      "block_elements": 512,
+      "block_bytes": {
+        "bytes": 4096.0,
+        "KiB": 4.0,
+        "MiB": 0.00390625,
+        "GiB": 3.814697265625e-06
+      },
+      "summary_elements": 164,
+      "summary_bytes": {
+        "bytes": 1312.0,
+        "KiB": 1.28125,
+        "MiB": 0.001251220703125,
+        "GiB": 1.2218952178955078e-06
+      },
+      "legacy_wire_bytes": {
+        "bytes": 4128.0,
+        "KiB": 4.03125,
+        "MiB": 0.003936767578125,
+        "GiB": 3.844499588012695e-06
+      },
+      "pca_wire_bytes": {
+        "bytes": 1566.0,
+        "KiB": 1.529296875,
+        "MiB": 0.0014934539794921875,
+        "GiB": 1.4584511518478394e-06
+      },
+      "compression_ratio_full_rank_vs_data": 3.1219512195121952,
+      "compression_ratio_legacy_vs_pca_wire": 2.636015325670498,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 128,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 4,
+      "merged_root_n_samples": 16
+    },
+    {
+      "n_block": 16,
+      "n_features": 32,
+      "n_block_over_d": 0.5,
+      "regime": "flat",
+      "local_rank_requested": 16,
+      "local_rank_effective": 16,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 8,
+      "block_elements": 512,
+      "block_bytes": {
+        "bytes": 4096.0,
+        "KiB": 4.0,
+        "MiB": 0.00390625,
+        "GiB": 3.814697265625e-06
+      },
+      "summary_elements": 560,
+      "summary_bytes": {
+        "bytes": 4480.0,
+        "KiB": 4.375,
+        "MiB": 0.0042724609375,
+        "GiB": 4.172325134277344e-06
+      },
+      "legacy_wire_bytes": {
+        "bytes": 4128.0,
+        "KiB": 4.03125,
+        "MiB": 0.003936767578125,
+        "GiB": 3.844499588012695e-06
+      },
+      "pca_wire_bytes": {
+        "bytes": 4734.0,
+        "KiB": 4.623046875,
+        "MiB": 0.0045146942138671875,
+        "GiB": 4.408881068229675e-06
+      },
+      "compression_ratio_full_rank_vs_data": 0.9142857142857143,
+      "compression_ratio_legacy_vs_pca_wire": 0.8719898605830165,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 512,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": true,
+        "note": "expected whenever n_block <= d at full local rank: the summary holds min(n_block,d)*d elements against n_block*d for the data, so it cannot be smaller. This is the design's boundary and is why local_rank < d exists."
+      },
+      "merged_root_rank": 16,
+      "merged_root_n_samples": 16
+    },
+    {
+      "n_block": 16,
+      "n_features": 32,
+      "n_block_over_d": 0.5,
+      "regime": "flat",
+      "local_rank_requested": 64,
+      "local_rank_effective": 16,
+      "local_rank_saturated_at_d": true,
+      "intrinsic_rank": 8,
+      "block_elements": 512,
+      "block_bytes": {
+        "bytes": 4096.0,
+        "KiB": 4.0,
+        "MiB": 0.00390625,
+        "GiB": 3.814697265625e-06
+      },
+      "summary_elements": 560,
+      "summary_bytes": {
+        "bytes": 4480.0,
+        "KiB": 4.375,
+        "MiB": 0.0042724609375,
+        "GiB": 4.172325134277344e-06
+      },
+      "legacy_wire_bytes": {
+        "bytes": 4128.0,
+        "KiB": 4.03125,
+        "MiB": 0.003936767578125,
+        "GiB": 3.844499588012695e-06
+      },
+      "pca_wire_bytes": {
+        "bytes": 4734.0,
+        "KiB": 4.623046875,
+        "MiB": 0.0045146942138671875,
+        "GiB": 4.408881068229675e-06
+      },
+      "compression_ratio_full_rank_vs_data": 0.9142857142857143,
+      "compression_ratio_legacy_vs_pca_wire": 0.8719898605830165,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 512,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": true,
+        "note": "expected whenever n_block <= d at full local rank: the summary holds min(n_block,d)*d elements against n_block*d for the data, so it cannot be smaller. This is the design's boundary and is why local_rank < d exists."
+      },
+      "merged_root_rank": 16,
+      "merged_root_n_samples": 16
+    },
+    {
+      "n_block": 16,
+      "n_features": 32,
+      "n_block_over_d": 0.5,
+      "regime": "flat",
+      "local_rank_requested": null,
+      "local_rank_effective": 16,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 8,
+      "block_elements": 512,
+      "block_bytes": {
+        "bytes": 4096.0,
+        "KiB": 4.0,
+        "MiB": 0.00390625,
+        "GiB": 3.814697265625e-06
+      },
+      "summary_elements": 560,
+      "summary_bytes": {
+        "bytes": 4480.0,
+        "KiB": 4.375,
+        "MiB": 0.0042724609375,
+        "GiB": 4.172325134277344e-06
+      },
+      "legacy_wire_bytes": {
+        "bytes": 4128.0,
+        "KiB": 4.03125,
+        "MiB": 0.003936767578125,
+        "GiB": 3.844499588012695e-06
+      },
+      "pca_wire_bytes": {
+        "bytes": 4734.0,
+        "KiB": 4.623046875,
+        "MiB": 0.0045146942138671875,
+        "GiB": 4.408881068229675e-06
+      },
+      "compression_ratio_full_rank_vs_data": 0.9142857142857143,
+      "compression_ratio_legacy_vs_pca_wire": 0.8719898605830165,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 512,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": true,
+        "note": "expected whenever n_block <= d at full local rank: the summary holds min(n_block,d)*d elements against n_block*d for the data, so it cannot be smaller. This is the design's boundary and is why local_rank < d exists."
+      },
+      "merged_root_rank": 16,
+      "merged_root_n_samples": 16
+    },
+    {
+      "n_block": 32,
+      "n_features": 32,
+      "n_block_over_d": 1.0,
+      "regime": "square",
+      "local_rank_requested": 4,
+      "local_rank_effective": 4,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 8,
+      "block_elements": 1024,
+      "block_bytes": {
+        "bytes": 8192.0,
+        "KiB": 8.0,
+        "MiB": 0.0078125,
+        "GiB": 7.62939453125e-06
+      },
+      "summary_elements": 164,
+      "summary_bytes": {
+        "bytes": 1312.0,
+        "KiB": 1.28125,
+        "MiB": 0.001251220703125,
+        "GiB": 1.2218952178955078e-06
+      },
+      "legacy_wire_bytes": {
+        "bytes": 8224.0,
+        "KiB": 8.03125,
+        "MiB": 0.007843017578125,
+        "GiB": 7.659196853637695e-06
+      },
+      "pca_wire_bytes": {
+        "bytes": 1566.0,
+        "KiB": 1.529296875,
+        "MiB": 0.0014934539794921875,
+        "GiB": 1.4584511518478394e-06
+      },
+      "compression_ratio_full_rank_vs_data": 6.2439024390243905,
+      "compression_ratio_legacy_vs_pca_wire": 5.251596424010217,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 128,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 4,
+      "merged_root_n_samples": 32
+    },
+    {
+      "n_block": 32,
+      "n_features": 32,
+      "n_block_over_d": 1.0,
+      "regime": "square",
+      "local_rank_requested": 16,
+      "local_rank_effective": 16,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 8,
+      "block_elements": 1024,
+      "block_bytes": {
+        "bytes": 8192.0,
+        "KiB": 8.0,
+        "MiB": 0.0078125,
+        "GiB": 7.62939453125e-06
+      },
+      "summary_elements": 560,
+      "summary_bytes": {
+        "bytes": 4480.0,
+        "KiB": 4.375,
+        "MiB": 0.0042724609375,
+        "GiB": 4.172325134277344e-06
+      },
+      "legacy_wire_bytes": {
+        "bytes": 8224.0,
+        "KiB": 8.03125,
+        "MiB": 0.007843017578125,
+        "GiB": 7.659196853637695e-06
+      },
+      "pca_wire_bytes": {
+        "bytes": 4734.0,
+        "KiB": 4.623046875,
+        "MiB": 0.0045146942138671875,
+        "GiB": 4.408881068229675e-06
+      },
+      "compression_ratio_full_rank_vs_data": 1.8285714285714285,
+      "compression_ratio_legacy_vs_pca_wire": 1.737220109843684,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 512,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 16,
+      "merged_root_n_samples": 32
+    },
+    {
+      "n_block": 32,
+      "n_features": 32,
+      "n_block_over_d": 1.0,
+      "regime": "square",
+      "local_rank_requested": 64,
+      "local_rank_effective": 32,
+      "local_rank_saturated_at_d": true,
+      "intrinsic_rank": 8,
+      "block_elements": 1024,
+      "block_bytes": {
+        "bytes": 8192.0,
+        "KiB": 8.0,
+        "MiB": 0.0078125,
+        "GiB": 7.62939453125e-06
+      },
+      "summary_elements": 1088,
+      "summary_bytes": {
+        "bytes": 8704.0,
+        "KiB": 8.5,
+        "MiB": 0.00830078125,
+        "GiB": 8.106231689453125e-06
+      },
+      "legacy_wire_bytes": {
+        "bytes": 8224.0,
+        "KiB": 8.03125,
+        "MiB": 0.007843017578125,
+        "GiB": 7.659196853637695e-06
+      },
+      "pca_wire_bytes": {
+        "bytes": 8958.0,
+        "KiB": 8.748046875,
+        "MiB": 0.008543014526367188,
+        "GiB": 8.342787623405457e-06
+      },
+      "compression_ratio_full_rank_vs_data": 0.9411764705882353,
+      "compression_ratio_legacy_vs_pca_wire": 0.9180620674257647,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 1024,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": true,
+        "note": "expected whenever n_block <= d at full local rank: the summary holds min(n_block,d)*d elements against n_block*d for the data, so it cannot be smaller. This is the design's boundary and is why local_rank < d exists."
+      },
+      "merged_root_rank": 32,
+      "merged_root_n_samples": 32
+    },
+    {
+      "n_block": 32,
+      "n_features": 32,
+      "n_block_over_d": 1.0,
+      "regime": "square",
+      "local_rank_requested": null,
+      "local_rank_effective": 32,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 8,
+      "block_elements": 1024,
+      "block_bytes": {
+        "bytes": 8192.0,
+        "KiB": 8.0,
+        "MiB": 0.0078125,
+        "GiB": 7.62939453125e-06
+      },
+      "summary_elements": 1088,
+      "summary_bytes": {
+        "bytes": 8704.0,
+        "KiB": 8.5,
+        "MiB": 0.00830078125,
+        "GiB": 8.106231689453125e-06
+      },
+      "legacy_wire_bytes": {
+        "bytes": 8224.0,
+        "KiB": 8.03125,
+        "MiB": 0.007843017578125,
+        "GiB": 7.659196853637695e-06
+      },
+      "pca_wire_bytes": {
+        "bytes": 8958.0,
+        "KiB": 8.748046875,
+        "MiB": 0.008543014526367188,
+        "GiB": 8.342787623405457e-06
+      },
+      "compression_ratio_full_rank_vs_data": 0.9411764705882353,
+      "compression_ratio_legacy_vs_pca_wire": 0.9180620674257647,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 1024,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": true,
+        "note": "expected whenever n_block <= d at full local rank: the summary holds min(n_block,d)*d elements against n_block*d for the data, so it cannot be smaller. This is the design's boundary and is why local_rank < d exists."
+      },
+      "merged_root_rank": 32,
+      "merged_root_n_samples": 32
+    },
+    {
+      "n_block": 64,
+      "n_features": 32,
+      "n_block_over_d": 2.0,
+      "regime": "tall",
+      "local_rank_requested": 4,
+      "local_rank_effective": 4,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 8,
+      "block_elements": 2048,
+      "block_bytes": {
+        "bytes": 16384.0,
+        "KiB": 16.0,
+        "MiB": 0.015625,
+        "GiB": 1.52587890625e-05
+      },
+      "summary_elements": 164,
+      "summary_bytes": {
+        "bytes": 1312.0,
+        "KiB": 1.28125,
+        "MiB": 0.001251220703125,
+        "GiB": 1.2218952178955078e-06
+      },
+      "legacy_wire_bytes": {
+        "bytes": 16416.0,
+        "KiB": 16.03125,
+        "MiB": 0.015655517578125,
+        "GiB": 1.5288591384887695e-05
+      },
+      "pca_wire_bytes": {
+        "bytes": 1566.0,
+        "KiB": 1.529296875,
+        "MiB": 0.0014934539794921875,
+        "GiB": 1.4584511518478394e-06
+      },
+      "compression_ratio_full_rank_vs_data": 12.487804878048781,
+      "compression_ratio_legacy_vs_pca_wire": 10.482758620689655,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 128,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 4,
+      "merged_root_n_samples": 64
+    },
+    {
+      "n_block": 64,
+      "n_features": 32,
+      "n_block_over_d": 2.0,
+      "regime": "tall",
+      "local_rank_requested": 16,
+      "local_rank_effective": 16,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 8,
+      "block_elements": 2048,
+      "block_bytes": {
+        "bytes": 16384.0,
+        "KiB": 16.0,
+        "MiB": 0.015625,
+        "GiB": 1.52587890625e-05
+      },
+      "summary_elements": 560,
+      "summary_bytes": {
+        "bytes": 4480.0,
+        "KiB": 4.375,
+        "MiB": 0.0042724609375,
+        "GiB": 4.172325134277344e-06
+      },
+      "legacy_wire_bytes": {
+        "bytes": 16416.0,
+        "KiB": 16.03125,
+        "MiB": 0.015655517578125,
+        "GiB": 1.5288591384887695e-05
+      },
+      "pca_wire_bytes": {
+        "bytes": 4734.0,
+        "KiB": 4.623046875,
+        "MiB": 0.0045146942138671875,
+        "GiB": 4.408881068229675e-06
+      },
+      "compression_ratio_full_rank_vs_data": 3.657142857142857,
+      "compression_ratio_legacy_vs_pca_wire": 3.467680608365019,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 512,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 16,
+      "merged_root_n_samples": 64
+    },
+    {
+      "n_block": 64,
+      "n_features": 32,
+      "n_block_over_d": 2.0,
+      "regime": "tall",
+      "local_rank_requested": 64,
+      "local_rank_effective": 32,
+      "local_rank_saturated_at_d": true,
+      "intrinsic_rank": 8,
+      "block_elements": 2048,
+      "block_bytes": {
+        "bytes": 16384.0,
+        "KiB": 16.0,
+        "MiB": 0.015625,
+        "GiB": 1.52587890625e-05
+      },
+      "summary_elements": 1088,
+      "summary_bytes": {
+        "bytes": 8704.0,
+        "KiB": 8.5,
+        "MiB": 0.00830078125,
+        "GiB": 8.106231689453125e-06
+      },
+      "legacy_wire_bytes": {
+        "bytes": 16416.0,
+        "KiB": 16.03125,
+        "MiB": 0.015655517578125,
+        "GiB": 1.5288591384887695e-05
+      },
+      "pca_wire_bytes": {
+        "bytes": 8958.0,
+        "KiB": 8.748046875,
+        "MiB": 0.008543014526367188,
+        "GiB": 8.342787623405457e-06
+      },
+      "compression_ratio_full_rank_vs_data": 1.8823529411764706,
+      "compression_ratio_legacy_vs_pca_wire": 1.8325519089082385,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 1024,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 32,
+      "merged_root_n_samples": 64
+    },
+    {
+      "n_block": 64,
+      "n_features": 32,
+      "n_block_over_d": 2.0,
+      "regime": "tall",
+      "local_rank_requested": null,
+      "local_rank_effective": 32,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 8,
+      "block_elements": 2048,
+      "block_bytes": {
+        "bytes": 16384.0,
+        "KiB": 16.0,
+        "MiB": 0.015625,
+        "GiB": 1.52587890625e-05
+      },
+      "summary_elements": 1088,
+      "summary_bytes": {
+        "bytes": 8704.0,
+        "KiB": 8.5,
+        "MiB": 0.00830078125,
+        "GiB": 8.106231689453125e-06
+      },
+      "legacy_wire_bytes": {
+        "bytes": 16416.0,
+        "KiB": 16.03125,
+        "MiB": 0.015655517578125,
+        "GiB": 1.5288591384887695e-05
+      },
+      "pca_wire_bytes": {
+        "bytes": 8958.0,
+        "KiB": 8.748046875,
+        "MiB": 0.008543014526367188,
+        "GiB": 8.342787623405457e-06
+      },
+      "compression_ratio_full_rank_vs_data": 1.8823529411764706,
+      "compression_ratio_legacy_vs_pca_wire": 1.8325519089082385,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 1024,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 32,
+      "merged_root_n_samples": 64
+    },
+    {
+      "n_block": 128,
+      "n_features": 32,
+      "n_block_over_d": 4.0,
+      "regime": "tall",
+      "local_rank_requested": 4,
+      "local_rank_effective": 4,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 8,
+      "block_elements": 4096,
+      "block_bytes": {
+        "bytes": 32768.0,
+        "KiB": 32.0,
+        "MiB": 0.03125,
+        "GiB": 3.0517578125e-05
+      },
+      "summary_elements": 164,
+      "summary_bytes": {
+        "bytes": 1312.0,
+        "KiB": 1.28125,
+        "MiB": 0.001251220703125,
+        "GiB": 1.2218952178955078e-06
+      },
+      "legacy_wire_bytes": {
+        "bytes": 32800.0,
+        "KiB": 32.03125,
+        "MiB": 0.031280517578125,
+        "GiB": 3.0547380447387695e-05
+      },
+      "pca_wire_bytes": {
+        "bytes": 1566.0,
+        "KiB": 1.529296875,
+        "MiB": 0.0014934539794921875,
+        "GiB": 1.4584511518478394e-06
+      },
+      "compression_ratio_full_rank_vs_data": 24.975609756097562,
+      "compression_ratio_legacy_vs_pca_wire": 20.94508301404853,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 128,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 4,
+      "merged_root_n_samples": 128
+    },
+    {
+      "n_block": 128,
+      "n_features": 32,
+      "n_block_over_d": 4.0,
+      "regime": "tall",
+      "local_rank_requested": 16,
+      "local_rank_effective": 16,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 8,
+      "block_elements": 4096,
+      "block_bytes": {
+        "bytes": 32768.0,
+        "KiB": 32.0,
+        "MiB": 0.03125,
+        "GiB": 3.0517578125e-05
+      },
+      "summary_elements": 560,
+      "summary_bytes": {
+        "bytes": 4480.0,
+        "KiB": 4.375,
+        "MiB": 0.0042724609375,
+        "GiB": 4.172325134277344e-06
+      },
+      "legacy_wire_bytes": {
+        "bytes": 32800.0,
+        "KiB": 32.03125,
+        "MiB": 0.031280517578125,
+        "GiB": 3.0547380447387695e-05
+      },
+      "pca_wire_bytes": {
+        "bytes": 4734.0,
+        "KiB": 4.623046875,
+        "MiB": 0.0045146942138671875,
+        "GiB": 4.408881068229675e-06
+      },
+      "compression_ratio_full_rank_vs_data": 7.314285714285714,
+      "compression_ratio_legacy_vs_pca_wire": 6.928601605407689,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 512,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 16,
+      "merged_root_n_samples": 128
+    },
+    {
+      "n_block": 128,
+      "n_features": 32,
+      "n_block_over_d": 4.0,
+      "regime": "tall",
+      "local_rank_requested": 64,
+      "local_rank_effective": 32,
+      "local_rank_saturated_at_d": true,
+      "intrinsic_rank": 8,
+      "block_elements": 4096,
+      "block_bytes": {
+        "bytes": 32768.0,
+        "KiB": 32.0,
+        "MiB": 0.03125,
+        "GiB": 3.0517578125e-05
+      },
+      "summary_elements": 1088,
+      "summary_bytes": {
+        "bytes": 8704.0,
+        "KiB": 8.5,
+        "MiB": 0.00830078125,
+        "GiB": 8.106231689453125e-06
+      },
+      "legacy_wire_bytes": {
+        "bytes": 32800.0,
+        "KiB": 32.03125,
+        "MiB": 0.031280517578125,
+        "GiB": 3.0547380447387695e-05
+      },
+      "pca_wire_bytes": {
+        "bytes": 8958.0,
+        "KiB": 8.748046875,
+        "MiB": 0.008543014526367188,
+        "GiB": 8.342787623405457e-06
+      },
+      "compression_ratio_full_rank_vs_data": 3.764705882352941,
+      "compression_ratio_legacy_vs_pca_wire": 3.661531591873186,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 1024,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 32,
+      "merged_root_n_samples": 128
+    },
+    {
+      "n_block": 128,
+      "n_features": 32,
+      "n_block_over_d": 4.0,
+      "regime": "tall",
+      "local_rank_requested": null,
+      "local_rank_effective": 32,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 8,
+      "block_elements": 4096,
+      "block_bytes": {
+        "bytes": 32768.0,
+        "KiB": 32.0,
+        "MiB": 0.03125,
+        "GiB": 3.0517578125e-05
+      },
+      "summary_elements": 1088,
+      "summary_bytes": {
+        "bytes": 8704.0,
+        "KiB": 8.5,
+        "MiB": 0.00830078125,
+        "GiB": 8.106231689453125e-06
+      },
+      "legacy_wire_bytes": {
+        "bytes": 32800.0,
+        "KiB": 32.03125,
+        "MiB": 0.031280517578125,
+        "GiB": 3.0547380447387695e-05
+      },
+      "pca_wire_bytes": {
+        "bytes": 8958.0,
+        "KiB": 8.748046875,
+        "MiB": 0.008543014526367188,
+        "GiB": 8.342787623405457e-06
+      },
+      "compression_ratio_full_rank_vs_data": 3.764705882352941,
+      "compression_ratio_legacy_vs_pca_wire": 3.661531591873186,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 1024,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 32,
+      "merged_root_n_samples": 128
+    },
+    {
+      "n_block": 256,
+      "n_features": 32,
+      "n_block_over_d": 8.0,
+      "regime": "tall",
+      "local_rank_requested": 4,
+      "local_rank_effective": 4,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 8,
+      "block_elements": 8192,
+      "block_bytes": {
+        "bytes": 65536.0,
+        "KiB": 64.0,
+        "MiB": 0.0625,
+        "GiB": 6.103515625e-05
+      },
+      "summary_elements": 164,
+      "summary_bytes": {
+        "bytes": 1312.0,
+        "KiB": 1.28125,
+        "MiB": 0.001251220703125,
+        "GiB": 1.2218952178955078e-06
+      },
+      "legacy_wire_bytes": {
+        "bytes": 65568.0,
+        "KiB": 64.03125,
+        "MiB": 0.062530517578125,
+        "GiB": 6.10649585723877e-05
+      },
+      "pca_wire_bytes": {
+        "bytes": 1567.0,
+        "KiB": 1.5302734375,
+        "MiB": 0.0014944076538085938,
+        "GiB": 1.4593824744224548e-06
+      },
+      "compression_ratio_full_rank_vs_data": 49.951219512195124,
+      "compression_ratio_legacy_vs_pca_wire": 41.84301212507977,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 128,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 4,
+      "merged_root_n_samples": 256
+    },
+    {
+      "n_block": 256,
+      "n_features": 32,
+      "n_block_over_d": 8.0,
+      "regime": "tall",
+      "local_rank_requested": 16,
+      "local_rank_effective": 16,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 8,
+      "block_elements": 8192,
+      "block_bytes": {
+        "bytes": 65536.0,
+        "KiB": 64.0,
+        "MiB": 0.0625,
+        "GiB": 6.103515625e-05
+      },
+      "summary_elements": 560,
+      "summary_bytes": {
+        "bytes": 4480.0,
+        "KiB": 4.375,
+        "MiB": 0.0042724609375,
+        "GiB": 4.172325134277344e-06
+      },
+      "legacy_wire_bytes": {
+        "bytes": 65568.0,
+        "KiB": 64.03125,
+        "MiB": 0.062530517578125,
+        "GiB": 6.10649585723877e-05
+      },
+      "pca_wire_bytes": {
+        "bytes": 4735.0,
+        "KiB": 4.6240234375,
+        "MiB": 0.004515647888183594,
+        "GiB": 4.409812390804291e-06
+      },
+      "compression_ratio_full_rank_vs_data": 14.628571428571428,
+      "compression_ratio_legacy_vs_pca_wire": 13.84751847940866,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 512,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 16,
+      "merged_root_n_samples": 256
+    },
+    {
+      "n_block": 256,
+      "n_features": 32,
+      "n_block_over_d": 8.0,
+      "regime": "tall",
+      "local_rank_requested": 64,
+      "local_rank_effective": 32,
+      "local_rank_saturated_at_d": true,
+      "intrinsic_rank": 8,
+      "block_elements": 8192,
+      "block_bytes": {
+        "bytes": 65536.0,
+        "KiB": 64.0,
+        "MiB": 0.0625,
+        "GiB": 6.103515625e-05
+      },
+      "summary_elements": 1088,
+      "summary_bytes": {
+        "bytes": 8704.0,
+        "KiB": 8.5,
+        "MiB": 0.00830078125,
+        "GiB": 8.106231689453125e-06
+      },
+      "legacy_wire_bytes": {
+        "bytes": 65568.0,
+        "KiB": 64.03125,
+        "MiB": 0.062530517578125,
+        "GiB": 6.10649585723877e-05
+      },
+      "pca_wire_bytes": {
+        "bytes": 8959.0,
+        "KiB": 8.7490234375,
+        "MiB": 0.008543968200683594,
+        "GiB": 8.343718945980072e-06
+      },
+      "compression_ratio_full_rank_vs_data": 7.529411764705882,
+      "compression_ratio_legacy_vs_pca_wire": 7.318673959147226,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 1024,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 32,
+      "merged_root_n_samples": 256
+    },
+    {
+      "n_block": 256,
+      "n_features": 32,
+      "n_block_over_d": 8.0,
+      "regime": "tall",
+      "local_rank_requested": null,
+      "local_rank_effective": 32,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 8,
+      "block_elements": 8192,
+      "block_bytes": {
+        "bytes": 65536.0,
+        "KiB": 64.0,
+        "MiB": 0.0625,
+        "GiB": 6.103515625e-05
+      },
+      "summary_elements": 1088,
+      "summary_bytes": {
+        "bytes": 8704.0,
+        "KiB": 8.5,
+        "MiB": 0.00830078125,
+        "GiB": 8.106231689453125e-06
+      },
+      "legacy_wire_bytes": {
+        "bytes": 65568.0,
+        "KiB": 64.03125,
+        "MiB": 0.062530517578125,
+        "GiB": 6.10649585723877e-05
+      },
+      "pca_wire_bytes": {
+        "bytes": 8959.0,
+        "KiB": 8.7490234375,
+        "MiB": 0.008543968200683594,
+        "GiB": 8.343718945980072e-06
+      },
+      "compression_ratio_full_rank_vs_data": 7.529411764705882,
+      "compression_ratio_legacy_vs_pca_wire": 7.318673959147226,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 1024,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 32,
+      "merged_root_n_samples": 256
+    },
+    {
+      "n_block": 32,
+      "n_features": 128,
+      "n_block_over_d": 0.25,
+      "regime": "flat",
+      "local_rank_requested": 4,
+      "local_rank_effective": 4,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 32,
+      "block_elements": 4096,
+      "block_bytes": {
+        "bytes": 32768.0,
+        "KiB": 32.0,
+        "MiB": 0.03125,
+        "GiB": 3.0517578125e-05
+      },
+      "summary_elements": 644,
+      "summary_bytes": {
+        "bytes": 5152.0,
+        "KiB": 5.03125,
+        "MiB": 0.004913330078125,
+        "GiB": 4.798173904418945e-06
+      },
+      "legacy_wire_bytes": {
+        "bytes": 32800.0,
+        "KiB": 32.03125,
+        "MiB": 0.031280517578125,
+        "GiB": 3.0547380447387695e-05
+      },
+      "pca_wire_bytes": {
+        "bytes": 5406.0,
+        "KiB": 5.279296875,
+        "MiB": 0.0051555633544921875,
+        "GiB": 5.034729838371277e-06
+      },
+      "compression_ratio_full_rank_vs_data": 6.3602484472049685,
+      "compression_ratio_legacy_vs_pca_wire": 6.067332593414724,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 512,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 4,
+      "merged_root_n_samples": 32
+    },
+    {
+      "n_block": 32,
+      "n_features": 128,
+      "n_block_over_d": 0.25,
+      "regime": "flat",
+      "local_rank_requested": 16,
+      "local_rank_effective": 16,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 32,
+      "block_elements": 4096,
+      "block_bytes": {
+        "bytes": 32768.0,
+        "KiB": 32.0,
+        "MiB": 0.03125,
+        "GiB": 3.0517578125e-05
+      },
+      "summary_elements": 2192,
+      "summary_bytes": {
+        "bytes": 17536.0,
+        "KiB": 17.125,
+        "MiB": 0.0167236328125,
+        "GiB": 1.633167266845703e-05
+      },
+      "legacy_wire_bytes": {
+        "bytes": 32800.0,
+        "KiB": 32.03125,
+        "MiB": 0.031280517578125,
+        "GiB": 3.0547380447387695e-05
+      },
+      "pca_wire_bytes": {
+        "bytes": 17790.0,
+        "KiB": 17.373046875,
+        "MiB": 0.016965866088867188,
+        "GiB": 1.6568228602409363e-05
+      },
+      "compression_ratio_full_rank_vs_data": 1.8686131386861313,
+      "compression_ratio_legacy_vs_pca_wire": 1.8437324339516583,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 2048,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 16,
+      "merged_root_n_samples": 32
+    },
+    {
+      "n_block": 32,
+      "n_features": 128,
+      "n_block_over_d": 0.25,
+      "regime": "flat",
+      "local_rank_requested": 64,
+      "local_rank_effective": 32,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 32,
+      "block_elements": 4096,
+      "block_bytes": {
+        "bytes": 32768.0,
+        "KiB": 32.0,
+        "MiB": 0.03125,
+        "GiB": 3.0517578125e-05
+      },
+      "summary_elements": 4256,
+      "summary_bytes": {
+        "bytes": 34048.0,
+        "KiB": 33.25,
+        "MiB": 0.032470703125,
+        "GiB": 3.170967102050781e-05
+      },
+      "legacy_wire_bytes": {
+        "bytes": 32800.0,
+        "KiB": 32.03125,
+        "MiB": 0.031280517578125,
+        "GiB": 3.0547380447387695e-05
+      },
+      "pca_wire_bytes": {
+        "bytes": 34302.0,
+        "KiB": 33.498046875,
+        "MiB": 0.03271293640136719,
+        "GiB": 3.1946226954460144e-05
+      },
+      "compression_ratio_full_rank_vs_data": 0.9624060150375939,
+      "compression_ratio_legacy_vs_pca_wire": 0.9562124657454376,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 4096,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": true,
+        "note": "expected whenever n_block <= d at full local rank: the summary holds min(n_block,d)*d elements against n_block*d for the data, so it cannot be smaller. This is the design's boundary and is why local_rank < d exists."
+      },
+      "merged_root_rank": 32,
+      "merged_root_n_samples": 32
+    },
+    {
+      "n_block": 32,
+      "n_features": 128,
+      "n_block_over_d": 0.25,
+      "regime": "flat",
+      "local_rank_requested": null,
+      "local_rank_effective": 32,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 32,
+      "block_elements": 4096,
+      "block_bytes": {
+        "bytes": 32768.0,
+        "KiB": 32.0,
+        "MiB": 0.03125,
+        "GiB": 3.0517578125e-05
+      },
+      "summary_elements": 4256,
+      "summary_bytes": {
+        "bytes": 34048.0,
+        "KiB": 33.25,
+        "MiB": 0.032470703125,
+        "GiB": 3.170967102050781e-05
+      },
+      "legacy_wire_bytes": {
+        "bytes": 32800.0,
+        "KiB": 32.03125,
+        "MiB": 0.031280517578125,
+        "GiB": 3.0547380447387695e-05
+      },
+      "pca_wire_bytes": {
+        "bytes": 34302.0,
+        "KiB": 33.498046875,
+        "MiB": 0.03271293640136719,
+        "GiB": 3.1946226954460144e-05
+      },
+      "compression_ratio_full_rank_vs_data": 0.9624060150375939,
+      "compression_ratio_legacy_vs_pca_wire": 0.9562124657454376,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 4096,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": true,
+        "note": "expected whenever n_block <= d at full local rank: the summary holds min(n_block,d)*d elements against n_block*d for the data, so it cannot be smaller. This is the design's boundary and is why local_rank < d exists."
+      },
+      "merged_root_rank": 32,
+      "merged_root_n_samples": 32
+    },
+    {
+      "n_block": 64,
+      "n_features": 128,
+      "n_block_over_d": 0.5,
+      "regime": "flat",
+      "local_rank_requested": 4,
+      "local_rank_effective": 4,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 32,
+      "block_elements": 8192,
+      "block_bytes": {
+        "bytes": 65536.0,
+        "KiB": 64.0,
+        "MiB": 0.0625,
+        "GiB": 6.103515625e-05
+      },
+      "summary_elements": 644,
+      "summary_bytes": {
+        "bytes": 5152.0,
+        "KiB": 5.03125,
+        "MiB": 0.004913330078125,
+        "GiB": 4.798173904418945e-06
+      },
+      "legacy_wire_bytes": {
+        "bytes": 65568.0,
+        "KiB": 64.03125,
+        "MiB": 0.062530517578125,
+        "GiB": 6.10649585723877e-05
+      },
+      "pca_wire_bytes": {
+        "bytes": 5406.0,
+        "KiB": 5.279296875,
+        "MiB": 0.0051555633544921875,
+        "GiB": 5.034729838371277e-06
+      },
+      "compression_ratio_full_rank_vs_data": 12.720496894409937,
+      "compression_ratio_legacy_vs_pca_wire": 12.128745837957824,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 512,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 4,
+      "merged_root_n_samples": 64
+    },
+    {
+      "n_block": 64,
+      "n_features": 128,
+      "n_block_over_d": 0.5,
+      "regime": "flat",
+      "local_rank_requested": 16,
+      "local_rank_effective": 16,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 32,
+      "block_elements": 8192,
+      "block_bytes": {
+        "bytes": 65536.0,
+        "KiB": 64.0,
+        "MiB": 0.0625,
+        "GiB": 6.103515625e-05
+      },
+      "summary_elements": 2192,
+      "summary_bytes": {
+        "bytes": 17536.0,
+        "KiB": 17.125,
+        "MiB": 0.0167236328125,
+        "GiB": 1.633167266845703e-05
+      },
+      "legacy_wire_bytes": {
+        "bytes": 65568.0,
+        "KiB": 64.03125,
+        "MiB": 0.062530517578125,
+        "GiB": 6.10649585723877e-05
+      },
+      "pca_wire_bytes": {
+        "bytes": 17790.0,
+        "KiB": 17.373046875,
+        "MiB": 0.016965866088867188,
+        "GiB": 1.6568228602409363e-05
+      },
+      "compression_ratio_full_rank_vs_data": 3.7372262773722627,
+      "compression_ratio_legacy_vs_pca_wire": 3.68566610455312,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 2048,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 16,
+      "merged_root_n_samples": 64
+    },
+    {
+      "n_block": 64,
+      "n_features": 128,
+      "n_block_over_d": 0.5,
+      "regime": "flat",
+      "local_rank_requested": 64,
+      "local_rank_effective": 64,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 32,
+      "block_elements": 8192,
+      "block_bytes": {
+        "bytes": 65536.0,
+        "KiB": 64.0,
+        "MiB": 0.0625,
+        "GiB": 6.103515625e-05
+      },
+      "summary_elements": 8384,
+      "summary_bytes": {
+        "bytes": 67072.0,
+        "KiB": 65.5,
+        "MiB": 0.06396484375,
+        "GiB": 6.246566772460938e-05
+      },
+      "legacy_wire_bytes": {
+        "bytes": 65568.0,
+        "KiB": 64.03125,
+        "MiB": 0.062530517578125,
+        "GiB": 6.10649585723877e-05
+      },
+      "pca_wire_bytes": {
+        "bytes": 67326.0,
+        "KiB": 65.748046875,
+        "MiB": 0.06420707702636719,
+        "GiB": 6.27022236585617e-05
+      },
+      "compression_ratio_full_rank_vs_data": 0.9770992366412213,
+      "compression_ratio_legacy_vs_pca_wire": 0.9738882452544336,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 8192,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": true,
+        "note": "expected whenever n_block <= d at full local rank: the summary holds min(n_block,d)*d elements against n_block*d for the data, so it cannot be smaller. This is the design's boundary and is why local_rank < d exists."
+      },
+      "merged_root_rank": 64,
+      "merged_root_n_samples": 64
+    },
+    {
+      "n_block": 64,
+      "n_features": 128,
+      "n_block_over_d": 0.5,
+      "regime": "flat",
+      "local_rank_requested": null,
+      "local_rank_effective": 64,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 32,
+      "block_elements": 8192,
+      "block_bytes": {
+        "bytes": 65536.0,
+        "KiB": 64.0,
+        "MiB": 0.0625,
+        "GiB": 6.103515625e-05
+      },
+      "summary_elements": 8384,
+      "summary_bytes": {
+        "bytes": 67072.0,
+        "KiB": 65.5,
+        "MiB": 0.06396484375,
+        "GiB": 6.246566772460938e-05
+      },
+      "legacy_wire_bytes": {
+        "bytes": 65568.0,
+        "KiB": 64.03125,
+        "MiB": 0.062530517578125,
+        "GiB": 6.10649585723877e-05
+      },
+      "pca_wire_bytes": {
+        "bytes": 67326.0,
+        "KiB": 65.748046875,
+        "MiB": 0.06420707702636719,
+        "GiB": 6.27022236585617e-05
+      },
+      "compression_ratio_full_rank_vs_data": 0.9770992366412213,
+      "compression_ratio_legacy_vs_pca_wire": 0.9738882452544336,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 8192,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": true,
+        "note": "expected whenever n_block <= d at full local rank: the summary holds min(n_block,d)*d elements against n_block*d for the data, so it cannot be smaller. This is the design's boundary and is why local_rank < d exists."
+      },
+      "merged_root_rank": 64,
+      "merged_root_n_samples": 64
+    },
+    {
+      "n_block": 128,
+      "n_features": 128,
+      "n_block_over_d": 1.0,
+      "regime": "square",
+      "local_rank_requested": 4,
+      "local_rank_effective": 4,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 32,
+      "block_elements": 16384,
+      "block_bytes": {
+        "bytes": 131072.0,
+        "KiB": 128.0,
+        "MiB": 0.125,
+        "GiB": 0.0001220703125
+      },
+      "summary_elements": 644,
+      "summary_bytes": {
+        "bytes": 5152.0,
+        "KiB": 5.03125,
+        "MiB": 0.004913330078125,
+        "GiB": 4.798173904418945e-06
+      },
+      "legacy_wire_bytes": {
+        "bytes": 131104.0,
+        "KiB": 128.03125,
+        "MiB": 0.125030517578125,
+        "GiB": 0.0001221001148223877
+      },
+      "pca_wire_bytes": {
+        "bytes": 5406.0,
+        "KiB": 5.279296875,
+        "MiB": 0.0051555633544921875,
+        "GiB": 5.034729838371277e-06
+      },
+      "compression_ratio_full_rank_vs_data": 25.440993788819874,
+      "compression_ratio_legacy_vs_pca_wire": 24.251572327044027,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 512,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 4,
+      "merged_root_n_samples": 128
+    },
+    {
+      "n_block": 128,
+      "n_features": 128,
+      "n_block_over_d": 1.0,
+      "regime": "square",
+      "local_rank_requested": 16,
+      "local_rank_effective": 16,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 32,
+      "block_elements": 16384,
+      "block_bytes": {
+        "bytes": 131072.0,
+        "KiB": 128.0,
+        "MiB": 0.125,
+        "GiB": 0.0001220703125
+      },
+      "summary_elements": 2192,
+      "summary_bytes": {
+        "bytes": 17536.0,
+        "KiB": 17.125,
+        "MiB": 0.0167236328125,
+        "GiB": 1.633167266845703e-05
+      },
+      "legacy_wire_bytes": {
+        "bytes": 131104.0,
+        "KiB": 128.03125,
+        "MiB": 0.125030517578125,
+        "GiB": 0.0001221001148223877
+      },
+      "pca_wire_bytes": {
+        "bytes": 17790.0,
+        "KiB": 17.373046875,
+        "MiB": 0.016965866088867188,
+        "GiB": 1.6568228602409363e-05
+      },
+      "compression_ratio_full_rank_vs_data": 7.474452554744525,
+      "compression_ratio_legacy_vs_pca_wire": 7.369533445756042,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 2048,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 16,
+      "merged_root_n_samples": 128
+    },
+    {
+      "n_block": 128,
+      "n_features": 128,
+      "n_block_over_d": 1.0,
+      "regime": "square",
+      "local_rank_requested": 64,
+      "local_rank_effective": 64,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 32,
+      "block_elements": 16384,
+      "block_bytes": {
+        "bytes": 131072.0,
+        "KiB": 128.0,
+        "MiB": 0.125,
+        "GiB": 0.0001220703125
+      },
+      "summary_elements": 8384,
+      "summary_bytes": {
+        "bytes": 67072.0,
+        "KiB": 65.5,
+        "MiB": 0.06396484375,
+        "GiB": 6.246566772460938e-05
+      },
+      "legacy_wire_bytes": {
+        "bytes": 131104.0,
+        "KiB": 128.03125,
+        "MiB": 0.125030517578125,
+        "GiB": 0.0001221001148223877
+      },
+      "pca_wire_bytes": {
+        "bytes": 67326.0,
+        "KiB": 65.748046875,
+        "MiB": 0.06420707702636719,
+        "GiB": 6.27022236585617e-05
+      },
+      "compression_ratio_full_rank_vs_data": 1.9541984732824427,
+      "compression_ratio_legacy_vs_pca_wire": 1.9473011912188456,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 8192,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 64,
+      "merged_root_n_samples": 128
+    },
+    {
+      "n_block": 128,
+      "n_features": 128,
+      "n_block_over_d": 1.0,
+      "regime": "square",
+      "local_rank_requested": null,
+      "local_rank_effective": 128,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 32,
+      "block_elements": 16384,
+      "block_bytes": {
+        "bytes": 131072.0,
+        "KiB": 128.0,
+        "MiB": 0.125,
+        "GiB": 0.0001220703125
+      },
+      "summary_elements": 16640,
+      "summary_bytes": {
+        "bytes": 133120.0,
+        "KiB": 130.0,
+        "MiB": 0.126953125,
+        "GiB": 0.0001239776611328125
+      },
+      "legacy_wire_bytes": {
+        "bytes": 131104.0,
+        "KiB": 128.03125,
+        "MiB": 0.125030517578125,
+        "GiB": 0.0001221001148223877
+      },
+      "pca_wire_bytes": {
+        "bytes": 133374.0,
+        "KiB": 130.248046875,
+        "MiB": 0.1271953582763672,
+        "GiB": 0.00012421421706676483
+      },
+      "compression_ratio_full_rank_vs_data": 0.9846153846153847,
+      "compression_ratio_legacy_vs_pca_wire": 0.9829801910417323,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 16384,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": true,
+        "note": "expected whenever n_block <= d at full local rank: the summary holds min(n_block,d)*d elements against n_block*d for the data, so it cannot be smaller. This is the design's boundary and is why local_rank < d exists."
+      },
+      "merged_root_rank": 128,
+      "merged_root_n_samples": 128
+    },
+    {
+      "n_block": 256,
+      "n_features": 128,
+      "n_block_over_d": 2.0,
+      "regime": "tall",
+      "local_rank_requested": 4,
+      "local_rank_effective": 4,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 32,
+      "block_elements": 32768,
+      "block_bytes": {
+        "bytes": 262144.0,
+        "KiB": 256.0,
+        "MiB": 0.25,
+        "GiB": 0.000244140625
+      },
+      "summary_elements": 644,
+      "summary_bytes": {
+        "bytes": 5152.0,
+        "KiB": 5.03125,
+        "MiB": 0.004913330078125,
+        "GiB": 4.798173904418945e-06
+      },
+      "legacy_wire_bytes": {
+        "bytes": 262176.0,
+        "KiB": 256.03125,
+        "MiB": 0.250030517578125,
+        "GiB": 0.0002441704273223877
+      },
+      "pca_wire_bytes": {
+        "bytes": 5407.0,
+        "KiB": 5.2802734375,
+        "MiB": 0.005156517028808594,
+        "GiB": 5.035661160945892e-06
+      },
+      "compression_ratio_full_rank_vs_data": 50.88198757763975,
+      "compression_ratio_legacy_vs_pca_wire": 48.48825596449048,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 512,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 4,
+      "merged_root_n_samples": 256
+    },
+    {
+      "n_block": 256,
+      "n_features": 128,
+      "n_block_over_d": 2.0,
+      "regime": "tall",
+      "local_rank_requested": 16,
+      "local_rank_effective": 16,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 32,
+      "block_elements": 32768,
+      "block_bytes": {
+        "bytes": 262144.0,
+        "KiB": 256.0,
+        "MiB": 0.25,
+        "GiB": 0.000244140625
+      },
+      "summary_elements": 2192,
+      "summary_bytes": {
+        "bytes": 17536.0,
+        "KiB": 17.125,
+        "MiB": 0.0167236328125,
+        "GiB": 1.633167266845703e-05
+      },
+      "legacy_wire_bytes": {
+        "bytes": 262176.0,
+        "KiB": 256.03125,
+        "MiB": 0.250030517578125,
+        "GiB": 0.0002441704273223877
+      },
+      "pca_wire_bytes": {
+        "bytes": 17791.0,
+        "KiB": 17.3740234375,
+        "MiB": 0.016966819763183594,
+        "GiB": 1.6569159924983978e-05
+      },
+      "compression_ratio_full_rank_vs_data": 14.94890510948905,
+      "compression_ratio_legacy_vs_pca_wire": 14.736439772918892,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 2048,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 16,
+      "merged_root_n_samples": 256
+    },
+    {
+      "n_block": 256,
+      "n_features": 128,
+      "n_block_over_d": 2.0,
+      "regime": "tall",
+      "local_rank_requested": 64,
+      "local_rank_effective": 64,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 32,
+      "block_elements": 32768,
+      "block_bytes": {
+        "bytes": 262144.0,
+        "KiB": 256.0,
+        "MiB": 0.25,
+        "GiB": 0.000244140625
+      },
+      "summary_elements": 8384,
+      "summary_bytes": {
+        "bytes": 67072.0,
+        "KiB": 65.5,
+        "MiB": 0.06396484375,
+        "GiB": 6.246566772460938e-05
+      },
+      "legacy_wire_bytes": {
+        "bytes": 262176.0,
+        "KiB": 256.03125,
+        "MiB": 0.250030517578125,
+        "GiB": 0.0002441704273223877
+      },
+      "pca_wire_bytes": {
+        "bytes": 67327.0,
+        "KiB": 65.7490234375,
+        "MiB": 0.0642080307006836,
+        "GiB": 6.270315498113632e-05
+      },
+      "compression_ratio_full_rank_vs_data": 3.9083969465648853,
+      "compression_ratio_legacy_vs_pca_wire": 3.8940692441368245,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 8192,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 64,
+      "merged_root_n_samples": 256
+    },
+    {
+      "n_block": 256,
+      "n_features": 128,
+      "n_block_over_d": 2.0,
+      "regime": "tall",
+      "local_rank_requested": null,
+      "local_rank_effective": 128,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 32,
+      "block_elements": 32768,
+      "block_bytes": {
+        "bytes": 262144.0,
+        "KiB": 256.0,
+        "MiB": 0.25,
+        "GiB": 0.000244140625
+      },
+      "summary_elements": 16640,
+      "summary_bytes": {
+        "bytes": 133120.0,
+        "KiB": 130.0,
+        "MiB": 0.126953125,
+        "GiB": 0.0001239776611328125
+      },
+      "legacy_wire_bytes": {
+        "bytes": 262176.0,
+        "KiB": 256.03125,
+        "MiB": 0.250030517578125,
+        "GiB": 0.0002441704273223877
+      },
+      "pca_wire_bytes": {
+        "bytes": 133375.0,
+        "KiB": 130.2490234375,
+        "MiB": 0.1271963119506836,
+        "GiB": 0.00012421514838933945
+      },
+      "compression_ratio_full_rank_vs_data": 1.9692307692307693,
+      "compression_ratio_legacy_vs_pca_wire": 1.9657057169634489,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 16384,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 128,
+      "merged_root_n_samples": 256
+    },
+    {
+      "n_block": 512,
+      "n_features": 128,
+      "n_block_over_d": 4.0,
+      "regime": "tall",
+      "local_rank_requested": 4,
+      "local_rank_effective": 4,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 32,
+      "block_elements": 65536,
+      "block_bytes": {
+        "bytes": 524288.0,
+        "KiB": 512.0,
+        "MiB": 0.5,
+        "GiB": 0.00048828125
+      },
+      "summary_elements": 644,
+      "summary_bytes": {
+        "bytes": 5152.0,
+        "KiB": 5.03125,
+        "MiB": 0.004913330078125,
+        "GiB": 4.798173904418945e-06
+      },
+      "legacy_wire_bytes": {
+        "bytes": 524320.0,
+        "KiB": 512.03125,
+        "MiB": 0.500030517578125,
+        "GiB": 0.0004883110523223877
+      },
+      "pca_wire_bytes": {
+        "bytes": 5407.0,
+        "KiB": 5.2802734375,
+        "MiB": 0.005156517028808594,
+        "GiB": 5.035661160945892e-06
+      },
+      "compression_ratio_full_rank_vs_data": 101.7639751552795,
+      "compression_ratio_legacy_vs_pca_wire": 96.97059367486591,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 512,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 4,
+      "merged_root_n_samples": 512
+    },
+    {
+      "n_block": 512,
+      "n_features": 128,
+      "n_block_over_d": 4.0,
+      "regime": "tall",
+      "local_rank_requested": 16,
+      "local_rank_effective": 16,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 32,
+      "block_elements": 65536,
+      "block_bytes": {
+        "bytes": 524288.0,
+        "KiB": 512.0,
+        "MiB": 0.5,
+        "GiB": 0.00048828125
+      },
+      "summary_elements": 2192,
+      "summary_bytes": {
+        "bytes": 17536.0,
+        "KiB": 17.125,
+        "MiB": 0.0167236328125,
+        "GiB": 1.633167266845703e-05
+      },
+      "legacy_wire_bytes": {
+        "bytes": 524320.0,
+        "KiB": 512.03125,
+        "MiB": 0.500030517578125,
+        "GiB": 0.0004883110523223877
+      },
+      "pca_wire_bytes": {
+        "bytes": 17791.0,
+        "KiB": 17.3740234375,
+        "MiB": 0.016966819763183594,
+        "GiB": 1.6569159924983978e-05
+      },
+      "compression_ratio_full_rank_vs_data": 29.8978102189781,
+      "compression_ratio_legacy_vs_pca_wire": 29.471080883592826,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 2048,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 16,
+      "merged_root_n_samples": 512
+    },
+    {
+      "n_block": 512,
+      "n_features": 128,
+      "n_block_over_d": 4.0,
+      "regime": "tall",
+      "local_rank_requested": 64,
+      "local_rank_effective": 64,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 32,
+      "block_elements": 65536,
+      "block_bytes": {
+        "bytes": 524288.0,
+        "KiB": 512.0,
+        "MiB": 0.5,
+        "GiB": 0.00048828125
+      },
+      "summary_elements": 8384,
+      "summary_bytes": {
+        "bytes": 67072.0,
+        "KiB": 65.5,
+        "MiB": 0.06396484375,
+        "GiB": 6.246566772460938e-05
+      },
+      "legacy_wire_bytes": {
+        "bytes": 524320.0,
+        "KiB": 512.03125,
+        "MiB": 0.500030517578125,
+        "GiB": 0.0004883110523223877
+      },
+      "pca_wire_bytes": {
+        "bytes": 67327.0,
+        "KiB": 65.7490234375,
+        "MiB": 0.0642080307006836,
+        "GiB": 6.270315498113632e-05
+      },
+      "compression_ratio_full_rank_vs_data": 7.816793893129771,
+      "compression_ratio_legacy_vs_pca_wire": 7.787663196043193,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 8192,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 64,
+      "merged_root_n_samples": 512
+    },
+    {
+      "n_block": 512,
+      "n_features": 128,
+      "n_block_over_d": 4.0,
+      "regime": "tall",
+      "local_rank_requested": null,
+      "local_rank_effective": 128,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 32,
+      "block_elements": 65536,
+      "block_bytes": {
+        "bytes": 524288.0,
+        "KiB": 512.0,
+        "MiB": 0.5,
+        "GiB": 0.00048828125
+      },
+      "summary_elements": 16640,
+      "summary_bytes": {
+        "bytes": 133120.0,
+        "KiB": 130.0,
+        "MiB": 0.126953125,
+        "GiB": 0.0001239776611328125
+      },
+      "legacy_wire_bytes": {
+        "bytes": 524320.0,
+        "KiB": 512.03125,
+        "MiB": 0.500030517578125,
+        "GiB": 0.0004883110523223877
+      },
+      "pca_wire_bytes": {
+        "bytes": 133375.0,
+        "KiB": 130.2490234375,
+        "MiB": 0.1271963119506836,
+        "GiB": 0.00012421514838933945
+      },
+      "compression_ratio_full_rank_vs_data": 3.9384615384615387,
+      "compression_ratio_legacy_vs_pca_wire": 3.931171508903468,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 16384,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 128,
+      "merged_root_n_samples": 512
+    },
+    {
+      "n_block": 1024,
+      "n_features": 128,
+      "n_block_over_d": 8.0,
+      "regime": "tall",
+      "local_rank_requested": 4,
+      "local_rank_effective": 4,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 32,
+      "block_elements": 131072,
+      "block_bytes": {
+        "bytes": 1048576.0,
+        "KiB": 1024.0,
+        "MiB": 1.0,
+        "GiB": 0.0009765625
+      },
+      "summary_elements": 644,
+      "summary_bytes": {
+        "bytes": 5152.0,
+        "KiB": 5.03125,
+        "MiB": 0.004913330078125,
+        "GiB": 4.798173904418945e-06
+      },
+      "legacy_wire_bytes": {
+        "bytes": 1048608.0,
+        "KiB": 1024.03125,
+        "MiB": 1.000030517578125,
+        "GiB": 0.0009765923023223877
+      },
+      "pca_wire_bytes": {
+        "bytes": 5407.0,
+        "KiB": 5.2802734375,
+        "MiB": 0.005156517028808594,
+        "GiB": 5.035661160945892e-06
+      },
+      "compression_ratio_full_rank_vs_data": 203.527950310559,
+      "compression_ratio_legacy_vs_pca_wire": 193.9352690956168,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 512,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 4,
+      "merged_root_n_samples": 1024
+    },
+    {
+      "n_block": 1024,
+      "n_features": 128,
+      "n_block_over_d": 8.0,
+      "regime": "tall",
+      "local_rank_requested": 16,
+      "local_rank_effective": 16,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 32,
+      "block_elements": 131072,
+      "block_bytes": {
+        "bytes": 1048576.0,
+        "KiB": 1024.0,
+        "MiB": 1.0,
+        "GiB": 0.0009765625
+      },
+      "summary_elements": 2192,
+      "summary_bytes": {
+        "bytes": 17536.0,
+        "KiB": 17.125,
+        "MiB": 0.0167236328125,
+        "GiB": 1.633167266845703e-05
+      },
+      "legacy_wire_bytes": {
+        "bytes": 1048608.0,
+        "KiB": 1024.03125,
+        "MiB": 1.000030517578125,
+        "GiB": 0.0009765923023223877
+      },
+      "pca_wire_bytes": {
+        "bytes": 17791.0,
+        "KiB": 17.3740234375,
+        "MiB": 0.016966819763183594,
+        "GiB": 1.6569159924983978e-05
+      },
+      "compression_ratio_full_rank_vs_data": 59.7956204379562,
+      "compression_ratio_legacy_vs_pca_wire": 58.9403631049407,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 2048,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 16,
+      "merged_root_n_samples": 1024
+    },
+    {
+      "n_block": 1024,
+      "n_features": 128,
+      "n_block_over_d": 8.0,
+      "regime": "tall",
+      "local_rank_requested": 64,
+      "local_rank_effective": 64,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 32,
+      "block_elements": 131072,
+      "block_bytes": {
+        "bytes": 1048576.0,
+        "KiB": 1024.0,
+        "MiB": 1.0,
+        "GiB": 0.0009765625
+      },
+      "summary_elements": 8384,
+      "summary_bytes": {
+        "bytes": 67072.0,
+        "KiB": 65.5,
+        "MiB": 0.06396484375,
+        "GiB": 6.246566772460938e-05
+      },
+      "legacy_wire_bytes": {
+        "bytes": 1048608.0,
+        "KiB": 1024.03125,
+        "MiB": 1.000030517578125,
+        "GiB": 0.0009765923023223877
+      },
+      "pca_wire_bytes": {
+        "bytes": 67327.0,
+        "KiB": 65.7490234375,
+        "MiB": 0.0642080307006836,
+        "GiB": 6.270315498113632e-05
+      },
+      "compression_ratio_full_rank_vs_data": 15.633587786259541,
+      "compression_ratio_legacy_vs_pca_wire": 15.574851099855927,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 8192,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 64,
+      "merged_root_n_samples": 1024
+    },
+    {
+      "n_block": 1024,
+      "n_features": 128,
+      "n_block_over_d": 8.0,
+      "regime": "tall",
+      "local_rank_requested": null,
+      "local_rank_effective": 128,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 32,
+      "block_elements": 131072,
+      "block_bytes": {
+        "bytes": 1048576.0,
+        "KiB": 1024.0,
+        "MiB": 1.0,
+        "GiB": 0.0009765625
+      },
+      "summary_elements": 16640,
+      "summary_bytes": {
+        "bytes": 133120.0,
+        "KiB": 130.0,
+        "MiB": 0.126953125,
+        "GiB": 0.0001239776611328125
+      },
+      "legacy_wire_bytes": {
+        "bytes": 1048608.0,
+        "KiB": 1024.03125,
+        "MiB": 1.000030517578125,
+        "GiB": 0.0009765923023223877
+      },
+      "pca_wire_bytes": {
+        "bytes": 133375.0,
+        "KiB": 130.2490234375,
+        "MiB": 0.1271963119506836,
+        "GiB": 0.00012421514838933945
+      },
+      "compression_ratio_full_rank_vs_data": 7.876923076923077,
+      "compression_ratio_legacy_vs_pca_wire": 7.862103092783505,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 16384,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 128,
+      "merged_root_n_samples": 1024
+    },
+    {
+      "n_block": 128,
+      "n_features": 512,
+      "n_block_over_d": 0.25,
+      "regime": "flat",
+      "local_rank_requested": 4,
+      "local_rank_effective": 4,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 128,
+      "block_elements": 65536,
+      "block_bytes": {
+        "bytes": 524288.0,
+        "KiB": 512.0,
+        "MiB": 0.5,
+        "GiB": 0.00048828125
+      },
+      "summary_elements": 2564,
+      "summary_bytes": {
+        "bytes": 20512.0,
+        "KiB": 20.03125,
+        "MiB": 0.019561767578125,
+        "GiB": 1.9103288650512695e-05
+      },
+      "legacy_wire_bytes": {
+        "bytes": 524320.0,
+        "KiB": 512.03125,
+        "MiB": 0.500030517578125,
+        "GiB": 0.0004883110523223877
+      },
+      "pca_wire_bytes": {
+        "bytes": 20768.0,
+        "KiB": 20.28125,
+        "MiB": 0.019805908203125,
+        "GiB": 1.9341707229614258e-05
+      },
+      "compression_ratio_full_rank_vs_data": 25.5600624024961,
+      "compression_ratio_legacy_vs_pca_wire": 25.24653312788906,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 2048,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 4,
+      "merged_root_n_samples": 128
+    },
+    {
+      "n_block": 128,
+      "n_features": 512,
+      "n_block_over_d": 0.25,
+      "regime": "flat",
+      "local_rank_requested": 16,
+      "local_rank_effective": 16,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 128,
+      "block_elements": 65536,
+      "block_bytes": {
+        "bytes": 524288.0,
+        "KiB": 512.0,
+        "MiB": 0.5,
+        "GiB": 0.00048828125
+      },
+      "summary_elements": 8720,
+      "summary_bytes": {
+        "bytes": 69760.0,
+        "KiB": 68.125,
+        "MiB": 0.0665283203125,
+        "GiB": 6.496906280517578e-05
+      },
+      "legacy_wire_bytes": {
+        "bytes": 524320.0,
+        "KiB": 512.03125,
+        "MiB": 0.500030517578125,
+        "GiB": 0.0004883110523223877
+      },
+      "pca_wire_bytes": {
+        "bytes": 70016.0,
+        "KiB": 68.375,
+        "MiB": 0.0667724609375,
+        "GiB": 6.520748138427734e-05
+      },
+      "compression_ratio_full_rank_vs_data": 7.51559633027523,
+      "compression_ratio_legacy_vs_pca_wire": 7.488574040219379,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 8192,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 16,
+      "merged_root_n_samples": 128
+    },
+    {
+      "n_block": 128,
+      "n_features": 512,
+      "n_block_over_d": 0.25,
+      "regime": "flat",
+      "local_rank_requested": 64,
+      "local_rank_effective": 64,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 128,
+      "block_elements": 65536,
+      "block_bytes": {
+        "bytes": 524288.0,
+        "KiB": 512.0,
+        "MiB": 0.5,
+        "GiB": 0.00048828125
+      },
+      "summary_elements": 33344,
+      "summary_bytes": {
+        "bytes": 266752.0,
+        "KiB": 260.5,
+        "MiB": 0.25439453125,
+        "GiB": 0.0002484321594238281
+      },
+      "legacy_wire_bytes": {
+        "bytes": 524320.0,
+        "KiB": 512.03125,
+        "MiB": 0.500030517578125,
+        "GiB": 0.0004883110523223877
+      },
+      "pca_wire_bytes": {
+        "bytes": 267008.0,
+        "KiB": 260.75,
+        "MiB": 0.254638671875,
+        "GiB": 0.0002486705780029297
+      },
+      "compression_ratio_full_rank_vs_data": 1.965451055662188,
+      "compression_ratio_legacy_vs_pca_wire": 1.963686481303931,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 32768,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 64,
+      "merged_root_n_samples": 128
+    },
+    {
+      "n_block": 128,
+      "n_features": 512,
+      "n_block_over_d": 0.25,
+      "regime": "flat",
+      "local_rank_requested": null,
+      "local_rank_effective": 128,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 128,
+      "block_elements": 65536,
+      "block_bytes": {
+        "bytes": 524288.0,
+        "KiB": 512.0,
+        "MiB": 0.5,
+        "GiB": 0.00048828125
+      },
+      "summary_elements": 66176,
+      "summary_bytes": {
+        "bytes": 529408.0,
+        "KiB": 517.0,
+        "MiB": 0.5048828125,
+        "GiB": 0.0004930496215820312
+      },
+      "legacy_wire_bytes": {
+        "bytes": 524320.0,
+        "KiB": 512.03125,
+        "MiB": 0.500030517578125,
+        "GiB": 0.0004883110523223877
+      },
+      "pca_wire_bytes": {
+        "bytes": 529664.0,
+        "KiB": 517.25,
+        "MiB": 0.505126953125,
+        "GiB": 0.0004932880401611328
+      },
+      "compression_ratio_full_rank_vs_data": 0.9903288201160542,
+      "compression_ratio_legacy_vs_pca_wire": 0.9899105848235863,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 65536,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": true,
+        "note": "expected whenever n_block <= d at full local rank: the summary holds min(n_block,d)*d elements against n_block*d for the data, so it cannot be smaller. This is the design's boundary and is why local_rank < d exists."
+      },
+      "merged_root_rank": 128,
+      "merged_root_n_samples": 128
+    },
+    {
+      "n_block": 256,
+      "n_features": 512,
+      "n_block_over_d": 0.5,
+      "regime": "flat",
+      "local_rank_requested": 4,
+      "local_rank_effective": 4,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 128,
+      "block_elements": 131072,
+      "block_bytes": {
+        "bytes": 1048576.0,
+        "KiB": 1024.0,
+        "MiB": 1.0,
+        "GiB": 0.0009765625
+      },
+      "summary_elements": 2564,
+      "summary_bytes": {
+        "bytes": 20512.0,
+        "KiB": 20.03125,
+        "MiB": 0.019561767578125,
+        "GiB": 1.9103288650512695e-05
+      },
+      "legacy_wire_bytes": {
+        "bytes": 1048608.0,
+        "KiB": 1024.03125,
+        "MiB": 1.000030517578125,
+        "GiB": 0.0009765923023223877
+      },
+      "pca_wire_bytes": {
+        "bytes": 20769.0,
+        "KiB": 20.2822265625,
+        "MiB": 0.019806861877441406,
+        "GiB": 1.9342638552188873e-05
+      },
+      "compression_ratio_full_rank_vs_data": 51.1201248049922,
+      "compression_ratio_legacy_vs_pca_wire": 50.48909432327026,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 2048,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 4,
+      "merged_root_n_samples": 256
+    },
+    {
+      "n_block": 256,
+      "n_features": 512,
+      "n_block_over_d": 0.5,
+      "regime": "flat",
+      "local_rank_requested": 16,
+      "local_rank_effective": 16,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 128,
+      "block_elements": 131072,
+      "block_bytes": {
+        "bytes": 1048576.0,
+        "KiB": 1024.0,
+        "MiB": 1.0,
+        "GiB": 0.0009765625
+      },
+      "summary_elements": 8720,
+      "summary_bytes": {
+        "bytes": 69760.0,
+        "KiB": 68.125,
+        "MiB": 0.0665283203125,
+        "GiB": 6.496906280517578e-05
+      },
+      "legacy_wire_bytes": {
+        "bytes": 1048608.0,
+        "KiB": 1024.03125,
+        "MiB": 1.000030517578125,
+        "GiB": 0.0009765923023223877
+      },
+      "pca_wire_bytes": {
+        "bytes": 70017.0,
+        "KiB": 68.3759765625,
+        "MiB": 0.0667734146118164,
+        "GiB": 6.520841270685196e-05
+      },
+      "compression_ratio_full_rank_vs_data": 15.03119266055046,
+      "compression_ratio_legacy_vs_pca_wire": 14.976477141265693,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 8192,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 16,
+      "merged_root_n_samples": 256
+    },
+    {
+      "n_block": 256,
+      "n_features": 512,
+      "n_block_over_d": 0.5,
+      "regime": "flat",
+      "local_rank_requested": 64,
+      "local_rank_effective": 64,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 128,
+      "block_elements": 131072,
+      "block_bytes": {
+        "bytes": 1048576.0,
+        "KiB": 1024.0,
+        "MiB": 1.0,
+        "GiB": 0.0009765625
+      },
+      "summary_elements": 33344,
+      "summary_bytes": {
+        "bytes": 266752.0,
+        "KiB": 260.5,
+        "MiB": 0.25439453125,
+        "GiB": 0.0002484321594238281
+      },
+      "legacy_wire_bytes": {
+        "bytes": 1048608.0,
+        "KiB": 1024.03125,
+        "MiB": 1.000030517578125,
+        "GiB": 0.0009765923023223877
+      },
+      "pca_wire_bytes": {
+        "bytes": 267009.0,
+        "KiB": 260.7509765625,
+        "MiB": 0.2546396255493164,
+        "GiB": 0.0002486715093255043
+      },
+      "compression_ratio_full_rank_vs_data": 3.930902111324376,
+      "compression_ratio_legacy_vs_pca_wire": 3.9272384076941225,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 32768,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 64,
+      "merged_root_n_samples": 256
+    },
+    {
+      "n_block": 256,
+      "n_features": 512,
+      "n_block_over_d": 0.5,
+      "regime": "flat",
+      "local_rank_requested": null,
+      "local_rank_effective": 256,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 128,
+      "block_elements": 131072,
+      "block_bytes": {
+        "bytes": 1048576.0,
+        "KiB": 1024.0,
+        "MiB": 1.0,
+        "GiB": 0.0009765625
+      },
+      "summary_elements": 131840,
+      "summary_bytes": {
+        "bytes": 1054720.0,
+        "KiB": 1030.0,
+        "MiB": 1.005859375,
+        "GiB": 0.0009822845458984375
+      },
+      "legacy_wire_bytes": {
+        "bytes": 1048608.0,
+        "KiB": 1024.03125,
+        "MiB": 1.000030517578125,
+        "GiB": 0.0009765923023223877
+      },
+      "pca_wire_bytes": {
+        "bytes": 1054979.0,
+        "KiB": 1030.2529296875,
+        "MiB": 1.0061063766479492,
+        "GiB": 0.000982525758445263
+      },
+      "compression_ratio_full_rank_vs_data": 0.9941747572815534,
+      "compression_ratio_legacy_vs_pca_wire": 0.9939610172335184,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 131072,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": true,
+        "note": "expected whenever n_block <= d at full local rank: the summary holds min(n_block,d)*d elements against n_block*d for the data, so it cannot be smaller. This is the design's boundary and is why local_rank < d exists."
+      },
+      "merged_root_rank": 256,
+      "merged_root_n_samples": 256
+    },
+    {
+      "n_block": 512,
+      "n_features": 512,
+      "n_block_over_d": 1.0,
+      "regime": "square",
+      "local_rank_requested": 4,
+      "local_rank_effective": 4,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 128,
+      "block_elements": 262144,
+      "block_bytes": {
+        "bytes": 2097152.0,
+        "KiB": 2048.0,
+        "MiB": 2.0,
+        "GiB": 0.001953125
+      },
+      "summary_elements": 2564,
+      "summary_bytes": {
+        "bytes": 20512.0,
+        "KiB": 20.03125,
+        "MiB": 0.019561767578125,
+        "GiB": 1.9103288650512695e-05
+      },
+      "legacy_wire_bytes": {
+        "bytes": 2097184.0,
+        "KiB": 2048.03125,
+        "MiB": 2.000030517578125,
+        "GiB": 0.0019531548023223877
+      },
+      "pca_wire_bytes": {
+        "bytes": 20769.0,
+        "KiB": 20.2822265625,
+        "MiB": 0.019806861877441406,
+        "GiB": 1.9342638552188873e-05
+      },
+      "compression_ratio_full_rank_vs_data": 102.2402496099844,
+      "compression_ratio_legacy_vs_pca_wire": 100.97664788868025,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 2048,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 4,
+      "merged_root_n_samples": 512
+    },
+    {
+      "n_block": 512,
+      "n_features": 512,
+      "n_block_over_d": 1.0,
+      "regime": "square",
+      "local_rank_requested": 16,
+      "local_rank_effective": 16,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 128,
+      "block_elements": 262144,
+      "block_bytes": {
+        "bytes": 2097152.0,
+        "KiB": 2048.0,
+        "MiB": 2.0,
+        "GiB": 0.001953125
+      },
+      "summary_elements": 8720,
+      "summary_bytes": {
+        "bytes": 69760.0,
+        "KiB": 68.125,
+        "MiB": 0.0665283203125,
+        "GiB": 6.496906280517578e-05
+      },
+      "legacy_wire_bytes": {
+        "bytes": 2097184.0,
+        "KiB": 2048.03125,
+        "MiB": 2.000030517578125,
+        "GiB": 0.0019531548023223877
+      },
+      "pca_wire_bytes": {
+        "bytes": 70017.0,
+        "KiB": 68.3759765625,
+        "MiB": 0.0667734146118164,
+        "GiB": 6.520841270685196e-05
+      },
+      "compression_ratio_full_rank_vs_data": 30.06238532110092,
+      "compression_ratio_legacy_vs_pca_wire": 29.952497250667694,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 8192,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 16,
+      "merged_root_n_samples": 512
+    },
+    {
+      "n_block": 512,
+      "n_features": 512,
+      "n_block_over_d": 1.0,
+      "regime": "square",
+      "local_rank_requested": 64,
+      "local_rank_effective": 64,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 128,
+      "block_elements": 262144,
+      "block_bytes": {
+        "bytes": 2097152.0,
+        "KiB": 2048.0,
+        "MiB": 2.0,
+        "GiB": 0.001953125
+      },
+      "summary_elements": 33344,
+      "summary_bytes": {
+        "bytes": 266752.0,
+        "KiB": 260.5,
+        "MiB": 0.25439453125,
+        "GiB": 0.0002484321594238281
+      },
+      "legacy_wire_bytes": {
+        "bytes": 2097184.0,
+        "KiB": 2048.03125,
+        "MiB": 2.000030517578125,
+        "GiB": 0.0019531548023223877
+      },
+      "pca_wire_bytes": {
+        "bytes": 267009.0,
+        "KiB": 260.7509765625,
+        "MiB": 0.2546396255493164,
+        "GiB": 0.0002486715093255043
+      },
+      "compression_ratio_full_rank_vs_data": 7.861804222648752,
+      "compression_ratio_legacy_vs_pca_wire": 7.854356969240738,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 32768,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 64,
+      "merged_root_n_samples": 512
+    },
+    {
+      "n_block": 512,
+      "n_features": 512,
+      "n_block_over_d": 1.0,
+      "regime": "square",
+      "local_rank_requested": null,
+      "local_rank_effective": 512,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 128,
+      "block_elements": 262144,
+      "block_bytes": {
+        "bytes": 2097152.0,
+        "KiB": 2048.0,
+        "MiB": 2.0,
+        "GiB": 0.001953125
+      },
+      "summary_elements": 263168,
+      "summary_bytes": {
+        "bytes": 2105344.0,
+        "KiB": 2056.0,
+        "MiB": 2.0078125,
+        "GiB": 0.00196075439453125
+      },
+      "legacy_wire_bytes": {
+        "bytes": 2097184.0,
+        "KiB": 2048.03125,
+        "MiB": 2.000030517578125,
+        "GiB": 0.0019531548023223877
+      },
+      "pca_wire_bytes": {
+        "bytes": 2105603.0,
+        "KiB": 2056.2529296875,
+        "MiB": 2.008059501647949,
+        "GiB": 0.0019609956070780754
+      },
+      "compression_ratio_full_rank_vs_data": 0.9961089494163424,
+      "compression_ratio_legacy_vs_pca_wire": 0.9960016204384208,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 262144,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": true,
+        "note": "expected whenever n_block <= d at full local rank: the summary holds min(n_block,d)*d elements against n_block*d for the data, so it cannot be smaller. This is the design's boundary and is why local_rank < d exists."
+      },
+      "merged_root_rank": 512,
+      "merged_root_n_samples": 512
+    },
+    {
+      "n_block": 1024,
+      "n_features": 512,
+      "n_block_over_d": 2.0,
+      "regime": "tall",
+      "local_rank_requested": 4,
+      "local_rank_effective": 4,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 128,
+      "block_elements": 524288,
+      "block_bytes": {
+        "bytes": 4194304.0,
+        "KiB": 4096.0,
+        "MiB": 4.0,
+        "GiB": 0.00390625
+      },
+      "summary_elements": 2564,
+      "summary_bytes": {
+        "bytes": 20512.0,
+        "KiB": 20.03125,
+        "MiB": 0.019561767578125,
+        "GiB": 1.9103288650512695e-05
+      },
+      "legacy_wire_bytes": {
+        "bytes": 4194336.0,
+        "KiB": 4096.03125,
+        "MiB": 4.000030517578125,
+        "GiB": 0.003906279802322388
+      },
+      "pca_wire_bytes": {
+        "bytes": 20769.0,
+        "KiB": 20.2822265625,
+        "MiB": 0.019806861877441406,
+        "GiB": 1.9342638552188873e-05
+      },
+      "compression_ratio_full_rank_vs_data": 204.4804992199688,
+      "compression_ratio_legacy_vs_pca_wire": 201.9517550195002,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 2048,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 4,
+      "merged_root_n_samples": 1024
+    },
+    {
+      "n_block": 1024,
+      "n_features": 512,
+      "n_block_over_d": 2.0,
+      "regime": "tall",
+      "local_rank_requested": 16,
+      "local_rank_effective": 16,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 128,
+      "block_elements": 524288,
+      "block_bytes": {
+        "bytes": 4194304.0,
+        "KiB": 4096.0,
+        "MiB": 4.0,
+        "GiB": 0.00390625
+      },
+      "summary_elements": 8720,
+      "summary_bytes": {
+        "bytes": 69760.0,
+        "KiB": 68.125,
+        "MiB": 0.0665283203125,
+        "GiB": 6.496906280517578e-05
+      },
+      "legacy_wire_bytes": {
+        "bytes": 4194336.0,
+        "KiB": 4096.03125,
+        "MiB": 4.000030517578125,
+        "GiB": 0.003906279802322388
+      },
+      "pca_wire_bytes": {
+        "bytes": 70017.0,
+        "KiB": 68.3759765625,
+        "MiB": 0.0667734146118164,
+        "GiB": 6.520841270685196e-05
+      },
+      "compression_ratio_full_rank_vs_data": 60.12477064220184,
+      "compression_ratio_legacy_vs_pca_wire": 59.9045374694717,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 8192,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 16,
+      "merged_root_n_samples": 1024
+    },
+    {
+      "n_block": 1024,
+      "n_features": 512,
+      "n_block_over_d": 2.0,
+      "regime": "tall",
+      "local_rank_requested": 64,
+      "local_rank_effective": 64,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 128,
+      "block_elements": 524288,
+      "block_bytes": {
+        "bytes": 4194304.0,
+        "KiB": 4096.0,
+        "MiB": 4.0,
+        "GiB": 0.00390625
+      },
+      "summary_elements": 33344,
+      "summary_bytes": {
+        "bytes": 266752.0,
+        "KiB": 260.5,
+        "MiB": 0.25439453125,
+        "GiB": 0.0002484321594238281
+      },
+      "legacy_wire_bytes": {
+        "bytes": 4194336.0,
+        "KiB": 4096.03125,
+        "MiB": 4.000030517578125,
+        "GiB": 0.003906279802322388
+      },
+      "pca_wire_bytes": {
+        "bytes": 267009.0,
+        "KiB": 260.7509765625,
+        "MiB": 0.2546396255493164,
+        "GiB": 0.0002486715093255043
+      },
+      "compression_ratio_full_rank_vs_data": 15.723608445297504,
+      "compression_ratio_legacy_vs_pca_wire": 15.708594092333966,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 32768,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 64,
+      "merged_root_n_samples": 1024
+    },
+    {
+      "n_block": 1024,
+      "n_features": 512,
+      "n_block_over_d": 2.0,
+      "regime": "tall",
+      "local_rank_requested": null,
+      "local_rank_effective": 512,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 128,
+      "block_elements": 524288,
+      "block_bytes": {
+        "bytes": 4194304.0,
+        "KiB": 4096.0,
+        "MiB": 4.0,
+        "GiB": 0.00390625
+      },
+      "summary_elements": 263168,
+      "summary_bytes": {
+        "bytes": 2105344.0,
+        "KiB": 2056.0,
+        "MiB": 2.0078125,
+        "GiB": 0.00196075439453125
+      },
+      "legacy_wire_bytes": {
+        "bytes": 4194336.0,
+        "KiB": 4096.03125,
+        "MiB": 4.000030517578125,
+        "GiB": 0.003906279802322388
+      },
+      "pca_wire_bytes": {
+        "bytes": 2105603.0,
+        "KiB": 2056.2529296875,
+        "MiB": 2.008059501647949,
+        "GiB": 0.0019609956070780754
+      },
+      "compression_ratio_full_rank_vs_data": 1.9922178988326849,
+      "compression_ratio_legacy_vs_pca_wire": 1.9919880433301054,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 262144,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 512,
+      "merged_root_n_samples": 1024
+    },
+    {
+      "n_block": 2048,
+      "n_features": 512,
+      "n_block_over_d": 4.0,
+      "regime": "tall",
+      "local_rank_requested": 4,
+      "local_rank_effective": 4,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 128,
+      "block_elements": 1048576,
+      "block_bytes": {
+        "bytes": 8388608.0,
+        "KiB": 8192.0,
+        "MiB": 8.0,
+        "GiB": 0.0078125
+      },
+      "summary_elements": 2564,
+      "summary_bytes": {
+        "bytes": 20512.0,
+        "KiB": 20.03125,
+        "MiB": 0.019561767578125,
+        "GiB": 1.9103288650512695e-05
+      },
+      "legacy_wire_bytes": {
+        "bytes": 8388640.0,
+        "KiB": 8192.03125,
+        "MiB": 8.000030517578125,
+        "GiB": 0.007812529802322388
+      },
+      "pca_wire_bytes": {
+        "bytes": 20769.0,
+        "KiB": 20.2822265625,
+        "MiB": 0.019806861877441406,
+        "GiB": 1.9342638552188873e-05
+      },
+      "compression_ratio_full_rank_vs_data": 408.9609984399376,
+      "compression_ratio_legacy_vs_pca_wire": 403.90196928114017,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 2048,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 4,
+      "merged_root_n_samples": 2048
+    },
+    {
+      "n_block": 2048,
+      "n_features": 512,
+      "n_block_over_d": 4.0,
+      "regime": "tall",
+      "local_rank_requested": 16,
+      "local_rank_effective": 16,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 128,
+      "block_elements": 1048576,
+      "block_bytes": {
+        "bytes": 8388608.0,
+        "KiB": 8192.0,
+        "MiB": 8.0,
+        "GiB": 0.0078125
+      },
+      "summary_elements": 8720,
+      "summary_bytes": {
+        "bytes": 69760.0,
+        "KiB": 68.125,
+        "MiB": 0.0665283203125,
+        "GiB": 6.496906280517578e-05
+      },
+      "legacy_wire_bytes": {
+        "bytes": 8388640.0,
+        "KiB": 8192.03125,
+        "MiB": 8.000030517578125,
+        "GiB": 0.007812529802322388
+      },
+      "pca_wire_bytes": {
+        "bytes": 70017.0,
+        "KiB": 68.3759765625,
+        "MiB": 0.0667734146118164,
+        "GiB": 6.520841270685196e-05
+      },
+      "compression_ratio_full_rank_vs_data": 120.24954128440368,
+      "compression_ratio_legacy_vs_pca_wire": 119.80861790707971,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 8192,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 16,
+      "merged_root_n_samples": 2048
+    },
+    {
+      "n_block": 2048,
+      "n_features": 512,
+      "n_block_over_d": 4.0,
+      "regime": "tall",
+      "local_rank_requested": 64,
+      "local_rank_effective": 64,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 128,
+      "block_elements": 1048576,
+      "block_bytes": {
+        "bytes": 8388608.0,
+        "KiB": 8192.0,
+        "MiB": 8.0,
+        "GiB": 0.0078125
+      },
+      "summary_elements": 33344,
+      "summary_bytes": {
+        "bytes": 266752.0,
+        "KiB": 260.5,
+        "MiB": 0.25439453125,
+        "GiB": 0.0002484321594238281
+      },
+      "legacy_wire_bytes": {
+        "bytes": 8388640.0,
+        "KiB": 8192.03125,
+        "MiB": 8.000030517578125,
+        "GiB": 0.007812529802322388
+      },
+      "pca_wire_bytes": {
+        "bytes": 267009.0,
+        "KiB": 260.7509765625,
+        "MiB": 0.2546396255493164,
+        "GiB": 0.0002486715093255043
+      },
+      "compression_ratio_full_rank_vs_data": 31.44721689059501,
+      "compression_ratio_legacy_vs_pca_wire": 31.417068338520423,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 32768,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 64,
+      "merged_root_n_samples": 2048
+    },
+    {
+      "n_block": 2048,
+      "n_features": 512,
+      "n_block_over_d": 4.0,
+      "regime": "tall",
+      "local_rank_requested": null,
+      "local_rank_effective": 512,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 128,
+      "block_elements": 1048576,
+      "block_bytes": {
+        "bytes": 8388608.0,
+        "KiB": 8192.0,
+        "MiB": 8.0,
+        "GiB": 0.0078125
+      },
+      "summary_elements": 263168,
+      "summary_bytes": {
+        "bytes": 2105344.0,
+        "KiB": 2056.0,
+        "MiB": 2.0078125,
+        "GiB": 0.00196075439453125
+      },
+      "legacy_wire_bytes": {
+        "bytes": 8388640.0,
+        "KiB": 8192.03125,
+        "MiB": 8.000030517578125,
+        "GiB": 0.007812529802322388
+      },
+      "pca_wire_bytes": {
+        "bytes": 2105603.0,
+        "KiB": 2056.2529296875,
+        "MiB": 2.008059501647949,
+        "GiB": 0.0019609956070780754
+      },
+      "compression_ratio_full_rank_vs_data": 3.9844357976653697,
+      "compression_ratio_legacy_vs_pca_wire": 3.983960889113475,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 262144,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 512,
+      "merged_root_n_samples": 2048
+    },
+    {
+      "n_block": 4096,
+      "n_features": 512,
+      "n_block_over_d": 8.0,
+      "regime": "tall",
+      "local_rank_requested": 4,
+      "local_rank_effective": 4,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 128,
+      "block_elements": 2097152,
+      "block_bytes": {
+        "bytes": 16777216.0,
+        "KiB": 16384.0,
+        "MiB": 16.0,
+        "GiB": 0.015625
+      },
+      "summary_elements": 2564,
+      "summary_bytes": {
+        "bytes": 20512.0,
+        "KiB": 20.03125,
+        "MiB": 0.019561767578125,
+        "GiB": 1.9103288650512695e-05
+      },
+      "legacy_wire_bytes": {
+        "bytes": 16777248.0,
+        "KiB": 16384.03125,
+        "MiB": 16.000030517578125,
+        "GiB": 0.015625029802322388
+      },
+      "pca_wire_bytes": {
+        "bytes": 20769.0,
+        "KiB": 20.2822265625,
+        "MiB": 0.019806861877441406,
+        "GiB": 1.9342638552188873e-05
+      },
+      "compression_ratio_full_rank_vs_data": 817.9219968798752,
+      "compression_ratio_legacy_vs_pca_wire": 807.80239780442,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 2048,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 4,
+      "merged_root_n_samples": 4096
+    },
+    {
+      "n_block": 4096,
+      "n_features": 512,
+      "n_block_over_d": 8.0,
+      "regime": "tall",
+      "local_rank_requested": 16,
+      "local_rank_effective": 16,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 128,
+      "block_elements": 2097152,
+      "block_bytes": {
+        "bytes": 16777216.0,
+        "KiB": 16384.0,
+        "MiB": 16.0,
+        "GiB": 0.015625
+      },
+      "summary_elements": 8720,
+      "summary_bytes": {
+        "bytes": 69760.0,
+        "KiB": 68.125,
+        "MiB": 0.0665283203125,
+        "GiB": 6.496906280517578e-05
+      },
+      "legacy_wire_bytes": {
+        "bytes": 16777248.0,
+        "KiB": 16384.03125,
+        "MiB": 16.000030517578125,
+        "GiB": 0.015625029802322388
+      },
+      "pca_wire_bytes": {
+        "bytes": 70017.0,
+        "KiB": 68.3759765625,
+        "MiB": 0.0667734146118164,
+        "GiB": 6.520841270685196e-05
+      },
+      "compression_ratio_full_rank_vs_data": 240.49908256880735,
+      "compression_ratio_legacy_vs_pca_wire": 239.61677878229574,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 8192,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 16,
+      "merged_root_n_samples": 4096
+    },
+    {
+      "n_block": 4096,
+      "n_features": 512,
+      "n_block_over_d": 8.0,
+      "regime": "tall",
+      "local_rank_requested": 64,
+      "local_rank_effective": 64,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 128,
+      "block_elements": 2097152,
+      "block_bytes": {
+        "bytes": 16777216.0,
+        "KiB": 16384.0,
+        "MiB": 16.0,
+        "GiB": 0.015625
+      },
+      "summary_elements": 33344,
+      "summary_bytes": {
+        "bytes": 266752.0,
+        "KiB": 260.5,
+        "MiB": 0.25439453125,
+        "GiB": 0.0002484321594238281
+      },
+      "legacy_wire_bytes": {
+        "bytes": 16777248.0,
+        "KiB": 16384.03125,
+        "MiB": 16.000030517578125,
+        "GiB": 0.015625029802322388
+      },
+      "pca_wire_bytes": {
+        "bytes": 267009.0,
+        "KiB": 260.7509765625,
+        "MiB": 0.2546396255493164,
+        "GiB": 0.0002486715093255043
+      },
+      "compression_ratio_full_rank_vs_data": 62.89443378119002,
+      "compression_ratio_legacy_vs_pca_wire": 62.83401683089334,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 32768,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 64,
+      "merged_root_n_samples": 4096
+    },
+    {
+      "n_block": 4096,
+      "n_features": 512,
+      "n_block_over_d": 8.0,
+      "regime": "tall",
+      "local_rank_requested": null,
+      "local_rank_effective": 512,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 128,
+      "block_elements": 2097152,
+      "block_bytes": {
+        "bytes": 16777216.0,
+        "KiB": 16384.0,
+        "MiB": 16.0,
+        "GiB": 0.015625
+      },
+      "summary_elements": 263168,
+      "summary_bytes": {
+        "bytes": 2105344.0,
+        "KiB": 2056.0,
+        "MiB": 2.0078125,
+        "GiB": 0.00196075439453125
+      },
+      "legacy_wire_bytes": {
+        "bytes": 16777248.0,
+        "KiB": 16384.03125,
+        "MiB": 16.000030517578125,
+        "GiB": 0.015625029802322388
+      },
+      "pca_wire_bytes": {
+        "bytes": 2105603.0,
+        "KiB": 2056.2529296875,
+        "MiB": 2.008059501647949,
+        "GiB": 0.0019609956070780754
+      },
+      "compression_ratio_full_rank_vs_data": 7.968871595330739,
+      "compression_ratio_legacy_vs_pca_wire": 7.967906580680213,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 262144,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 512,
+      "merged_root_n_samples": 4096
+    }
+  ],
+  "skipped": []
+}

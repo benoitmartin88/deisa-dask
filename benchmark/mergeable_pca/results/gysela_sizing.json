@@ -1,0 +1,3137 @@
+{
+  "provenance": {
+    "script": "gysela_sizing",
+    "description": "Sizing of the two candidate PCA flattenings for a gyrokinetic distribution indexed (Species, Tor1, Tor2, Tor3, Vpar, Mu), swept over mesh shape and RANK COUNT. Layout A (velocity-space) compresses at every rank count measured; Layout B (spatial-box) does not, and degrades as ranks are added.",
+    "generated_utc": "2026-10-04T07:45:37.726337+00:00",
+    "seed": 20261004,
+    "machine": {
+      "hostname": "5627397aad86",
+      "platform": "Linux-6.1.0-47-amd64-x86_64-with-glibc2.41",
+      "processor": "unknown",
+      "machine": "x86_64",
+      "python": "3.13.5",
+      "cpu_count_logical": 40,
+      "cpu_count_physical": 20,
+      "total_memory_bytes": 135048007680,
+      "numpy_blas": "scipy-openblas",
+      "numpy_lapack": "scipy-openblas",
+      "thread_env": {
+        "OMP_NUM_THREADS": null,
+        "OPENBLAS_NUM_THREADS": null,
+        "MKL_NUM_THREADS": null,
+        "NUMEXPR_NUM_THREADS": null,
+        "VECLIB_MAXIMUM_THREADS": null
+      }
+    },
+    "timing_policy": {
+      "clock": "time.perf_counter",
+      "warmup_rounds": 1,
+      "timed_repeats": 5,
+      "statistic": "median",
+      "dispersion": "min/max/iqr/stddev reported alongside the median",
+      "note": "one warmup round is discarded before timing so BLAS thread pools and page faults are not charged to the measurement; the median of the timed repeats is the headline and the spread is reported"
+    },
+    "versions": {
+      "numpy": "2.5.1",
+      "dask": "2026.7.1",
+      "distributed": "2026.7.1",
+      "deisa-dask": "0.6.3",
+      "scipy": "1.18.1",
+      "scikit-learn": "1.9.1",
+      "dask-ml": "2025.1.0",
+      "psutil": "7.2.2"
+    },
+    "deisa_dask_commit": "UNAVAILABLE (git rev-parse failed)",
+    "gysela_sources": {
+      "gyselalibxx": {
+        "repository": "https://github.com/gyselax/gyselalibxx",
+        "branch": "devel",
+        "commit": "b9aad37bc0d174ce37e95021573d9b846251d86a",
+        "role": "MPILayout distribution semantics (src/mpi_parallelisation/mpilayout.hpp)"
+      },
+      "gysela-mini-app_io": {
+        "repository": "https://github.com/gyselax/gysela-mini-app_io",
+        "branch": "(detached)",
+        "commit": "f39e2a57456e82aabefed140ccd97bd06453f747",
+        "role": "field and MPI layout types (src/C++/geometry.hpp)"
+      }
+    },
+    "disclaimer": "The gysela mesh extents used by the sizing experiments are SYNTHETIC parameter points chosen to span a range of shapes in the same family as the application's index ranges. They are NOT read from a production input file and no gysela build was run on this machine; the arrays are simulated in numpy from the TYPE and LAYOUT semantics of the pinned C++ sources.",
+    "inputs": {
+      "meshes_tor1_tor2_tor3_vpar_mu": [
+        [
+          128,
+          32,
+          16,
+          64,
+          8
+        ],
+        [
+          256,
+          64,
+          32,
+          128,
+          8
+        ],
+        [
+          512,
+          128,
+          64,
+          128,
+          8
+        ]
+      ],
+      "rank_counts": [
+        4,
+        8,
+        16,
+        32,
+        64,
+        128
+      ],
+      "truncated_local_rank": 32,
+      "bytes_per_element": 8
+    },
+    "layout_semantics_from_source": {
+      "field_and_layouts": "gysela-mini-app_io @ f39e2a5, src/C++/geometry.hpp",
+      "distribution_rule": "gyselalibxx @ b9aad37c, src/mpi_parallelisation/mpilayout.hpp: a requested dimension takes gcd(remaining_ranks, extent) ranks, local extent is extent/ranks_along, and the remaining ranks recurse on the lower dimensions -- distribute in order, maximally, leave a dimension local once ranks run out"
+    },
+    "not_claimed": "the mesh extents are SYNTHETIC parameter points in the same family as the application's index ranges, not production configurations read from an input file. No gysela build was run on this machine; only the TYPE and LAYOUT semantics are taken from the pinned C++ sources, and the arrays are sized arithmetically. The superseded Fortran GYSELA decomposition is not described here."
+  },
+  "findings": {
+    "layout_a_velocity_space": {
+      "full_rank_compress_rate": 0.9444444444444444,
+      "full_rank_ratio": {
+        "n": 18,
+        "min": 0.9961089494163424,
+        "max": 1022.0038986354775
+      },
+      "d_independent_of_rank_count": true,
+      "d_values_observed": [
+        512,
+        1024
+      ],
+      "claim": "d = Nvpar*Nmu is fixed by the physics and independent of the rank count, so a full-rank summary compresses at every rank count measured and the merge can be exact"
+    },
+    "layout_b_spatial_box": {
+      "full_rank_compress_rate": 0.0,
+      "full_rank_ratio": {
+        "n": 18,
+        "min": 0.015624523177393268,
+        "max": 0.9961089494163424
+      },
+      "truncated_compress_rate": 0.4444444444444444,
+      "truncated_ratio": {
+        "n": 18,
+        "min": 0.24241684620061424,
+        "max": 7.757568415428924
+      },
+      "d_grows_as_ranks_decrease": true,
+      "d_values_observed": [
+        512,
+        1024,
+        2048,
+        4096,
+        8192,
+        16384,
+        32768,
+        65536,
+        131072,
+        262144,
+        524288,
+        1048576
+      ],
+      "claim": "d is the LOCAL spatial box and grows as the rank count drops, so a full-rank summary is not smaller than its input; truncating local_rank restores compression at the cost of accuracy"
+    },
+    "inversion": [
+      {
+        "mesh": [
+          128,
+          32,
+          16,
+          64,
+          8
+        ],
+        "ranks": [
+          4,
+          8,
+          16,
+          32,
+          64,
+          128
+        ],
+        "d_per_rank": [
+          16384,
+          8192,
+          4096,
+          2048,
+          1024,
+          512
+        ],
+        "full_rank_ratio": [
+          0.2494974498705744,
+          0.12474111180647936,
+          0.12493899463152758,
+          0.2497560975609756,
+          0.49902534113060426,
+          0.9961089494163424
+        ],
+        "ratio_first": 0.2494974498705744,
+        "ratio_last": 0.9961089494163424,
+        "ratio_at_high_rank_worse_than_low": false,
+        "consecutive_steps_total": 5,
+        "consecutive_steps_worse_as_ranks_added": 1,
+        "fraction_steps_worse": 0.2,
+        "series_is_monotone_worsening": false,
+        "all_full_rank_rows_compress": false,
+        "n_full_rank_rows_compressing": 0,
+        "n_rows": 6,
+        "note": "full rank never compresses in Layout B at any rank count measured; the per-step trend is reported because the series is not strictly monotone (the merged root rank saturates), so an endpoint-only comparison would misstate it"
+      },
+      {
+        "mesh": [
+          256,
+          64,
+          32,
+          128,
+          8
+        ],
+        "ranks": [
+          4,
+          8,
+          16,
+          32,
+          64,
+          128
+        ],
+        "d_per_rank": [
+          131072,
+          65536,
+          32768,
+          16384,
+          8192,
+          4096
+        ],
+        "full_rank_ratio": [
+          0.24975419255245437,
+          0.12487614355412739,
+          0.06243711907676931,
+          0.06249237153667765,
+          0.12496948987063705,
+          0.24987798926305516
+        ],
+        "ratio_first": 0.24975419255245437,
+        "ratio_last": 0.24987798926305516,
+        "ratio_at_high_rank_worse_than_low": false,
+        "consecutive_steps_total": 5,
+        "consecutive_steps_worse_as_ranks_added": 2,
+        "fraction_steps_worse": 0.4,
+        "series_is_monotone_worsening": false,
+        "all_full_rank_rows_compress": false,
+        "n_full_rank_rows_compressing": 0,
+        "n_rows": 6,
+        "note": "full rank never compresses in Layout B at any rank count measured; the per-step trend is reported because the series is not strictly monotone (the merged root rank saturates), so an endpoint-only comparison would misstate it"
+      },
+      {
+        "mesh": [
+          512,
+          128,
+          64,
+          128,
+          8
+        ],
+        "ranks": [
+          4,
+          8,
+          16,
+          32,
+          64,
+          128
+        ],
+        "d_per_rank": [
+          1048576,
+          524288,
+          262144,
+          131072,
+          65536,
+          32768
+        ],
+        "full_rank_ratio": [
+          0.24975585943332118,
+          0.12487781062401346,
+          0.062438786219700323,
+          0.0312192740182252,
+          0.015624523177393268,
+          0.031248092767775404
+        ],
+        "ratio_first": 0.24975585943332118,
+        "ratio_last": 0.031248092767775404,
+        "ratio_at_high_rank_worse_than_low": true,
+        "consecutive_steps_total": 5,
+        "consecutive_steps_worse_as_ranks_added": 4,
+        "fraction_steps_worse": 0.8,
+        "series_is_monotone_worsening": false,
+        "all_full_rank_rows_compress": false,
+        "n_full_rank_rows_compressing": 0,
+        "n_rows": 6,
+        "note": "full rank never compresses in Layout B at any rank count measured; the per-step trend is reported because the series is not strictly monotone (the merged root rank saturates), so an endpoint-only comparison would misstate it"
+      }
+    ]
+  },
+  "layout_a_velocity_space": {
+    "full_rank": [
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          128,
+          32,
+          16,
+          64,
+          8
+        ],
+        "n_ranks": 4,
+        "local_box": [
+          32,
+          32,
+          16
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 16384,
+        "n_features_d": 512,
+        "n_features_definition": "Nvpar * Nmu (fixed by the physics, independent of rank count)",
+        "n_block_over_d": 32.0,
+        "regime": "tall",
+        "local_rank_requested": null,
+        "leaf_summary_elements": 263168,
+        "slab_elements_per_rank": 8388608,
+        "slab_bytes": {
+          "bytes": 67108864.0,
+          "KiB": 65536.0,
+          "MiB": 64.0,
+          "GiB": 0.0625
+        },
+        "summary_bytes": {
+          "bytes": 2105344.0,
+          "KiB": 2056.0,
+          "MiB": 2.0078125,
+          "GiB": 0.00196075439453125
+        },
+        "compression_ratio_slab_over_summary": 31.875486381322958,
+        "compresses": true
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          128,
+          32,
+          16,
+          64,
+          8
+        ],
+        "n_ranks": 8,
+        "local_box": [
+          16,
+          32,
+          16
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 8192,
+        "n_features_d": 512,
+        "n_features_definition": "Nvpar * Nmu (fixed by the physics, independent of rank count)",
+        "n_block_over_d": 16.0,
+        "regime": "tall",
+        "local_rank_requested": null,
+        "leaf_summary_elements": 263168,
+        "slab_elements_per_rank": 4194304,
+        "slab_bytes": {
+          "bytes": 33554432.0,
+          "KiB": 32768.0,
+          "MiB": 32.0,
+          "GiB": 0.03125
+        },
+        "summary_bytes": {
+          "bytes": 2105344.0,
+          "KiB": 2056.0,
+          "MiB": 2.0078125,
+          "GiB": 0.00196075439453125
+        },
+        "compression_ratio_slab_over_summary": 15.937743190661479,
+        "compresses": true
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          128,
+          32,
+          16,
+          64,
+          8
+        ],
+        "n_ranks": 16,
+        "local_box": [
+          8,
+          32,
+          16
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 4096,
+        "n_features_d": 512,
+        "n_features_definition": "Nvpar * Nmu (fixed by the physics, independent of rank count)",
+        "n_block_over_d": 8.0,
+        "regime": "tall",
+        "local_rank_requested": null,
+        "leaf_summary_elements": 263168,
+        "slab_elements_per_rank": 2097152,
+        "slab_bytes": {
+          "bytes": 16777216.0,
+          "KiB": 16384.0,
+          "MiB": 16.0,
+          "GiB": 0.015625
+        },
+        "summary_bytes": {
+          "bytes": 2105344.0,
+          "KiB": 2056.0,
+          "MiB": 2.0078125,
+          "GiB": 0.00196075439453125
+        },
+        "compression_ratio_slab_over_summary": 7.968871595330739,
+        "compresses": true
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          128,
+          32,
+          16,
+          64,
+          8
+        ],
+        "n_ranks": 32,
+        "local_box": [
+          4,
+          32,
+          16
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 2048,
+        "n_features_d": 512,
+        "n_features_definition": "Nvpar * Nmu (fixed by the physics, independent of rank count)",
+        "n_block_over_d": 4.0,
+        "regime": "tall",
+        "local_rank_requested": null,
+        "leaf_summary_elements": 263168,
+        "slab_elements_per_rank": 1048576,
+        "slab_bytes": {
+          "bytes": 8388608.0,
+          "KiB": 8192.0,
+          "MiB": 8.0,
+          "GiB": 0.0078125
+        },
+        "summary_bytes": {
+          "bytes": 2105344.0,
+          "KiB": 2056.0,
+          "MiB": 2.0078125,
+          "GiB": 0.00196075439453125
+        },
+        "compression_ratio_slab_over_summary": 3.9844357976653697,
+        "compresses": true
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          128,
+          32,
+          16,
+          64,
+          8
+        ],
+        "n_ranks": 64,
+        "local_box": [
+          2,
+          32,
+          16
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 1024,
+        "n_features_d": 512,
+        "n_features_definition": "Nvpar * Nmu (fixed by the physics, independent of rank count)",
+        "n_block_over_d": 2.0,
+        "regime": "tall",
+        "local_rank_requested": null,
+        "leaf_summary_elements": 263168,
+        "slab_elements_per_rank": 524288,
+        "slab_bytes": {
+          "bytes": 4194304.0,
+          "KiB": 4096.0,
+          "MiB": 4.0,
+          "GiB": 0.00390625
+        },
+        "summary_bytes": {
+          "bytes": 2105344.0,
+          "KiB": 2056.0,
+          "MiB": 2.0078125,
+          "GiB": 0.00196075439453125
+        },
+        "compression_ratio_slab_over_summary": 1.9922178988326849,
+        "compresses": true
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          128,
+          32,
+          16,
+          64,
+          8
+        ],
+        "n_ranks": 128,
+        "local_box": [
+          1,
+          32,
+          16
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 512,
+        "n_features_d": 512,
+        "n_features_definition": "Nvpar * Nmu (fixed by the physics, independent of rank count)",
+        "n_block_over_d": 1.0,
+        "regime": "square",
+        "local_rank_requested": null,
+        "leaf_summary_elements": 263168,
+        "slab_elements_per_rank": 262144,
+        "slab_bytes": {
+          "bytes": 2097152.0,
+          "KiB": 2048.0,
+          "MiB": 2.0,
+          "GiB": 0.001953125
+        },
+        "summary_bytes": {
+          "bytes": 2105344.0,
+          "KiB": 2056.0,
+          "MiB": 2.0078125,
+          "GiB": 0.00196075439453125
+        },
+        "compression_ratio_slab_over_summary": 0.9961089494163424,
+        "compresses": false
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          256,
+          64,
+          32,
+          128,
+          8
+        ],
+        "n_ranks": 4,
+        "local_box": [
+          64,
+          64,
+          32
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 131072,
+        "n_features_d": 1024,
+        "n_features_definition": "Nvpar * Nmu (fixed by the physics, independent of rank count)",
+        "n_block_over_d": 128.0,
+        "regime": "tall",
+        "local_rank_requested": null,
+        "leaf_summary_elements": 1050624,
+        "slab_elements_per_rank": 134217728,
+        "slab_bytes": {
+          "bytes": 1073741824.0,
+          "KiB": 1048576.0,
+          "MiB": 1024.0,
+          "GiB": 1.0
+        },
+        "summary_bytes": {
+          "bytes": 8404992.0,
+          "KiB": 8208.0,
+          "MiB": 8.015625,
+          "GiB": 0.0078277587890625
+        },
+        "compression_ratio_slab_over_summary": 127.75048732943469,
+        "compresses": true
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          256,
+          64,
+          32,
+          128,
+          8
+        ],
+        "n_ranks": 8,
+        "local_box": [
+          32,
+          64,
+          32
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 65536,
+        "n_features_d": 1024,
+        "n_features_definition": "Nvpar * Nmu (fixed by the physics, independent of rank count)",
+        "n_block_over_d": 64.0,
+        "regime": "tall",
+        "local_rank_requested": null,
+        "leaf_summary_elements": 1050624,
+        "slab_elements_per_rank": 67108864,
+        "slab_bytes": {
+          "bytes": 536870912.0,
+          "KiB": 524288.0,
+          "MiB": 512.0,
+          "GiB": 0.5
+        },
+        "summary_bytes": {
+          "bytes": 8404992.0,
+          "KiB": 8208.0,
+          "MiB": 8.015625,
+          "GiB": 0.0078277587890625
+        },
+        "compression_ratio_slab_over_summary": 63.875243664717345,
+        "compresses": true
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          256,
+          64,
+          32,
+          128,
+          8
+        ],
+        "n_ranks": 16,
+        "local_box": [
+          16,
+          64,
+          32
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 32768,
+        "n_features_d": 1024,
+        "n_features_definition": "Nvpar * Nmu (fixed by the physics, independent of rank count)",
+        "n_block_over_d": 32.0,
+        "regime": "tall",
+        "local_rank_requested": null,
+        "leaf_summary_elements": 1050624,
+        "slab_elements_per_rank": 33554432,
+        "slab_bytes": {
+          "bytes": 268435456.0,
+          "KiB": 262144.0,
+          "MiB": 256.0,
+          "GiB": 0.25
+        },
+        "summary_bytes": {
+          "bytes": 8404992.0,
+          "KiB": 8208.0,
+          "MiB": 8.015625,
+          "GiB": 0.0078277587890625
+        },
+        "compression_ratio_slab_over_summary": 31.937621832358673,
+        "compresses": true
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          256,
+          64,
+          32,
+          128,
+          8
+        ],
+        "n_ranks": 32,
+        "local_box": [
+          8,
+          64,
+          32
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 16384,
+        "n_features_d": 1024,
+        "n_features_definition": "Nvpar * Nmu (fixed by the physics, independent of rank count)",
+        "n_block_over_d": 16.0,
+        "regime": "tall",
+        "local_rank_requested": null,
+        "leaf_summary_elements": 1050624,
+        "slab_elements_per_rank": 16777216,
+        "slab_bytes": {
+          "bytes": 134217728.0,
+          "KiB": 131072.0,
+          "MiB": 128.0,
+          "GiB": 0.125
+        },
+        "summary_bytes": {
+          "bytes": 8404992.0,
+          "KiB": 8208.0,
+          "MiB": 8.015625,
+          "GiB": 0.0078277587890625
+        },
+        "compression_ratio_slab_over_summary": 15.968810916179336,
+        "compresses": true
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          256,
+          64,
+          32,
+          128,
+          8
+        ],
+        "n_ranks": 64,
+        "local_box": [
+          4,
+          64,
+          32
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 8192,
+        "n_features_d": 1024,
+        "n_features_definition": "Nvpar * Nmu (fixed by the physics, independent of rank count)",
+        "n_block_over_d": 8.0,
+        "regime": "tall",
+        "local_rank_requested": null,
+        "leaf_summary_elements": 1050624,
+        "slab_elements_per_rank": 8388608,
+        "slab_bytes": {
+          "bytes": 67108864.0,
+          "KiB": 65536.0,
+          "MiB": 64.0,
+          "GiB": 0.0625
+        },
+        "summary_bytes": {
+          "bytes": 8404992.0,
+          "KiB": 8208.0,
+          "MiB": 8.015625,
+          "GiB": 0.0078277587890625
+        },
+        "compression_ratio_slab_over_summary": 7.984405458089668,
+        "compresses": true
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          256,
+          64,
+          32,
+          128,
+          8
+        ],
+        "n_ranks": 128,
+        "local_box": [
+          2,
+          64,
+          32
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 4096,
+        "n_features_d": 1024,
+        "n_features_definition": "Nvpar * Nmu (fixed by the physics, independent of rank count)",
+        "n_block_over_d": 4.0,
+        "regime": "tall",
+        "local_rank_requested": null,
+        "leaf_summary_elements": 1050624,
+        "slab_elements_per_rank": 4194304,
+        "slab_bytes": {
+          "bytes": 33554432.0,
+          "KiB": 32768.0,
+          "MiB": 32.0,
+          "GiB": 0.03125
+        },
+        "summary_bytes": {
+          "bytes": 8404992.0,
+          "KiB": 8208.0,
+          "MiB": 8.015625,
+          "GiB": 0.0078277587890625
+        },
+        "compression_ratio_slab_over_summary": 3.992202729044834,
+        "compresses": true
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          512,
+          128,
+          64,
+          128,
+          8
+        ],
+        "n_ranks": 4,
+        "local_box": [
+          128,
+          128,
+          64
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 1048576,
+        "n_features_d": 1024,
+        "n_features_definition": "Nvpar * Nmu (fixed by the physics, independent of rank count)",
+        "n_block_over_d": 1024.0,
+        "regime": "tall",
+        "local_rank_requested": null,
+        "leaf_summary_elements": 1050624,
+        "slab_elements_per_rank": 1073741824,
+        "slab_bytes": {
+          "bytes": 8589934592.0,
+          "KiB": 8388608.0,
+          "MiB": 8192.0,
+          "GiB": 8.0
+        },
+        "summary_bytes": {
+          "bytes": 8404992.0,
+          "KiB": 8208.0,
+          "MiB": 8.015625,
+          "GiB": 0.0078277587890625
+        },
+        "compression_ratio_slab_over_summary": 1022.0038986354775,
+        "compresses": true
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          512,
+          128,
+          64,
+          128,
+          8
+        ],
+        "n_ranks": 8,
+        "local_box": [
+          64,
+          128,
+          64
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 524288,
+        "n_features_d": 1024,
+        "n_features_definition": "Nvpar * Nmu (fixed by the physics, independent of rank count)",
+        "n_block_over_d": 512.0,
+        "regime": "tall",
+        "local_rank_requested": null,
+        "leaf_summary_elements": 1050624,
+        "slab_elements_per_rank": 536870912,
+        "slab_bytes": {
+          "bytes": 4294967296.0,
+          "KiB": 4194304.0,
+          "MiB": 4096.0,
+          "GiB": 4.0
+        },
+        "summary_bytes": {
+          "bytes": 8404992.0,
+          "KiB": 8208.0,
+          "MiB": 8.015625,
+          "GiB": 0.0078277587890625
+        },
+        "compression_ratio_slab_over_summary": 511.00194931773876,
+        "compresses": true
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          512,
+          128,
+          64,
+          128,
+          8
+        ],
+        "n_ranks": 16,
+        "local_box": [
+          32,
+          128,
+          64
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 262144,
+        "n_features_d": 1024,
+        "n_features_definition": "Nvpar * Nmu (fixed by the physics, independent of rank count)",
+        "n_block_over_d": 256.0,
+        "regime": "tall",
+        "local_rank_requested": null,
+        "leaf_summary_elements": 1050624,
+        "slab_elements_per_rank": 268435456,
+        "slab_bytes": {
+          "bytes": 2147483648.0,
+          "KiB": 2097152.0,
+          "MiB": 2048.0,
+          "GiB": 2.0
+        },
+        "summary_bytes": {
+          "bytes": 8404992.0,
+          "KiB": 8208.0,
+          "MiB": 8.015625,
+          "GiB": 0.0078277587890625
+        },
+        "compression_ratio_slab_over_summary": 255.50097465886938,
+        "compresses": true
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          512,
+          128,
+          64,
+          128,
+          8
+        ],
+        "n_ranks": 32,
+        "local_box": [
+          16,
+          128,
+          64
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 131072,
+        "n_features_d": 1024,
+        "n_features_definition": "Nvpar * Nmu (fixed by the physics, independent of rank count)",
+        "n_block_over_d": 128.0,
+        "regime": "tall",
+        "local_rank_requested": null,
+        "leaf_summary_elements": 1050624,
+        "slab_elements_per_rank": 134217728,
+        "slab_bytes": {
+          "bytes": 1073741824.0,
+          "KiB": 1048576.0,
+          "MiB": 1024.0,
+          "GiB": 1.0
+        },
+        "summary_bytes": {
+          "bytes": 8404992.0,
+          "KiB": 8208.0,
+          "MiB": 8.015625,
+          "GiB": 0.0078277587890625
+        },
+        "compression_ratio_slab_over_summary": 127.75048732943469,
+        "compresses": true
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          512,
+          128,
+          64,
+          128,
+          8
+        ],
+        "n_ranks": 64,
+        "local_box": [
+          8,
+          128,
+          64
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 65536,
+        "n_features_d": 1024,
+        "n_features_definition": "Nvpar * Nmu (fixed by the physics, independent of rank count)",
+        "n_block_over_d": 64.0,
+        "regime": "tall",
+        "local_rank_requested": null,
+        "leaf_summary_elements": 1050624,
+        "slab_elements_per_rank": 67108864,
+        "slab_bytes": {
+          "bytes": 536870912.0,
+          "KiB": 524288.0,
+          "MiB": 512.0,
+          "GiB": 0.5
+        },
+        "summary_bytes": {
+          "bytes": 8404992.0,
+          "KiB": 8208.0,
+          "MiB": 8.015625,
+          "GiB": 0.0078277587890625
+        },
+        "compression_ratio_slab_over_summary": 63.875243664717345,
+        "compresses": true
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          512,
+          128,
+          64,
+          128,
+          8
+        ],
+        "n_ranks": 128,
+        "local_box": [
+          4,
+          128,
+          64
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 32768,
+        "n_features_d": 1024,
+        "n_features_definition": "Nvpar * Nmu (fixed by the physics, independent of rank count)",
+        "n_block_over_d": 32.0,
+        "regime": "tall",
+        "local_rank_requested": null,
+        "leaf_summary_elements": 1050624,
+        "slab_elements_per_rank": 33554432,
+        "slab_bytes": {
+          "bytes": 268435456.0,
+          "KiB": 262144.0,
+          "MiB": 256.0,
+          "GiB": 0.25
+        },
+        "summary_bytes": {
+          "bytes": 8404992.0,
+          "KiB": 8208.0,
+          "MiB": 8.015625,
+          "GiB": 0.0078277587890625
+        },
+        "compression_ratio_slab_over_summary": 31.937621832358673,
+        "compresses": true
+      }
+    ],
+    "truncated": [
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          128,
+          32,
+          16,
+          64,
+          8
+        ],
+        "n_ranks": 4,
+        "local_box": [
+          32,
+          32,
+          16
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 16384,
+        "n_features_d": 512,
+        "n_features_definition": "Nvpar * Nmu (fixed by the physics, independent of rank count)",
+        "n_block_over_d": 32.0,
+        "regime": "tall",
+        "local_rank_requested": 32,
+        "leaf_summary_elements": 16928,
+        "slab_elements_per_rank": 8388608,
+        "slab_bytes": {
+          "bytes": 67108864.0,
+          "KiB": 65536.0,
+          "MiB": 64.0,
+          "GiB": 0.0625
+        },
+        "summary_bytes": {
+          "bytes": 135424.0,
+          "KiB": 132.25,
+          "MiB": 0.129150390625,
+          "GiB": 0.00012612342834472656
+        },
+        "compression_ratio_slab_over_summary": 495.54631379962194,
+        "compresses": true
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          128,
+          32,
+          16,
+          64,
+          8
+        ],
+        "n_ranks": 8,
+        "local_box": [
+          16,
+          32,
+          16
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 8192,
+        "n_features_d": 512,
+        "n_features_definition": "Nvpar * Nmu (fixed by the physics, independent of rank count)",
+        "n_block_over_d": 16.0,
+        "regime": "tall",
+        "local_rank_requested": 32,
+        "leaf_summary_elements": 16928,
+        "slab_elements_per_rank": 4194304,
+        "slab_bytes": {
+          "bytes": 33554432.0,
+          "KiB": 32768.0,
+          "MiB": 32.0,
+          "GiB": 0.03125
+        },
+        "summary_bytes": {
+          "bytes": 135424.0,
+          "KiB": 132.25,
+          "MiB": 0.129150390625,
+          "GiB": 0.00012612342834472656
+        },
+        "compression_ratio_slab_over_summary": 247.77315689981097,
+        "compresses": true
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          128,
+          32,
+          16,
+          64,
+          8
+        ],
+        "n_ranks": 16,
+        "local_box": [
+          8,
+          32,
+          16
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 4096,
+        "n_features_d": 512,
+        "n_features_definition": "Nvpar * Nmu (fixed by the physics, independent of rank count)",
+        "n_block_over_d": 8.0,
+        "regime": "tall",
+        "local_rank_requested": 32,
+        "leaf_summary_elements": 16928,
+        "slab_elements_per_rank": 2097152,
+        "slab_bytes": {
+          "bytes": 16777216.0,
+          "KiB": 16384.0,
+          "MiB": 16.0,
+          "GiB": 0.015625
+        },
+        "summary_bytes": {
+          "bytes": 135424.0,
+          "KiB": 132.25,
+          "MiB": 0.129150390625,
+          "GiB": 0.00012612342834472656
+        },
+        "compression_ratio_slab_over_summary": 123.88657844990549,
+        "compresses": true
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          128,
+          32,
+          16,
+          64,
+          8
+        ],
+        "n_ranks": 32,
+        "local_box": [
+          4,
+          32,
+          16
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 2048,
+        "n_features_d": 512,
+        "n_features_definition": "Nvpar * Nmu (fixed by the physics, independent of rank count)",
+        "n_block_over_d": 4.0,
+        "regime": "tall",
+        "local_rank_requested": 32,
+        "leaf_summary_elements": 16928,
+        "slab_elements_per_rank": 1048576,
+        "slab_bytes": {
+          "bytes": 8388608.0,
+          "KiB": 8192.0,
+          "MiB": 8.0,
+          "GiB": 0.0078125
+        },
+        "summary_bytes": {
+          "bytes": 135424.0,
+          "KiB": 132.25,
+          "MiB": 0.129150390625,
+          "GiB": 0.00012612342834472656
+        },
+        "compression_ratio_slab_over_summary": 61.94328922495274,
+        "compresses": true
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          128,
+          32,
+          16,
+          64,
+          8
+        ],
+        "n_ranks": 64,
+        "local_box": [
+          2,
+          32,
+          16
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 1024,
+        "n_features_d": 512,
+        "n_features_definition": "Nvpar * Nmu (fixed by the physics, independent of rank count)",
+        "n_block_over_d": 2.0,
+        "regime": "tall",
+        "local_rank_requested": 32,
+        "leaf_summary_elements": 16928,
+        "slab_elements_per_rank": 524288,
+        "slab_bytes": {
+          "bytes": 4194304.0,
+          "KiB": 4096.0,
+          "MiB": 4.0,
+          "GiB": 0.00390625
+        },
+        "summary_bytes": {
+          "bytes": 135424.0,
+          "KiB": 132.25,
+          "MiB": 0.129150390625,
+          "GiB": 0.00012612342834472656
+        },
+        "compression_ratio_slab_over_summary": 30.97164461247637,
+        "compresses": true
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          128,
+          32,
+          16,
+          64,
+          8
+        ],
+        "n_ranks": 128,
+        "local_box": [
+          1,
+          32,
+          16
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 512,
+        "n_features_d": 512,
+        "n_features_definition": "Nvpar * Nmu (fixed by the physics, independent of rank count)",
+        "n_block_over_d": 1.0,
+        "regime": "square",
+        "local_rank_requested": 32,
+        "leaf_summary_elements": 16928,
+        "slab_elements_per_rank": 262144,
+        "slab_bytes": {
+          "bytes": 2097152.0,
+          "KiB": 2048.0,
+          "MiB": 2.0,
+          "GiB": 0.001953125
+        },
+        "summary_bytes": {
+          "bytes": 135424.0,
+          "KiB": 132.25,
+          "MiB": 0.129150390625,
+          "GiB": 0.00012612342834472656
+        },
+        "compression_ratio_slab_over_summary": 15.485822306238186,
+        "compresses": true
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          256,
+          64,
+          32,
+          128,
+          8
+        ],
+        "n_ranks": 4,
+        "local_box": [
+          64,
+          64,
+          32
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 131072,
+        "n_features_d": 1024,
+        "n_features_definition": "Nvpar * Nmu (fixed by the physics, independent of rank count)",
+        "n_block_over_d": 128.0,
+        "regime": "tall",
+        "local_rank_requested": 32,
+        "leaf_summary_elements": 33824,
+        "slab_elements_per_rank": 134217728,
+        "slab_bytes": {
+          "bytes": 1073741824.0,
+          "KiB": 1048576.0,
+          "MiB": 1024.0,
+          "GiB": 1.0
+        },
+        "summary_bytes": {
+          "bytes": 270592.0,
+          "KiB": 264.25,
+          "MiB": 0.258056640625,
+          "GiB": 0.00025200843811035156
+        },
+        "compression_ratio_slab_over_summary": 3968.1210974456008,
+        "compresses": true
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          256,
+          64,
+          32,
+          128,
+          8
+        ],
+        "n_ranks": 8,
+        "local_box": [
+          32,
+          64,
+          32
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 65536,
+        "n_features_d": 1024,
+        "n_features_definition": "Nvpar * Nmu (fixed by the physics, independent of rank count)",
+        "n_block_over_d": 64.0,
+        "regime": "tall",
+        "local_rank_requested": 32,
+        "leaf_summary_elements": 33824,
+        "slab_elements_per_rank": 67108864,
+        "slab_bytes": {
+          "bytes": 536870912.0,
+          "KiB": 524288.0,
+          "MiB": 512.0,
+          "GiB": 0.5
+        },
+        "summary_bytes": {
+          "bytes": 270592.0,
+          "KiB": 264.25,
+          "MiB": 0.258056640625,
+          "GiB": 0.00025200843811035156
+        },
+        "compression_ratio_slab_over_summary": 1984.0605487228004,
+        "compresses": true
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          256,
+          64,
+          32,
+          128,
+          8
+        ],
+        "n_ranks": 16,
+        "local_box": [
+          16,
+          64,
+          32
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 32768,
+        "n_features_d": 1024,
+        "n_features_definition": "Nvpar * Nmu (fixed by the physics, independent of rank count)",
+        "n_block_over_d": 32.0,
+        "regime": "tall",
+        "local_rank_requested": 32,
+        "leaf_summary_elements": 33824,
+        "slab_elements_per_rank": 33554432,
+        "slab_bytes": {
+          "bytes": 268435456.0,
+          "KiB": 262144.0,
+          "MiB": 256.0,
+          "GiB": 0.25
+        },
+        "summary_bytes": {
+          "bytes": 270592.0,
+          "KiB": 264.25,
+          "MiB": 0.258056640625,
+          "GiB": 0.00025200843811035156
+        },
+        "compression_ratio_slab_over_summary": 992.0302743614002,
+        "compresses": true
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          256,
+          64,
+          32,
+          128,
+          8
+        ],
+        "n_ranks": 32,
+        "local_box": [
+          8,
+          64,
+          32
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 16384,
+        "n_features_d": 1024,
+        "n_features_definition": "Nvpar * Nmu (fixed by the physics, independent of rank count)",
+        "n_block_over_d": 16.0,
+        "regime": "tall",
+        "local_rank_requested": 32,
+        "leaf_summary_elements": 33824,
+        "slab_elements_per_rank": 16777216,
+        "slab_bytes": {
+          "bytes": 134217728.0,
+          "KiB": 131072.0,
+          "MiB": 128.0,
+          "GiB": 0.125
+        },
+        "summary_bytes": {
+          "bytes": 270592.0,
+          "KiB": 264.25,
+          "MiB": 0.258056640625,
+          "GiB": 0.00025200843811035156
+        },
+        "compression_ratio_slab_over_summary": 496.0151371807001,
+        "compresses": true
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          256,
+          64,
+          32,
+          128,
+          8
+        ],
+        "n_ranks": 64,
+        "local_box": [
+          4,
+          64,
+          32
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 8192,
+        "n_features_d": 1024,
+        "n_features_definition": "Nvpar * Nmu (fixed by the physics, independent of rank count)",
+        "n_block_over_d": 8.0,
+        "regime": "tall",
+        "local_rank_requested": 32,
+        "leaf_summary_elements": 33824,
+        "slab_elements_per_rank": 8388608,
+        "slab_bytes": {
+          "bytes": 67108864.0,
+          "KiB": 65536.0,
+          "MiB": 64.0,
+          "GiB": 0.0625
+        },
+        "summary_bytes": {
+          "bytes": 270592.0,
+          "KiB": 264.25,
+          "MiB": 0.258056640625,
+          "GiB": 0.00025200843811035156
+        },
+        "compression_ratio_slab_over_summary": 248.00756859035005,
+        "compresses": true
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          256,
+          64,
+          32,
+          128,
+          8
+        ],
+        "n_ranks": 128,
+        "local_box": [
+          2,
+          64,
+          32
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 4096,
+        "n_features_d": 1024,
+        "n_features_definition": "Nvpar * Nmu (fixed by the physics, independent of rank count)",
+        "n_block_over_d": 4.0,
+        "regime": "tall",
+        "local_rank_requested": 32,
+        "leaf_summary_elements": 33824,
+        "slab_elements_per_rank": 4194304,
+        "slab_bytes": {
+          "bytes": 33554432.0,
+          "KiB": 32768.0,
+          "MiB": 32.0,
+          "GiB": 0.03125
+        },
+        "summary_bytes": {
+          "bytes": 270592.0,
+          "KiB": 264.25,
+          "MiB": 0.258056640625,
+          "GiB": 0.00025200843811035156
+        },
+        "compression_ratio_slab_over_summary": 124.00378429517502,
+        "compresses": true
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          512,
+          128,
+          64,
+          128,
+          8
+        ],
+        "n_ranks": 4,
+        "local_box": [
+          128,
+          128,
+          64
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 1048576,
+        "n_features_d": 1024,
+        "n_features_definition": "Nvpar * Nmu (fixed by the physics, independent of rank count)",
+        "n_block_over_d": 1024.0,
+        "regime": "tall",
+        "local_rank_requested": 32,
+        "leaf_summary_elements": 33824,
+        "slab_elements_per_rank": 1073741824,
+        "slab_bytes": {
+          "bytes": 8589934592.0,
+          "KiB": 8388608.0,
+          "MiB": 8192.0,
+          "GiB": 8.0
+        },
+        "summary_bytes": {
+          "bytes": 270592.0,
+          "KiB": 264.25,
+          "MiB": 0.258056640625,
+          "GiB": 0.00025200843811035156
+        },
+        "compression_ratio_slab_over_summary": 31744.968779564806,
+        "compresses": true
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          512,
+          128,
+          64,
+          128,
+          8
+        ],
+        "n_ranks": 8,
+        "local_box": [
+          64,
+          128,
+          64
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 524288,
+        "n_features_d": 1024,
+        "n_features_definition": "Nvpar * Nmu (fixed by the physics, independent of rank count)",
+        "n_block_over_d": 512.0,
+        "regime": "tall",
+        "local_rank_requested": 32,
+        "leaf_summary_elements": 33824,
+        "slab_elements_per_rank": 536870912,
+        "slab_bytes": {
+          "bytes": 4294967296.0,
+          "KiB": 4194304.0,
+          "MiB": 4096.0,
+          "GiB": 4.0
+        },
+        "summary_bytes": {
+          "bytes": 270592.0,
+          "KiB": 264.25,
+          "MiB": 0.258056640625,
+          "GiB": 0.00025200843811035156
+        },
+        "compression_ratio_slab_over_summary": 15872.484389782403,
+        "compresses": true
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          512,
+          128,
+          64,
+          128,
+          8
+        ],
+        "n_ranks": 16,
+        "local_box": [
+          32,
+          128,
+          64
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 262144,
+        "n_features_d": 1024,
+        "n_features_definition": "Nvpar * Nmu (fixed by the physics, independent of rank count)",
+        "n_block_over_d": 256.0,
+        "regime": "tall",
+        "local_rank_requested": 32,
+        "leaf_summary_elements": 33824,
+        "slab_elements_per_rank": 268435456,
+        "slab_bytes": {
+          "bytes": 2147483648.0,
+          "KiB": 2097152.0,
+          "MiB": 2048.0,
+          "GiB": 2.0
+        },
+        "summary_bytes": {
+          "bytes": 270592.0,
+          "KiB": 264.25,
+          "MiB": 0.258056640625,
+          "GiB": 0.00025200843811035156
+        },
+        "compression_ratio_slab_over_summary": 7936.2421948912015,
+        "compresses": true
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          512,
+          128,
+          64,
+          128,
+          8
+        ],
+        "n_ranks": 32,
+        "local_box": [
+          16,
+          128,
+          64
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 131072,
+        "n_features_d": 1024,
+        "n_features_definition": "Nvpar * Nmu (fixed by the physics, independent of rank count)",
+        "n_block_over_d": 128.0,
+        "regime": "tall",
+        "local_rank_requested": 32,
+        "leaf_summary_elements": 33824,
+        "slab_elements_per_rank": 134217728,
+        "slab_bytes": {
+          "bytes": 1073741824.0,
+          "KiB": 1048576.0,
+          "MiB": 1024.0,
+          "GiB": 1.0
+        },
+        "summary_bytes": {
+          "bytes": 270592.0,
+          "KiB": 264.25,
+          "MiB": 0.258056640625,
+          "GiB": 0.00025200843811035156
+        },
+        "compression_ratio_slab_over_summary": 3968.1210974456008,
+        "compresses": true
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          512,
+          128,
+          64,
+          128,
+          8
+        ],
+        "n_ranks": 64,
+        "local_box": [
+          8,
+          128,
+          64
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 65536,
+        "n_features_d": 1024,
+        "n_features_definition": "Nvpar * Nmu (fixed by the physics, independent of rank count)",
+        "n_block_over_d": 64.0,
+        "regime": "tall",
+        "local_rank_requested": 32,
+        "leaf_summary_elements": 33824,
+        "slab_elements_per_rank": 67108864,
+        "slab_bytes": {
+          "bytes": 536870912.0,
+          "KiB": 524288.0,
+          "MiB": 512.0,
+          "GiB": 0.5
+        },
+        "summary_bytes": {
+          "bytes": 270592.0,
+          "KiB": 264.25,
+          "MiB": 0.258056640625,
+          "GiB": 0.00025200843811035156
+        },
+        "compression_ratio_slab_over_summary": 1984.0605487228004,
+        "compresses": true
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          512,
+          128,
+          64,
+          128,
+          8
+        ],
+        "n_ranks": 128,
+        "local_box": [
+          4,
+          128,
+          64
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 32768,
+        "n_features_d": 1024,
+        "n_features_definition": "Nvpar * Nmu (fixed by the physics, independent of rank count)",
+        "n_block_over_d": 32.0,
+        "regime": "tall",
+        "local_rank_requested": 32,
+        "leaf_summary_elements": 33824,
+        "slab_elements_per_rank": 33554432,
+        "slab_bytes": {
+          "bytes": 268435456.0,
+          "KiB": 262144.0,
+          "MiB": 256.0,
+          "GiB": 0.25
+        },
+        "summary_bytes": {
+          "bytes": 270592.0,
+          "KiB": 264.25,
+          "MiB": 0.258056640625,
+          "GiB": 0.00025200843811035156
+        },
+        "compression_ratio_slab_over_summary": 992.0302743614002,
+        "compresses": true
+      }
+    ]
+  },
+  "layout_b_spatial_box": {
+    "full_rank": [
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          128,
+          32,
+          16,
+          64,
+          8
+        ],
+        "n_ranks": 4,
+        "local_box": [
+          32,
+          32,
+          16
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 512,
+        "n_features_d": 16384,
+        "n_features_definition": "local Tor1 * Tor2 * Tor3 (grows as the rank count drops)",
+        "n_block_over_d": 0.03125,
+        "regime": "flat",
+        "local_rank_requested": null,
+        "leaf_summary_elements": 8405504,
+        "merged_root_rank": 2051,
+        "merged_root_elements": 33622019,
+        "slab_elements_per_rank": 8388608,
+        "slab_bytes": {
+          "bytes": 67108864.0,
+          "KiB": 65536.0,
+          "MiB": 64.0,
+          "GiB": 0.0625
+        },
+        "summary_bytes": {
+          "bytes": 268976152.0,
+          "KiB": 262672.0234375,
+          "MiB": 256.5156478881836,
+          "GiB": 0.2505035623908043
+        },
+        "compression_ratio_slab_over_summary": 0.2494974498705744,
+        "compresses": false,
+        "note": "merged root over all ranks is what a fit actually materializes; sizing only the leaf understates the Layout B blow-up"
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          128,
+          32,
+          16,
+          64,
+          8
+        ],
+        "n_ranks": 8,
+        "local_box": [
+          16,
+          32,
+          16
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 512,
+        "n_features_d": 8192,
+        "n_features_definition": "local Tor1 * Tor2 * Tor3 (grows as the rank count drops)",
+        "n_block_over_d": 0.0625,
+        "regime": "flat",
+        "local_rank_requested": null,
+        "leaf_summary_elements": 4203008,
+        "merged_root_rank": 4103,
+        "merged_root_elements": 33624071,
+        "slab_elements_per_rank": 4194304,
+        "slab_bytes": {
+          "bytes": 33554432.0,
+          "KiB": 32768.0,
+          "MiB": 32.0,
+          "GiB": 0.03125
+        },
+        "summary_bytes": {
+          "bytes": 268992568.0,
+          "KiB": 262688.0546875,
+          "MiB": 256.5313034057617,
+          "GiB": 0.2505188509821892
+        },
+        "compression_ratio_slab_over_summary": 0.12474111180647936,
+        "compresses": false,
+        "note": "merged root over all ranks is what a fit actually materializes; sizing only the leaf understates the Layout B blow-up"
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          128,
+          32,
+          16,
+          64,
+          8
+        ],
+        "n_ranks": 16,
+        "local_box": [
+          8,
+          32,
+          16
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 512,
+        "n_features_d": 4096,
+        "n_features_definition": "local Tor1 * Tor2 * Tor3 (grows as the rank count drops)",
+        "n_block_over_d": 0.125,
+        "regime": "flat",
+        "local_rank_requested": null,
+        "leaf_summary_elements": 2101760,
+        "merged_root_rank": 4096,
+        "merged_root_elements": 16785408,
+        "slab_elements_per_rank": 2097152,
+        "slab_bytes": {
+          "bytes": 16777216.0,
+          "KiB": 16384.0,
+          "MiB": 16.0,
+          "GiB": 0.015625
+        },
+        "summary_bytes": {
+          "bytes": 134283264.0,
+          "KiB": 131136.0,
+          "MiB": 128.0625,
+          "GiB": 0.12506103515625
+        },
+        "compression_ratio_slab_over_summary": 0.12493899463152758,
+        "compresses": false,
+        "note": "merged root over all ranks is what a fit actually materializes; sizing only the leaf understates the Layout B blow-up"
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          128,
+          32,
+          16,
+          64,
+          8
+        ],
+        "n_ranks": 32,
+        "local_box": [
+          4,
+          32,
+          16
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 512,
+        "n_features_d": 2048,
+        "n_features_definition": "local Tor1 * Tor2 * Tor3 (grows as the rank count drops)",
+        "n_block_over_d": 0.25,
+        "regime": "flat",
+        "local_rank_requested": null,
+        "leaf_summary_elements": 1051136,
+        "merged_root_rank": 2048,
+        "merged_root_elements": 4198400,
+        "slab_elements_per_rank": 1048576,
+        "slab_bytes": {
+          "bytes": 8388608.0,
+          "KiB": 8192.0,
+          "MiB": 8.0,
+          "GiB": 0.0078125
+        },
+        "summary_bytes": {
+          "bytes": 33587200.0,
+          "KiB": 32800.0,
+          "MiB": 32.03125,
+          "GiB": 0.031280517578125
+        },
+        "compression_ratio_slab_over_summary": 0.2497560975609756,
+        "compresses": false,
+        "note": "merged root over all ranks is what a fit actually materializes; sizing only the leaf understates the Layout B blow-up"
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          128,
+          32,
+          16,
+          64,
+          8
+        ],
+        "n_ranks": 64,
+        "local_box": [
+          2,
+          32,
+          16
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 512,
+        "n_features_d": 1024,
+        "n_features_definition": "local Tor1 * Tor2 * Tor3 (grows as the rank count drops)",
+        "n_block_over_d": 0.5,
+        "regime": "flat",
+        "local_rank_requested": null,
+        "leaf_summary_elements": 525824,
+        "merged_root_rank": 1024,
+        "merged_root_elements": 1050624,
+        "slab_elements_per_rank": 524288,
+        "slab_bytes": {
+          "bytes": 4194304.0,
+          "KiB": 4096.0,
+          "MiB": 4.0,
+          "GiB": 0.00390625
+        },
+        "summary_bytes": {
+          "bytes": 8404992.0,
+          "KiB": 8208.0,
+          "MiB": 8.015625,
+          "GiB": 0.0078277587890625
+        },
+        "compression_ratio_slab_over_summary": 0.49902534113060426,
+        "compresses": false,
+        "note": "merged root over all ranks is what a fit actually materializes; sizing only the leaf understates the Layout B blow-up"
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          128,
+          32,
+          16,
+          64,
+          8
+        ],
+        "n_ranks": 128,
+        "local_box": [
+          1,
+          32,
+          16
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 512,
+        "n_features_d": 512,
+        "n_features_definition": "local Tor1 * Tor2 * Tor3 (grows as the rank count drops)",
+        "n_block_over_d": 1.0,
+        "regime": "square",
+        "local_rank_requested": null,
+        "leaf_summary_elements": 263168,
+        "merged_root_rank": 512,
+        "merged_root_elements": 263168,
+        "slab_elements_per_rank": 262144,
+        "slab_bytes": {
+          "bytes": 2097152.0,
+          "KiB": 2048.0,
+          "MiB": 2.0,
+          "GiB": 0.001953125
+        },
+        "summary_bytes": {
+          "bytes": 2105344.0,
+          "KiB": 2056.0,
+          "MiB": 2.0078125,
+          "GiB": 0.00196075439453125
+        },
+        "compression_ratio_slab_over_summary": 0.9961089494163424,
+        "compresses": false,
+        "note": "merged root over all ranks is what a fit actually materializes; sizing only the leaf understates the Layout B blow-up"
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          256,
+          64,
+          32,
+          128,
+          8
+        ],
+        "n_ranks": 4,
+        "local_box": [
+          64,
+          64,
+          32
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 1024,
+        "n_features_d": 131072,
+        "n_features_definition": "local Tor1 * Tor2 * Tor3 (grows as the rank count drops)",
+        "n_block_over_d": 0.0078125,
+        "regime": "flat",
+        "local_rank_requested": null,
+        "leaf_summary_elements": 134349824,
+        "merged_root_rank": 4099,
+        "merged_root_elements": 537399299,
+        "slab_elements_per_rank": 134217728,
+        "slab_bytes": {
+          "bytes": 1073741824.0,
+          "KiB": 1048576.0,
+          "MiB": 1024.0,
+          "GiB": 1.0
+        },
+        "summary_bytes": {
+          "bytes": 4299194392.0,
+          "KiB": 4198432.0234375,
+          "MiB": 4100.031272888184,
+          "GiB": 4.003936789929867
+        },
+        "compression_ratio_slab_over_summary": 0.24975419255245437,
+        "compresses": false,
+        "note": "merged root over all ranks is what a fit actually materializes; sizing only the leaf understates the Layout B blow-up"
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          256,
+          64,
+          32,
+          128,
+          8
+        ],
+        "n_ranks": 8,
+        "local_box": [
+          32,
+          64,
+          32
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 1024,
+        "n_features_d": 65536,
+        "n_features_definition": "local Tor1 * Tor2 * Tor3 (grows as the rank count drops)",
+        "n_block_over_d": 0.015625,
+        "regime": "flat",
+        "local_rank_requested": null,
+        "leaf_summary_elements": 67175424,
+        "merged_root_rank": 8199,
+        "merged_root_elements": 537403399,
+        "slab_elements_per_rank": 67108864,
+        "slab_bytes": {
+          "bytes": 536870912.0,
+          "KiB": 524288.0,
+          "MiB": 512.0,
+          "GiB": 0.5
+        },
+        "summary_bytes": {
+          "bytes": 4299227192.0,
+          "KiB": 4198464.0546875,
+          "MiB": 4100.062553405762,
+          "GiB": 4.003967337310314
+        },
+        "compression_ratio_slab_over_summary": 0.12487614355412739,
+        "compresses": false,
+        "note": "merged root over all ranks is what a fit actually materializes; sizing only the leaf understates the Layout B blow-up"
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          256,
+          64,
+          32,
+          128,
+          8
+        ],
+        "n_ranks": 16,
+        "local_box": [
+          16,
+          64,
+          32
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 1024,
+        "n_features_d": 32768,
+        "n_features_definition": "local Tor1 * Tor2 * Tor3 (grows as the rank count drops)",
+        "n_block_over_d": 0.03125,
+        "regime": "flat",
+        "local_rank_requested": null,
+        "leaf_summary_elements": 33588224,
+        "merged_root_rank": 16399,
+        "merged_root_elements": 537411599,
+        "slab_elements_per_rank": 33554432,
+        "slab_bytes": {
+          "bytes": 268435456.0,
+          "KiB": 262144.0,
+          "MiB": 256.0,
+          "GiB": 0.25
+        },
+        "summary_bytes": {
+          "bytes": 4299292792.0,
+          "KiB": 4198528.1171875,
+          "MiB": 4100.125114440918,
+          "GiB": 4.004028432071209
+        },
+        "compression_ratio_slab_over_summary": 0.06243711907676931,
+        "compresses": false,
+        "note": "merged root over all ranks is what a fit actually materializes; sizing only the leaf understates the Layout B blow-up"
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          256,
+          64,
+          32,
+          128,
+          8
+        ],
+        "n_ranks": 32,
+        "local_box": [
+          8,
+          64,
+          32
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 1024,
+        "n_features_d": 16384,
+        "n_features_definition": "local Tor1 * Tor2 * Tor3 (grows as the rank count drops)",
+        "n_block_over_d": 0.0625,
+        "regime": "flat",
+        "local_rank_requested": null,
+        "leaf_summary_elements": 16794624,
+        "merged_root_rank": 16384,
+        "merged_root_elements": 268468224,
+        "slab_elements_per_rank": 16777216,
+        "slab_bytes": {
+          "bytes": 134217728.0,
+          "KiB": 131072.0,
+          "MiB": 128.0,
+          "GiB": 0.125
+        },
+        "summary_bytes": {
+          "bytes": 2147745792.0,
+          "KiB": 2097408.0,
+          "MiB": 2048.25,
+          "GiB": 2.000244140625
+        },
+        "compression_ratio_slab_over_summary": 0.06249237153667765,
+        "compresses": false,
+        "note": "merged root over all ranks is what a fit actually materializes; sizing only the leaf understates the Layout B blow-up"
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          256,
+          64,
+          32,
+          128,
+          8
+        ],
+        "n_ranks": 64,
+        "local_box": [
+          4,
+          64,
+          32
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 1024,
+        "n_features_d": 8192,
+        "n_features_definition": "local Tor1 * Tor2 * Tor3 (grows as the rank count drops)",
+        "n_block_over_d": 0.125,
+        "regime": "flat",
+        "local_rank_requested": null,
+        "leaf_summary_elements": 8397824,
+        "merged_root_rank": 8192,
+        "merged_root_elements": 67125248,
+        "slab_elements_per_rank": 8388608,
+        "slab_bytes": {
+          "bytes": 67108864.0,
+          "KiB": 65536.0,
+          "MiB": 64.0,
+          "GiB": 0.0625
+        },
+        "summary_bytes": {
+          "bytes": 537001984.0,
+          "KiB": 524416.0,
+          "MiB": 512.125,
+          "GiB": 0.5001220703125
+        },
+        "compression_ratio_slab_over_summary": 0.12496948987063705,
+        "compresses": false,
+        "note": "merged root over all ranks is what a fit actually materializes; sizing only the leaf understates the Layout B blow-up"
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          256,
+          64,
+          32,
+          128,
+          8
+        ],
+        "n_ranks": 128,
+        "local_box": [
+          2,
+          64,
+          32
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 1024,
+        "n_features_d": 4096,
+        "n_features_definition": "local Tor1 * Tor2 * Tor3 (grows as the rank count drops)",
+        "n_block_over_d": 0.25,
+        "regime": "flat",
+        "local_rank_requested": null,
+        "leaf_summary_elements": 4199424,
+        "merged_root_rank": 4096,
+        "merged_root_elements": 16785408,
+        "slab_elements_per_rank": 4194304,
+        "slab_bytes": {
+          "bytes": 33554432.0,
+          "KiB": 32768.0,
+          "MiB": 32.0,
+          "GiB": 0.03125
+        },
+        "summary_bytes": {
+          "bytes": 134283264.0,
+          "KiB": 131136.0,
+          "MiB": 128.0625,
+          "GiB": 0.12506103515625
+        },
+        "compression_ratio_slab_over_summary": 0.24987798926305516,
+        "compresses": false,
+        "note": "merged root over all ranks is what a fit actually materializes; sizing only the leaf understates the Layout B blow-up"
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          512,
+          128,
+          64,
+          128,
+          8
+        ],
+        "n_ranks": 4,
+        "local_box": [
+          128,
+          128,
+          64
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 1024,
+        "n_features_d": 1048576,
+        "n_features_definition": "local Tor1 * Tor2 * Tor3 (grows as the rank count drops)",
+        "n_block_over_d": 0.0009765625,
+        "regime": "flat",
+        "local_rank_requested": null,
+        "leaf_summary_elements": 1074791424,
+        "merged_root_rank": 4099,
+        "merged_root_elements": 4299165699,
+        "slab_elements_per_rank": 1073741824,
+        "slab_bytes": {
+          "bytes": 8589934592.0,
+          "KiB": 8388608.0,
+          "MiB": 8192.0,
+          "GiB": 8.0
+        },
+        "summary_bytes": {
+          "bytes": 34393325592.0,
+          "KiB": 33587232.0234375,
+          "MiB": 32800.03127288818,
+          "GiB": 32.03128053992987
+        },
+        "compression_ratio_slab_over_summary": 0.24975585943332118,
+        "compresses": false,
+        "note": "merged root over all ranks is what a fit actually materializes; sizing only the leaf understates the Layout B blow-up"
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          512,
+          128,
+          64,
+          128,
+          8
+        ],
+        "n_ranks": 8,
+        "local_box": [
+          64,
+          128,
+          64
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 1024,
+        "n_features_d": 524288,
+        "n_features_definition": "local Tor1 * Tor2 * Tor3 (grows as the rank count drops)",
+        "n_block_over_d": 0.001953125,
+        "regime": "flat",
+        "local_rank_requested": null,
+        "leaf_summary_elements": 537396224,
+        "merged_root_rank": 8199,
+        "merged_root_elements": 4299169799,
+        "slab_elements_per_rank": 536870912,
+        "slab_bytes": {
+          "bytes": 4294967296.0,
+          "KiB": 4194304.0,
+          "MiB": 4096.0,
+          "GiB": 4.0
+        },
+        "summary_bytes": {
+          "bytes": 34393358392.0,
+          "KiB": 33587264.0546875,
+          "MiB": 32800.06255340576,
+          "GiB": 32.031311087310314
+        },
+        "compression_ratio_slab_over_summary": 0.12487781062401346,
+        "compresses": false,
+        "note": "merged root over all ranks is what a fit actually materializes; sizing only the leaf understates the Layout B blow-up"
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          512,
+          128,
+          64,
+          128,
+          8
+        ],
+        "n_ranks": 16,
+        "local_box": [
+          32,
+          128,
+          64
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 1024,
+        "n_features_d": 262144,
+        "n_features_definition": "local Tor1 * Tor2 * Tor3 (grows as the rank count drops)",
+        "n_block_over_d": 0.00390625,
+        "regime": "flat",
+        "local_rank_requested": null,
+        "leaf_summary_elements": 268698624,
+        "merged_root_rank": 16399,
+        "merged_root_elements": 4299177999,
+        "slab_elements_per_rank": 268435456,
+        "slab_bytes": {
+          "bytes": 2147483648.0,
+          "KiB": 2097152.0,
+          "MiB": 2048.0,
+          "GiB": 2.0
+        },
+        "summary_bytes": {
+          "bytes": 34393423992.0,
+          "KiB": 33587328.1171875,
+          "MiB": 32800.12511444092,
+          "GiB": 32.03137218207121
+        },
+        "compression_ratio_slab_over_summary": 0.062438786219700323,
+        "compresses": false,
+        "note": "merged root over all ranks is what a fit actually materializes; sizing only the leaf understates the Layout B blow-up"
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          512,
+          128,
+          64,
+          128,
+          8
+        ],
+        "n_ranks": 32,
+        "local_box": [
+          16,
+          128,
+          64
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 1024,
+        "n_features_d": 131072,
+        "n_features_definition": "local Tor1 * Tor2 * Tor3 (grows as the rank count drops)",
+        "n_block_over_d": 0.0078125,
+        "regime": "flat",
+        "local_rank_requested": null,
+        "leaf_summary_elements": 134349824,
+        "merged_root_rank": 32799,
+        "merged_root_elements": 4299194399,
+        "slab_elements_per_rank": 134217728,
+        "slab_bytes": {
+          "bytes": 1073741824.0,
+          "KiB": 1048576.0,
+          "MiB": 1024.0,
+          "GiB": 1.0
+        },
+        "summary_bytes": {
+          "bytes": 34393555192.0,
+          "KiB": 33587456.2421875,
+          "MiB": 32800.25023651123,
+          "GiB": 32.031494371593
+        },
+        "compression_ratio_slab_over_summary": 0.0312192740182252,
+        "compresses": false,
+        "note": "merged root over all ranks is what a fit actually materializes; sizing only the leaf understates the Layout B blow-up"
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          512,
+          128,
+          64,
+          128,
+          8
+        ],
+        "n_ranks": 64,
+        "local_box": [
+          8,
+          128,
+          64
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 1024,
+        "n_features_d": 65536,
+        "n_features_definition": "local Tor1 * Tor2 * Tor3 (grows as the rank count drops)",
+        "n_block_over_d": 0.015625,
+        "regime": "flat",
+        "local_rank_requested": null,
+        "leaf_summary_elements": 67175424,
+        "merged_root_rank": 65536,
+        "merged_root_elements": 4295098368,
+        "slab_elements_per_rank": 67108864,
+        "slab_bytes": {
+          "bytes": 536870912.0,
+          "KiB": 524288.0,
+          "MiB": 512.0,
+          "GiB": 0.5
+        },
+        "summary_bytes": {
+          "bytes": 34360786944.0,
+          "KiB": 33555456.0,
+          "MiB": 32769.0,
+          "GiB": 32.0009765625
+        },
+        "compression_ratio_slab_over_summary": 0.015624523177393268,
+        "compresses": false,
+        "note": "merged root over all ranks is what a fit actually materializes; sizing only the leaf understates the Layout B blow-up"
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          512,
+          128,
+          64,
+          128,
+          8
+        ],
+        "n_ranks": 128,
+        "local_box": [
+          4,
+          128,
+          64
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 1024,
+        "n_features_d": 32768,
+        "n_features_definition": "local Tor1 * Tor2 * Tor3 (grows as the rank count drops)",
+        "n_block_over_d": 0.03125,
+        "regime": "flat",
+        "local_rank_requested": null,
+        "leaf_summary_elements": 33588224,
+        "merged_root_rank": 32768,
+        "merged_root_elements": 1073807360,
+        "slab_elements_per_rank": 33554432,
+        "slab_bytes": {
+          "bytes": 268435456.0,
+          "KiB": 262144.0,
+          "MiB": 256.0,
+          "GiB": 0.25
+        },
+        "summary_bytes": {
+          "bytes": 8590458880.0,
+          "KiB": 8389120.0,
+          "MiB": 8192.5,
+          "GiB": 8.00048828125
+        },
+        "compression_ratio_slab_over_summary": 0.031248092767775404,
+        "compresses": false,
+        "note": "merged root over all ranks is what a fit actually materializes; sizing only the leaf understates the Layout B blow-up"
+      }
+    ],
+    "truncated": [
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          128,
+          32,
+          16,
+          64,
+          8
+        ],
+        "n_ranks": 4,
+        "local_box": [
+          32,
+          32,
+          16
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 512,
+        "n_features_d": 16384,
+        "n_features_definition": "local Tor1 * Tor2 * Tor3 (grows as the rank count drops)",
+        "n_block_over_d": 0.03125,
+        "regime": "flat",
+        "local_rank_requested": 32,
+        "leaf_summary_elements": 540704,
+        "merged_root_rank": 131,
+        "merged_root_elements": 2162819,
+        "slab_elements_per_rank": 8388608,
+        "slab_bytes": {
+          "bytes": 67108864.0,
+          "KiB": 65536.0,
+          "MiB": 64.0,
+          "GiB": 0.0625
+        },
+        "summary_bytes": {
+          "bytes": 17302552.0,
+          "KiB": 16897.0234375,
+          "MiB": 16.500999450683594,
+          "GiB": 0.016114257276058197
+        },
+        "compression_ratio_slab_over_summary": 3.878552944097495,
+        "compresses": true,
+        "note": "merged root over all ranks is what a fit actually materializes; sizing only the leaf understates the Layout B blow-up"
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          128,
+          32,
+          16,
+          64,
+          8
+        ],
+        "n_ranks": 8,
+        "local_box": [
+          16,
+          32,
+          16
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 512,
+        "n_features_d": 8192,
+        "n_features_definition": "local Tor1 * Tor2 * Tor3 (grows as the rank count drops)",
+        "n_block_over_d": 0.0625,
+        "regime": "flat",
+        "local_rank_requested": 32,
+        "leaf_summary_elements": 270368,
+        "merged_root_rank": 263,
+        "merged_root_elements": 2162951,
+        "slab_elements_per_rank": 4194304,
+        "slab_bytes": {
+          "bytes": 33554432.0,
+          "KiB": 32768.0,
+          "MiB": 32.0,
+          "GiB": 0.03125
+        },
+        "summary_bytes": {
+          "bytes": 17303608.0,
+          "KiB": 16898.0546875,
+          "MiB": 16.50200653076172,
+          "GiB": 0.01611524075269699
+        },
+        "compression_ratio_slab_over_summary": 1.9391581223985195,
+        "compresses": true,
+        "note": "merged root over all ranks is what a fit actually materializes; sizing only the leaf understates the Layout B blow-up"
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          128,
+          32,
+          16,
+          64,
+          8
+        ],
+        "n_ranks": 16,
+        "local_box": [
+          8,
+          32,
+          16
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 512,
+        "n_features_d": 4096,
+        "n_features_definition": "local Tor1 * Tor2 * Tor3 (grows as the rank count drops)",
+        "n_block_over_d": 0.125,
+        "regime": "flat",
+        "local_rank_requested": 32,
+        "leaf_summary_elements": 135200,
+        "merged_root_rank": 527,
+        "merged_root_elements": 2163215,
+        "slab_elements_per_rank": 2097152,
+        "slab_bytes": {
+          "bytes": 16777216.0,
+          "KiB": 16384.0,
+          "MiB": 16.0,
+          "GiB": 0.015625
+        },
+        "summary_bytes": {
+          "bytes": 17305720.0,
+          "KiB": 16900.1171875,
+          "MiB": 16.50402069091797,
+          "GiB": 0.01611720770597458
+        },
+        "compression_ratio_slab_over_summary": 0.9694607332142205,
+        "compresses": false,
+        "note": "merged root over all ranks is what a fit actually materializes; sizing only the leaf understates the Layout B blow-up"
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          128,
+          32,
+          16,
+          64,
+          8
+        ],
+        "n_ranks": 32,
+        "local_box": [
+          4,
+          32,
+          16
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 512,
+        "n_features_d": 2048,
+        "n_features_definition": "local Tor1 * Tor2 * Tor3 (grows as the rank count drops)",
+        "n_block_over_d": 0.25,
+        "regime": "flat",
+        "local_rank_requested": 32,
+        "leaf_summary_elements": 67616,
+        "merged_root_rank": 1055,
+        "merged_root_elements": 2163743,
+        "slab_elements_per_rank": 1048576,
+        "slab_bytes": {
+          "bytes": 8388608.0,
+          "KiB": 8192.0,
+          "MiB": 8.0,
+          "GiB": 0.0078125
+        },
+        "summary_bytes": {
+          "bytes": 17309944.0,
+          "KiB": 16904.2421875,
+          "MiB": 16.50804901123047,
+          "GiB": 0.016121141612529755
+        },
+        "compression_ratio_slab_over_summary": 0.484612081933945,
+        "compresses": false,
+        "note": "merged root over all ranks is what a fit actually materializes; sizing only the leaf understates the Layout B blow-up"
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          128,
+          32,
+          16,
+          64,
+          8
+        ],
+        "n_ranks": 64,
+        "local_box": [
+          2,
+          32,
+          16
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 512,
+        "n_features_d": 1024,
+        "n_features_definition": "local Tor1 * Tor2 * Tor3 (grows as the rank count drops)",
+        "n_block_over_d": 0.5,
+        "regime": "flat",
+        "local_rank_requested": 32,
+        "leaf_summary_elements": 33824,
+        "merged_root_rank": 1024,
+        "merged_root_elements": 1050624,
+        "slab_elements_per_rank": 524288,
+        "slab_bytes": {
+          "bytes": 4194304.0,
+          "KiB": 4096.0,
+          "MiB": 4.0,
+          "GiB": 0.00390625
+        },
+        "summary_bytes": {
+          "bytes": 8404992.0,
+          "KiB": 8208.0,
+          "MiB": 8.015625,
+          "GiB": 0.0078277587890625
+        },
+        "compression_ratio_slab_over_summary": 0.49902534113060426,
+        "compresses": false,
+        "note": "merged root over all ranks is what a fit actually materializes; sizing only the leaf understates the Layout B blow-up"
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          128,
+          32,
+          16,
+          64,
+          8
+        ],
+        "n_ranks": 128,
+        "local_box": [
+          1,
+          32,
+          16
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 512,
+        "n_features_d": 512,
+        "n_features_definition": "local Tor1 * Tor2 * Tor3 (grows as the rank count drops)",
+        "n_block_over_d": 1.0,
+        "regime": "square",
+        "local_rank_requested": 32,
+        "leaf_summary_elements": 16928,
+        "merged_root_rank": 512,
+        "merged_root_elements": 263168,
+        "slab_elements_per_rank": 262144,
+        "slab_bytes": {
+          "bytes": 2097152.0,
+          "KiB": 2048.0,
+          "MiB": 2.0,
+          "GiB": 0.001953125
+        },
+        "summary_bytes": {
+          "bytes": 2105344.0,
+          "KiB": 2056.0,
+          "MiB": 2.0078125,
+          "GiB": 0.00196075439453125
+        },
+        "compression_ratio_slab_over_summary": 0.9961089494163424,
+        "compresses": false,
+        "note": "merged root over all ranks is what a fit actually materializes; sizing only the leaf understates the Layout B blow-up"
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          256,
+          64,
+          32,
+          128,
+          8
+        ],
+        "n_ranks": 4,
+        "local_box": [
+          64,
+          64,
+          32
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 1024,
+        "n_features_d": 131072,
+        "n_features_definition": "local Tor1 * Tor2 * Tor3 (grows as the rank count drops)",
+        "n_block_over_d": 0.0078125,
+        "regime": "flat",
+        "local_rank_requested": 32,
+        "leaf_summary_elements": 4325408,
+        "merged_root_rank": 131,
+        "merged_root_elements": 17301635,
+        "slab_elements_per_rank": 134217728,
+        "slab_bytes": {
+          "bytes": 1073741824.0,
+          "KiB": 1048576.0,
+          "MiB": 1024.0,
+          "GiB": 1.0
+        },
+        "summary_bytes": {
+          "bytes": 138413080.0,
+          "KiB": 135169.0234375,
+          "MiB": 132.0009994506836,
+          "GiB": 0.1289072260260582
+        },
+        "compression_ratio_slab_over_summary": 7.757517020790232,
+        "compresses": true,
+        "note": "merged root over all ranks is what a fit actually materializes; sizing only the leaf understates the Layout B blow-up"
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          256,
+          64,
+          32,
+          128,
+          8
+        ],
+        "n_ranks": 8,
+        "local_box": [
+          32,
+          64,
+          32
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 1024,
+        "n_features_d": 65536,
+        "n_features_definition": "local Tor1 * Tor2 * Tor3 (grows as the rank count drops)",
+        "n_block_over_d": 0.015625,
+        "regime": "flat",
+        "local_rank_requested": 32,
+        "leaf_summary_elements": 2162720,
+        "merged_root_rank": 263,
+        "merged_root_elements": 17301767,
+        "slab_elements_per_rank": 67108864,
+        "slab_bytes": {
+          "bytes": 536870912.0,
+          "KiB": 524288.0,
+          "MiB": 512.0,
+          "GiB": 0.5
+        },
+        "summary_bytes": {
+          "bytes": 138414136.0,
+          "KiB": 135170.0546875,
+          "MiB": 132.00200653076172,
+          "GiB": 0.128908209502697
+        },
+        "compression_ratio_slab_over_summary": 3.878728918265978,
+        "compresses": true,
+        "note": "merged root over all ranks is what a fit actually materializes; sizing only the leaf understates the Layout B blow-up"
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          256,
+          64,
+          32,
+          128,
+          8
+        ],
+        "n_ranks": 16,
+        "local_box": [
+          16,
+          64,
+          32
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 1024,
+        "n_features_d": 32768,
+        "n_features_definition": "local Tor1 * Tor2 * Tor3 (grows as the rank count drops)",
+        "n_block_over_d": 0.03125,
+        "regime": "flat",
+        "local_rank_requested": 32,
+        "leaf_summary_elements": 1081376,
+        "merged_root_rank": 527,
+        "merged_root_elements": 17302031,
+        "slab_elements_per_rank": 33554432,
+        "slab_bytes": {
+          "bytes": 268435456.0,
+          "KiB": 262144.0,
+          "MiB": 256.0,
+          "GiB": 0.25
+        },
+        "summary_bytes": {
+          "bytes": 138416248.0,
+          "KiB": 135172.1171875,
+          "MiB": 132.00402069091797,
+          "GiB": 0.12891017645597458
+        },
+        "compression_ratio_slab_over_summary": 1.939334867681141,
+        "compresses": true,
+        "note": "merged root over all ranks is what a fit actually materializes; sizing only the leaf understates the Layout B blow-up"
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          256,
+          64,
+          32,
+          128,
+          8
+        ],
+        "n_ranks": 32,
+        "local_box": [
+          8,
+          64,
+          32
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 1024,
+        "n_features_d": 16384,
+        "n_features_definition": "local Tor1 * Tor2 * Tor3 (grows as the rank count drops)",
+        "n_block_over_d": 0.0625,
+        "regime": "flat",
+        "local_rank_requested": 32,
+        "leaf_summary_elements": 540704,
+        "merged_root_rank": 1055,
+        "merged_root_elements": 17302559,
+        "slab_elements_per_rank": 16777216,
+        "slab_bytes": {
+          "bytes": 134217728.0,
+          "KiB": 131072.0,
+          "MiB": 128.0,
+          "GiB": 0.125
+        },
+        "summary_bytes": {
+          "bytes": 138420472.0,
+          "KiB": 135176.2421875,
+          "MiB": 132.00804901123047,
+          "GiB": 0.12891411036252975
+        },
+        "compression_ratio_slab_over_summary": 0.9696378437432289,
+        "compresses": false,
+        "note": "merged root over all ranks is what a fit actually materializes; sizing only the leaf understates the Layout B blow-up"
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          256,
+          64,
+          32,
+          128,
+          8
+        ],
+        "n_ranks": 64,
+        "local_box": [
+          4,
+          64,
+          32
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 1024,
+        "n_features_d": 8192,
+        "n_features_definition": "local Tor1 * Tor2 * Tor3 (grows as the rank count drops)",
+        "n_block_over_d": 0.125,
+        "regime": "flat",
+        "local_rank_requested": 32,
+        "leaf_summary_elements": 270368,
+        "merged_root_rank": 2111,
+        "merged_root_elements": 17303615,
+        "slab_elements_per_rank": 8388608,
+        "slab_bytes": {
+          "bytes": 67108864.0,
+          "KiB": 65536.0,
+          "MiB": 64.0,
+          "GiB": 0.0625
+        },
+        "summary_bytes": {
+          "bytes": 138428920.0,
+          "KiB": 135184.4921875,
+          "MiB": 132.01610565185547,
+          "GiB": 0.1289219781756401
+        },
+        "compression_ratio_slab_over_summary": 0.48478933448299677,
+        "compresses": false,
+        "note": "merged root over all ranks is what a fit actually materializes; sizing only the leaf understates the Layout B blow-up"
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          256,
+          64,
+          32,
+          128,
+          8
+        ],
+        "n_ranks": 128,
+        "local_box": [
+          2,
+          64,
+          32
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 1024,
+        "n_features_d": 4096,
+        "n_features_definition": "local Tor1 * Tor2 * Tor3 (grows as the rank count drops)",
+        "n_block_over_d": 0.25,
+        "regime": "flat",
+        "local_rank_requested": 32,
+        "leaf_summary_elements": 135200,
+        "merged_root_rank": 4096,
+        "merged_root_elements": 16785408,
+        "slab_elements_per_rank": 4194304,
+        "slab_bytes": {
+          "bytes": 33554432.0,
+          "KiB": 32768.0,
+          "MiB": 32.0,
+          "GiB": 0.03125
+        },
+        "summary_bytes": {
+          "bytes": 134283264.0,
+          "KiB": 131136.0,
+          "MiB": 128.0625,
+          "GiB": 0.12506103515625
+        },
+        "compression_ratio_slab_over_summary": 0.24987798926305516,
+        "compresses": false,
+        "note": "merged root over all ranks is what a fit actually materializes; sizing only the leaf understates the Layout B blow-up"
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          512,
+          128,
+          64,
+          128,
+          8
+        ],
+        "n_ranks": 4,
+        "local_box": [
+          128,
+          128,
+          64
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 1024,
+        "n_features_d": 1048576,
+        "n_features_definition": "local Tor1 * Tor2 * Tor3 (grows as the rank count drops)",
+        "n_block_over_d": 0.0009765625,
+        "regime": "flat",
+        "local_rank_requested": 32,
+        "leaf_summary_elements": 34603040,
+        "merged_root_rank": 131,
+        "merged_root_elements": 138412163,
+        "slab_elements_per_rank": 1073741824,
+        "slab_bytes": {
+          "bytes": 8589934592.0,
+          "KiB": 8388608.0,
+          "MiB": 8192.0,
+          "GiB": 8.0
+        },
+        "summary_bytes": {
+          "bytes": 1107297304.0,
+          "KiB": 1081345.0234375,
+          "MiB": 1056.0009994506836,
+          "GiB": 1.0312509760260582
+        },
+        "compression_ratio_slab_over_summary": 7.757568415428924,
+        "compresses": true,
+        "note": "merged root over all ranks is what a fit actually materializes; sizing only the leaf understates the Layout B blow-up"
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          512,
+          128,
+          64,
+          128,
+          8
+        ],
+        "n_ranks": 8,
+        "local_box": [
+          64,
+          128,
+          64
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 1024,
+        "n_features_d": 524288,
+        "n_features_definition": "local Tor1 * Tor2 * Tor3 (grows as the rank count drops)",
+        "n_block_over_d": 0.001953125,
+        "regime": "flat",
+        "local_rank_requested": 32,
+        "leaf_summary_elements": 17301536,
+        "merged_root_rank": 263,
+        "merged_root_elements": 138412295,
+        "slab_elements_per_rank": 536870912,
+        "slab_bytes": {
+          "bytes": 4294967296.0,
+          "KiB": 4194304.0,
+          "MiB": 4096.0,
+          "GiB": 4.0
+        },
+        "summary_bytes": {
+          "bytes": 1107298360.0,
+          "KiB": 1081346.0546875,
+          "MiB": 1056.0020065307617,
+          "GiB": 1.031251959502697
+        },
+        "compression_ratio_slab_over_summary": 3.878780508624613,
+        "compresses": true,
+        "note": "merged root over all ranks is what a fit actually materializes; sizing only the leaf understates the Layout B blow-up"
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          512,
+          128,
+          64,
+          128,
+          8
+        ],
+        "n_ranks": 16,
+        "local_box": [
+          32,
+          128,
+          64
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 1024,
+        "n_features_d": 262144,
+        "n_features_definition": "local Tor1 * Tor2 * Tor3 (grows as the rank count drops)",
+        "n_block_over_d": 0.00390625,
+        "regime": "flat",
+        "local_rank_requested": 32,
+        "leaf_summary_elements": 8650784,
+        "merged_root_rank": 527,
+        "merged_root_elements": 138412559,
+        "slab_elements_per_rank": 268435456,
+        "slab_bytes": {
+          "bytes": 2147483648.0,
+          "KiB": 2097152.0,
+          "MiB": 2048.0,
+          "GiB": 2.0
+        },
+        "summary_bytes": {
+          "bytes": 1107300472.0,
+          "KiB": 1081348.1171875,
+          "MiB": 1056.004020690918,
+          "GiB": 1.0312539264559746
+        },
+        "compression_ratio_slab_over_summary": 1.9393865552330407,
+        "compresses": true,
+        "note": "merged root over all ranks is what a fit actually materializes; sizing only the leaf understates the Layout B blow-up"
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          512,
+          128,
+          64,
+          128,
+          8
+        ],
+        "n_ranks": 32,
+        "local_box": [
+          16,
+          128,
+          64
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 1024,
+        "n_features_d": 131072,
+        "n_features_definition": "local Tor1 * Tor2 * Tor3 (grows as the rank count drops)",
+        "n_block_over_d": 0.0078125,
+        "regime": "flat",
+        "local_rank_requested": 32,
+        "leaf_summary_elements": 4325408,
+        "merged_root_rank": 1055,
+        "merged_root_elements": 138413087,
+        "slab_elements_per_rank": 134217728,
+        "slab_bytes": {
+          "bytes": 1073741824.0,
+          "KiB": 1048576.0,
+          "MiB": 1024.0,
+          "GiB": 1.0
+        },
+        "summary_bytes": {
+          "bytes": 1107304696.0,
+          "KiB": 1081352.2421875,
+          "MiB": 1056.0080490112305,
+          "GiB": 1.0312578603625298
+        },
+        "compression_ratio_slab_over_summary": 0.9696895785584205,
+        "compresses": false,
+        "note": "merged root over all ranks is what a fit actually materializes; sizing only the leaf understates the Layout B blow-up"
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          512,
+          128,
+          64,
+          128,
+          8
+        ],
+        "n_ranks": 64,
+        "local_box": [
+          8,
+          128,
+          64
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 1024,
+        "n_features_d": 65536,
+        "n_features_definition": "local Tor1 * Tor2 * Tor3 (grows as the rank count drops)",
+        "n_block_over_d": 0.015625,
+        "regime": "flat",
+        "local_rank_requested": 32,
+        "leaf_summary_elements": 2162720,
+        "merged_root_rank": 2111,
+        "merged_root_elements": 138414143,
+        "slab_elements_per_rank": 67108864,
+        "slab_bytes": {
+          "bytes": 536870912.0,
+          "KiB": 524288.0,
+          "MiB": 512.0,
+          "GiB": 0.5
+        },
+        "summary_bytes": {
+          "bytes": 1107313144.0,
+          "KiB": 1081360.4921875,
+          "MiB": 1056.0161056518555,
+          "GiB": 1.03126572817564
+        },
+        "compression_ratio_slab_over_summary": 0.48484109026344224,
+        "compresses": false,
+        "note": "merged root over all ranks is what a fit actually materializes; sizing only the leaf understates the Layout B blow-up"
+      },
+      {
+        "mesh_tor1_tor2_tor3_vpar_mu": [
+          512,
+          128,
+          64,
+          128,
+          8
+        ],
+        "n_ranks": 128,
+        "local_box": [
+          4,
+          128,
+          64
+        ],
+        "ranks_unplaced_after_layout": 1,
+        "n_samples_per_rank": 1024,
+        "n_features_d": 32768,
+        "n_features_definition": "local Tor1 * Tor2 * Tor3 (grows as the rank count drops)",
+        "n_block_over_d": 0.03125,
+        "regime": "flat",
+        "local_rank_requested": 32,
+        "leaf_summary_elements": 1081376,
+        "merged_root_rank": 4223,
+        "merged_root_elements": 138416255,
+        "slab_elements_per_rank": 33554432,
+        "slab_bytes": {
+          "bytes": 268435456.0,
+          "KiB": 262144.0,
+          "MiB": 256.0,
+          "GiB": 0.25
+        },
+        "summary_bytes": {
+          "bytes": 1107330040.0,
+          "KiB": 1081376.9921875,
+          "MiB": 1056.0322189331055,
+          "GiB": 1.0312814638018608
+        },
+        "compression_ratio_slab_over_summary": 0.24241684620061424,
+        "compresses": false,
+        "note": "merged root over all ranks is what a fit actually materializes; sizing only the leaf understates the Layout B blow-up"
+      }
+    ]
+  }
+}
