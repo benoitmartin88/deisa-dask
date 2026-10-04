@@ -121,6 +121,7 @@ Repository constraints honoured here
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -291,6 +292,133 @@ _PCASummary = PCASummary
 _local_pca = local_pca
 _merge_pca = merge_pca
 _merge_tree = merge_tree
+
+
+# =============================================================================
+# The bridge-side leaf: the ONE local decomposition both paths call
+# =============================================================================
+def _flatten_chunk_to_2d(chunk: np.ndarray, axis_names, feature_axes, sample_axes) -> np.ndarray:
+    """Flatten one BRIDGE-LOCAL numpy chunk to ``(n_samples, n_features)`` under the estimator's axis policy.
+
+    This is deliberately the same policy the estimator applies to a Dask array, re-implemented for a numpy array so
+    the bridge leaf needs no Dask machinery: the estimator's :meth:`MergeablePCA._as_2d` calls ``moveaxis`` +
+    ``reshape`` on a ``da.Array``, and neither exists for a raw numpy chunk. Sharing the axis CLASSIFICATION with the
+    estimator (:func:`_partition_axes`) while doing the flattening with numpy here is what keeps one authority for
+    "which axis is a feature" and one implementation for "how to get from the chunk to a matrix".
+
+    The 2-D case is returned untouched, byte for byte, so the common deisa-dask case (a 2-D field split over ranks)
+    goes through the bridge with no reshape at all.
+
+    - ``:param chunk:`` The bridge's own numpy chunk, of any dimensionality.
+    - ``:param axis_names:`` The estimator's ``axis_names``, or ``None``.
+    - ``:param feature_axes:`` The estimator's ``feature_axes``, or ``None``.
+    - ``:param sample_axes:`` The estimator's ``sample_axes``, or ``None``.
+    """
+    X = np.asarray(chunk)
+    ndim = int(X.ndim)
+    if ndim == 2:
+        # The common case. Check the declared policy still names THIS axis partition rather than silently ignoring it:
+        # a user who declared axis_names for a 2-D array gets it verified, not bypassed.
+        if axis_names is not None and len(tuple(axis_names)) != 2:
+            raise ValueError(
+                f"local_pca: axis_names has {len(tuple(axis_names))} names but the chunk has {ndim} axes. Give exactly "
+                "one name per axis of the registered array, or None to classify the axes by position."
+            )
+        return X
+    if axis_names is not None and len(tuple(axis_names)) != ndim:
+        raise ValueError(
+            f"local_pca: axis_names has {len(tuple(axis_names))} names but the chunk has {ndim} axes. Give exactly one "
+            "name per axis of the registered array, or None to classify the axes by position."
+        )
+    if ndim < 2:
+        raise ValueError(
+            f"local_pca: a bridge chunk must be 2-dimensional or more (one sample axis, one feature axis), got "
+            f"ndim={ndim}. PCA on a bare vector is undefined, so the bridge cannot summarize it."
+        )
+    features, samples = _partition_axes(ndim, axis_names, feature_axes, sample_axes)
+    n_features = 1
+    for axis in features:
+        n_features *= int(X.shape[axis])
+    n_samples = 1
+    for axis in samples:
+        n_samples *= int(X.shape[axis])
+    # np.transpose moves the SAMPLE axes first and the feature axes last (the same order ``_as_2d`` asks dask for),
+    # then np.reshape collapses each sample cell into one feature column. Value-preserving and value-order identical
+    # to the dask path, so a bridge-side and a standalone fit agree.
+    permutation = samples + features
+    if permutation != tuple(range(ndim)):
+        X = np.transpose(X, axes=permutation)
+    return np.reshape(X, (n_samples, n_features))
+
+
+def local_pca_from_chunk(
+    chunk: np.ndarray,
+    rank: int | None = None,
+    axis_names: Sequence[str] | None = None,
+    feature_axes: object = None,
+    sample_axes: object = None,
+) -> PCASummary:
+    """Summarize ONE bridge-local chunk under the estimator's axis policy. The bridge branch's callable.
+
+    Why this exists next to :func:`local_pca`: the bridge hands a numpy chunk, not a Dask array, so the axis policy
+    that turns a multi-dimensional field into ``(n_samples, n_features)`` has to be applied to numpy. Routing BOTH
+    sides through this one function is what makes "bridge-side == standalone" testable rather than merely asserted:
+    the bridge calls this, the estimator's own leaf calls :func:`local_pca` on the already-flattened block, and both
+    bottom out in the identical SVD-and-mean code with no second implementation to drift.
+
+    A 2-D chunk takes the identical path :func:`local_pca` takes, because the policy leaves it untouched. A chunk
+    whose feature dimension is SPLIT across ranks is refused rather than summarized: every per-bridge summary must
+    span the same ``d`` for the merge to stack them, and a summary over half the features describes a different
+    problem, not a smaller one.
+
+    - ``:param chunk:`` This bridge's numpy chunk, of any dimensionality.
+    - ``:param rank:`` Maximum retained rank, or ``None`` for the full local rank ``min(n_samples, n_features)``.
+    - ``:param axis_names:`` One name per axis of the registered array, or ``None`` to classify by position.
+    - ``:param feature_axes:`` Which axes are features, by name or position, or ``None`` for the default policy.
+    - ``:param sample_axes:`` Which axes are samples, by name or position, or ``None`` for every non-feature axis.
+    """
+    block = _flatten_chunk_to_2d(chunk, axis_names, feature_axes, sample_axes)
+    return local_pca(block, rank=rank)
+
+
+def _pca_branch_func(chunk, _rank=None, _axis_names=None, _feature_axes=None, _sample_axes=None) -> PCASummary:
+    """Module-level bridge callable for a ``pca`` branch; bound by :func:`_build_pca_branch_func`.
+
+    It exists so the ``branch_func`` that crosses the bridge process boundary is a :func:`functools.partial` over a
+    module-level target, never a local ``def``: the HandshakeActor deserializes branches in another process, and a
+    closure raises ``AttributeError: Can't get local object`` there. The underscore-prefixed keyword arguments are the
+    bound ones, matching the ``_chain`` convention already used by :func:`_chain_branch_func`.
+
+    - ``:param chunk:`` This bridge's numpy chunk.
+    - ``:param _rank:`` Bound local rank, or ``None`` for full local rank.
+    - ``:param _axis_names:`` Bound axis names, or ``None``.
+    - ``:param _feature_axes:`` Bound feature-axis specification, or ``None``.
+    - ``:param _sample_axes:`` Bound sample-axis specification, or ``None``.
+    """
+    return local_pca_from_chunk(
+        chunk,
+        rank=_rank,
+        axis_names=_axis_names,
+        feature_axes=_feature_axes,
+        sample_axes=_sample_axes,
+    )
+
+
+def _build_pca_branch_func(local_rank, axis_names, feature_axes, sample_axes):
+    """Compose a ``pca`` branch's ``branch_func``: a module-level partial over :func:`_pca_branch_func`.
+
+    - ``:param local_rank:`` The requested per-leaf rank, or ``None`` for full local rank.
+    - ``:param axis_names:`` The estimator's axis names, or ``None``.
+    - ``:param feature_axes:`` The estimator's feature-axis specification, or ``None``.
+    - ``:param sample_axes:`` The estimator's sample-axis specification, or ``None``.
+    """
+    return functools.partial(
+        _pca_branch_func,
+        _rank=local_rank,
+        _axis_names=None if axis_names is None else tuple(axis_names),
+        _feature_axes=feature_axes,
+        _sample_axes=sample_axes,
+    )
 
 
 # =============================================================================
@@ -500,6 +628,11 @@ class MergeablePCA:
     vanish at ``R >= d``. There is no universally safe ``R``; :meth:`fit` refuses the one combination that cannot work
     at all (a root rank below ``n_components``) instead of silently returning fewer components.
 
+    ``n_components=None`` is the one request that a truncated merge cannot satisfy either, and it is refused for the
+    same reason: "keep everything" asks for ``min(n_samples, n_features)`` components, which a truncated merge does not
+    reach. The invariant ``n_components_ == components_.shape[0]`` holds for every configuration that fits, so a caller
+    sizing a buffer from ``n_components_`` always gets the width it is promised.
+
     n-dimensional input: the axis policy
     ------------------------------------
     An array of more than two dimensions does not say which axes are SAMPLES (rows) and which are FEATURES (columns),
@@ -702,15 +835,27 @@ class MergeablePCA:
     def fit(self, X, y=None) -> MergeablePCA:
         """Fit the estimator and return ``self``.
 
-        A dask array is fitted through :meth:`_fit_dask_delayed`; a numpy array takes the in-memory path, which is the
-        single-leaf base case of the same tree. Input of any dimensionality is accepted under the axis policy described
-        in this class's docstring: the array is transposed so the feature axes come last, then reshaped to
-        ``(n_samples, n_features)`` before anything else happens.
+        Three paths, all ending in the SAME root state (``_summary_`` plus the materialized public attributes), so
+        "in-situ on the bridge" and "standalone on Dask" cannot drift apart:
+
+        - A **delivered** array (one carrying ``_deisa_pca_summary``, i.e. the per-bridge dispatch view deisa-dask
+          hands a callback when the local PCA ran on the MPI bridge) takes :meth:`_fit_delivered`. The merge tree
+          over the per-bridge summaries has already run; this only adopts the root summary.
+        - A **dask array** is fitted through :meth:`_fit_dask_delayed` / :meth:`_fit_dask`.
+        - A **numpy array** takes the in-memory path, the single-leaf base case of the same tree.
+
+        Input of any dimensionality is accepted under the axis policy described in this class's docstring: the array is
+        transposed so the feature axes come last, then reshaped to ``(n_samples, n_features)`` before anything else
+        happens.
 
         - ``:param X:`` Array of ``n_samples * n_features`` values, dask or numpy, 2-D or more. For more than two
           dimensions, ``axis_names`` / ``feature_axes`` / ``sample_axes`` say which axes are which.
         - ``:param y:`` Accepted and ignored, for scikit-learn parity.
         """
+        delivered = getattr(X, "_deisa_pca_summary", None)
+        if delivered is not None:
+            return self._fit_delivered(delivered, X)
+
         array = X if isinstance(X, da.Array) else da.asarray(X)
         flat = self._as_2d(array)
         self._validate_input(flat)
@@ -734,11 +879,113 @@ class MergeablePCA:
             # In-memory: one leaf, the base case of the merge tree. Still routed through the same primitive.
             summary = local_pca(np.asarray(flat), rank=self.local_rank)
 
+        return self._adopt_summary(summary, n_features)
+
+    def _adopt_summary(self, summary: PCASummary, n_features: int) -> MergeablePCA:
+        """Install a merged root summary as this estimator's state, after the two guards, and return ``self``.
+
+        The single root of all three ``fit`` paths. Order matters and is the reason this is one method rather than
+        three copies: ``_check_root_rank`` refuses an ``n_components`` the merged rank cannot satisfy BEFORE any
+        public attribute is published, and ``_check_summary_smaller_than_input`` refuses a summary that would not
+        compress the data it summarizes. Both guards read the summary, so running them here means the bridge path is
+        held to exactly the same contract as the standalone one.
+
+        - ``:param summary:`` The merged root summary, untruncated and unwhitened, i.e. still mergeable.
+        - ``:param n_features:`` Feature dimension ``d``, i.e. ``summary.mean.shape[0]``.
+        """
+        self.n_features_in_ = int(n_features)
         self._summary_ = summary
         self._check_root_rank(summary)
-        self._check_summary_smaller_than_input(summary, n_features)
+        self._check_summary_smaller_than_input(summary, int(n_features))
         self._materialize_public_attributes(summary)
         return self
+
+    def _declared_feature_count(self, registered_shape) -> int | None:
+        """The feature dimension ``d`` the REGISTERED array declares, under this estimator's axis policy.
+
+        Read from the REGISTERED shape, never from the array handed to :meth:`fit`. Those are different things on the
+        bridge path: a PCA-only dispatch view is instantiated from :meth:`Deisa._pca_carrier_array`, whose shape is 1
+        along every axis by construction, because it carries no field data and must never be read as the array the
+        callback asked about. Its ``shape[-1]`` is 1 for every registered array of every dimensionality, which is why
+        cross-checking a summary against it refused EVERY legitimate fit with ``d != 1``.
+
+        The classification goes through the same :func:`_partition_axes` policy :meth:`_as_2d` applies, so the count
+        agrees with the layout the bridge summarized under by construction rather than by coincidence: a multi-axis
+        feature dimension multiplies out exactly as the reshape to ``(n_samples, n_features)`` would.
+
+        Returns ``None`` when the shape is absent or unusable, meaning "unknown" -- the caller then trusts the summary
+        rather than refusing a fit it has nothing to contradict.
+
+        - ``:param registered_shape:`` ``shape`` of the REGISTERED array, or ``None`` when unknown.
+        """
+        shape = tuple(registered_shape or ())
+        ndim = len(shape)
+        if ndim < 2:
+            # A bare vector has no sample/feature partition (see ``_as_2d``), so there is no declared count to report.
+            # Returning None keeps that refusal in one place instead of duplicating it here.
+            return None
+        if self.axis_names is not None and len(self.axis_names) != ndim:
+            # Wrong-length names would resolve to axes that do not exist. Not this method's refusal to make: ``_as_2d``
+            # already refuses it on the non-delivered paths, and the delivered path has no data to classify.
+            return None
+        features, _ = _partition_axes(ndim, self.axis_names, self.feature_axes, self.sample_axes)
+        n_features = 1
+        for axis in features:
+            n_features *= int(shape[axis])
+        return int(n_features)
+
+    def _fit_delivered(self, delivered, X) -> MergeablePCA:
+        """Adopt a summary that was already merged from per-bridge summaries computed ON the bridges.
+
+        This is the in-situ placement: the local PCA ran inside the MPI bridge process, where the simulation data
+        already lives, so only a compact summary crossed the process/network boundary and the merge tree ran over
+        those summaries on the Dask side. The merge algebra is the classical one documented in this module
+        (Chan-Golub-LeVeque 1979 for the mean correction; Qin & Yan, arXiv:1601.07010, and Kjolstad/Demmel et al.,
+        arXiv:1710.02812, for the tree); what is claimed as ours is only WHERE the leaves are evaluated.
+
+        The leaf primitive is literally :func:`local_pca` -- the same function the standalone estimator calls -- so
+        "bridge-side == standalone" is a single-implementation property rather than a claim.
+
+        ``n_components`` and ``whiten`` are applied HERE, at the root, and nowhere else: truncating or whitening
+        mid-tree would destroy mergeability and exactness. The delivered object is the MERGEABLE summary (rank up to
+        each leaf's local rank), never the truncated public representation.
+
+        The feature-dimension check is the one guard this path adds, and it reads the REGISTERED shape the delivery
+        carries, never the array the callback passed. That distinction is the whole fix: the dispatch view is built
+        from a one-element placeholder carrier (:meth:`Deisa._pca_carrier_array`) whose ``shape[-1]`` is 1 for every
+        registered array, so cross-checking against the carrier's own shape refused every legitimate fit with
+        ``d != 1``. With ``d`` declared by the registered metadata under the same axis policy the bridge summarized
+        under, the guard still catches a summary describing a DIFFERENT feature basis -- it now compares two real
+        counts instead of a real one and a placeholder.
+
+        - ``:param delivered:`` The merge tree over the per-bridge summaries: a ``Delayed``, a Dask collection, or an
+          already-materialized :class:`PCASummary`. Anything with ``.compute()`` is computed first.
+        - ``:param X:`` The array the callback passed in, used only to locate the registered shape when the view
+          carries none.
+        """
+        summary = delivered.compute() if hasattr(delivered, "compute") else delivered
+        if not isinstance(summary, PCASummary):
+            raise ValueError(
+                f"MergeablePCA: the delivered in-situ summary is a {type(summary).__name__}, not a PCASummary. "
+                "The bridge-side PCA branch must emit the mergeable summary (local_pca's return value) so it can be "
+                "merged; refusing rather than reading the wrong fields."
+            )
+        n_features = int(summary.mean.shape[0])
+        # The registered shape first (the delivery path stamps it), then the array's own shape as the fallback for a
+        # view that was built without registered metadata. The carrier's own shape is NEVER authoritative: it is 1 along
+        # every axis by construction and carries no field data.
+        registered_shape = getattr(X, "_deisa_registered_shape", None)
+        declared = self._declared_feature_count(registered_shape)
+        if declared is None and getattr(X, "ndim", 0) >= 2:
+            declared = self._declared_feature_count(getattr(X, "shape", ()))
+        if declared is not None and declared != n_features:
+            raise ValueError(
+                f"MergeablePCA: the delivered summary spans {n_features} features but the array it was requested "
+                f"for has {declared}. The per-bridge summaries were computed over a different feature basis, so "
+                "merging them against this array would project onto the wrong components. Check that every bridge "
+                "owns the COMPLETE feature dimension (rechunk any feature axis into one chunk)."
+            )
+        return self._adopt_summary(summary, n_features)
 
     def fit_transform(self, X, y=None):
         """Fit, then project ``X`` onto the components. Returns the projection, not the estimator.
@@ -863,9 +1110,28 @@ class MergeablePCA:
         with tree depth (see this module's rank-saturation note), so whether the request is satisfiable is only known at
         the root. ``n_components <= min(n_samples, n_features)`` alone cannot answer it.
 
+        ``n_components=None`` means "keep everything", which is a request for ``min(n_samples, n_features)`` components
+        and so needs the same guard: the merged rank only reaches that ceiling when the leaves are full rank. A
+        truncating ``local_rank`` leaves the root short, and slicing to the declared count would then publish fewer
+        components than ``n_components_`` claims -- the invariant ``n_components_ == components_.shape[0]`` would break
+        and every caller sizing a buffer from ``n_components_`` would get the wrong width. Measured on
+        ``(1024, 12)`` over 4 row blocks: ``local_rank=2`` reaches rank 11, ``local_rank=3`` reaches 12.
+
         - ``:param summary:`` The merged root summary, before the public attributes are materialized.
         """
-        if self.n_components is not None and summary.rank < self.n_components:
+        requested = self.n_components
+        if requested is None:
+            requested = min(int(summary.n_samples), int(self.n_features_in_))
+            if summary.rank >= requested:
+                return
+            raise ValueError(
+                f"MergeablePCA: n_components=None asks for all {requested} components "
+                f"(min(n_samples={int(summary.n_samples)}, n_features={int(self.n_features_in_)})), but the merge "
+                f"with local_rank={self.local_rank} only reached rank {summary.rank}. "
+                "Remedy: pass local_rank=None (or a larger local_rank) so the merge is exact, or pass an explicit "
+                "n_components that the merge can reach."
+            )
+        if summary.rank < requested:
             raise ValueError(
                 f"MergeablePCA: root summary rank {summary.rank} < n_components={self.n_components}. "
                 "Increase local_rank, use more or finer row blocks, or reduce n_components."
@@ -905,6 +1171,12 @@ class MergeablePCA:
         """
         n_samples = int(summary.n_samples)
         keep = min(n_samples, self.n_features_in_) if self.n_components is None else self.n_components
+        # numpy slicing clamps silently, so `keep` above is a REQUEST, not a guarantee: a truncated merge can leave
+        # fewer rows than requested and the slice would publish fewer components than n_components_ claims. Clamping
+        # here makes the invariant n_components_ == components_.shape[0] hold by construction for every code path,
+        # independently of which guards ran. _check_root_rank is what turns a short keep into a refusal rather than a
+        # quiet truncation; this clamp is the backstop that keeps the two numbers equal if that guard is ever bypassed.
+        keep = min(int(keep), int(summary.rank))
         self.n_components_ = int(keep)
         self.singular_values_ = np.asarray(summary.singular_values[:keep], dtype=np.float64)
         self.components_ = np.asarray(summary.components[:keep], dtype=np.float64)
