@@ -1,8 +1,8 @@
 {
   "provenance": {
     "script": "b1_network_transfer",
-    "description": "Network transfer between the bridge and the analytics engine: legacy full-chunk scatter versus bridge-side mergeable PCA summary. Measures only the configurations the paper reports -- the lead configuration at its true shape, its rank-truncated counterpart, the flat-regime no-compression rows, and full-rank points straddling ratio 1.0.",
-    "generated_utc": "2026-10-05T10:06:59.614812+00:00",
+    "description": "Network transfer between the bridge and the analytics engine: legacy full-chunk scatter versus bridge-side mergeable PCA summary. Measures only the byte ratio the paper reports, and only at the configurations it reports -- the lead configuration at its true shape, its rank-truncated counterpart, the tall-regime floor, and the flat-regime range end to end.",
+    "generated_utc": "2026-10-05T12:32:07.601932+00:00",
     "seed": 20261004,
     "machine": {
       "hostname": "06b0a0d72d59",
@@ -14,7 +14,7 @@
       "cpu_count_physical": 20,
       "total_memory_bytes": 135048007680,
       "cgroup_memory_limit_bytes": 107374182400,
-      "cgroup_memory_current_bytes": 2837893120,
+      "cgroup_memory_current_bytes": 3419619328,
       "numpy_blas": "scipy-openblas",
       "numpy_lapack": "scipy-openblas",
       "thread_env": {
@@ -25,14 +25,7 @@
         "VECLIB_MAXIMUM_THREADS": null
       }
     },
-    "timing_policy": {
-      "clock": "time.perf_counter",
-      "warmup_rounds": 1,
-      "timed_repeats": 1,
-      "statistic": "median",
-      "dispersion": "min/max/iqr/stddev reported alongside the median",
-      "note": "restated to 1 from TIMING_POLICY's default of 5, because each configuration is measured once and reports a deterministic ratio rather than a timed distribution"
-    },
+    "timing_policy": {},
     "versions": {
       "numpy": "2.5.1",
       "dask": "2026.7.1",
@@ -43,7 +36,7 @@
       "dask-ml": "2025.1.0",
       "psutil": "7.2.2"
     },
-    "deisa_dask_commit": "9a83d9b891d3b05572c314b4e5322d12b142a8c2",
+    "deisa_dask_commit": "71dd446c6205489685659871810a49311f5ae9f4",
     "gysela_sources": {
       "gyselalibxx": {
         "repository": "https://github.com/gyselax/gyselalibxx",
@@ -59,8 +52,10 @@
       }
     },
     "disclaimer": "The gysela mesh extents used by the sizing experiments are SYNTHETIC parameter points chosen to span a range of shapes in the same family as the application's index ranges. They are NOT read from a production input file and no gysela build was run on this machine; the arrays are simulated in numpy from the TYPE and LAYOUT semantics of the pinned C++ sources.",
+    "timing_policy_why": "deliberately emptied, not accidentally: this run reports a byte ratio and a serialized size is deterministic given its input, so there is no timing to report and no policy to declare. There is no repeat count anywhere in this artifact, because a count of 1 with a median and no dispersion behind it is the provenance defect the shared harness exists to catch",
     "inputs": {
       "feature_dims": [
+        32,
         128,
         256,
         512
@@ -79,14 +74,20 @@
           "claim_supported": "rank_truncation_local_rank_8"
         },
         {
-          "n_block": 256,
-          "d": 512,
+          "n_block": 64,
+          "d": 32,
           "local_rank": null,
-          "claim_supported": "crossover_full_rank_point"
+          "claim_supported": "tall_regime_floor"
         },
         {
-          "n_block": 128,
+          "n_block": 4096,
           "d": 512,
+          "local_rank": null,
+          "claim_supported": "tall_regime_ceiling"
+        },
+        {
+          "n_block": 8,
+          "d": 32,
           "local_rank": null,
           "claim_supported": "flat_regime_no_compression"
         },
@@ -95,29 +96,41 @@
           "d": 128,
           "local_rank": null,
           "claim_supported": "flat_regime_no_compression"
+        },
+        {
+          "n_block": 128,
+          "d": 512,
+          "local_rank": null,
+          "claim_supported": "flat_regime_no_compression"
+        },
+        {
+          "n_block": 512,
+          "d": 512,
+          "local_rank": null,
+          "claim_supported": "flat_regime_no_compression"
         }
       ],
       "intrinsic_rank_fraction_of_d": 0.25,
       "peak_multiple_input": 6.0,
-      "safety_fraction_input": 0.6,
-      "wall_clock_budget_seconds": 1200,
-      "wall_clock_budget_enforced": "checked between phases, not only between configurations: a single SVD cannot be interrupted once started, so a check at configuration boundaries alone would be discovered one configuration late",
-      "repeats_per_configuration": 1
+      "safety_fraction_input": 0.6
     },
     "memory_policy": {
       "cap_bytes": 107374182400,
       "cap_source": "/sys/fs/cgroup/memory.max (cgroup v2), else memory.limit_in_bytes (v1)",
       "budget_bytes": 64424509440.0,
       "preflight_gate": "refuse a point whose block_bytes * PEAK_MULTIPLE_INPUT exceeds cap * SAFETY_FRACTION, BEFORE allocating it, because a cgroup exhaustion is a SIGKILL that except MemoryError cannot catch",
-      "peak_rss_source": "/proc/self/status VmHWM, reset per configuration via /proc/self/clear_refs",
-      "peak_rss_resettable": true
+      "peak_rss_reported": false,
+      "peak_rss_why": "deliberately absent, not unavailable. The blocks measured here run from 2 KiB to 16 MiB, so a per-configuration peak RSS is dominated by the interpreter's own footprint and reads within a few percent of the same value on every row including the 2 KiB one. Reporting it would be a column that looks like a measurement while carrying no per-configuration information. Peak memory on the analytics side is B2's question, and B2 is a separate experiment"
     },
     "serialization": "distributed.protocol.serialize(to_serialize(...)), the same call Bridge._scatter_partials makes before scatter_to_workers; numbers are on-the-wire payload sizes including pickle framing",
-    "wall_clock_seconds_measured": 0.5710535878315568,
-    "scope": "bridge-side compute is the contribution: the local decomposition runs on the bridge where the field already resides and only a mergeable summary crosses. The reduction in the volume that crosses the boundary is the result. No local in-process speed number in this artifact is a benefit"
+    "scope": "the contribution measured here is the TRANSFER REDUCTION: the local decomposition runs on the bridge where the field already resides and only a mergeable summary crosses, so the result is the reduction in the volume that crosses the boundary. Local in-process cost is OUT OF SCOPE and is not reported here; it belongs to the baseline experiment, which measures the same decomposition against NumPy, SciPy and scikit-learn",
+    "ratio_definitions": {
+      "compression_ratio_legacy_vs_pca_wire": "the headline ratio the paper prints: legacy_wire_bytes / pca_wire_bytes, both measured through the same serializer, so it is a ratio of two wire payloads",
+      "compression_ratio_full_rank_vs_data": "block_bytes / summary_bytes on RAW float64 payload, i.e. before pickle framing. Retained because it is what explains WHY a configuration compresses or does not: it isolates the payload arithmetic from the framing overhead, which is the whole reason the flat ratios sit just below 1.0 rather than at 1.0"
+    }
   },
   "paper_claims_supported": {
-    "what_this_is": "the four claims the paper reports from this experiment, each mapped to the rows that back it. A configuration exists in this run only because one of these needs a row behind it",
+    "what_this_is": "the five claims the paper reports from this experiment, each mapped to the rows that back it. A configuration exists in this run only because one of these needs a row behind it, or because one of them quotes a range bound that otherwise has no row behind it",
     "headline_full_rank_network_transfer": {
       "claim": "the lead network-transfer number: a 4.000 MiB chunk against a 0.5042 MiB full-rank summary, a 7.9x reduction",
       "configuration": {
@@ -170,44 +183,91 @@
         "ratio": 223.66213405855063
       }
     },
+    "tall_regime_range": {
+      "claim": "at full local rank the summary is smaller than the chunk in every tall configuration, by 1.83x to 7.97x. Both ends are quoted, so both ends are measured: HEADLINE at 2048x256 is NOT the ceiling and does not produce 7.97x",
+      "floor_configuration": {
+        "n_block": 64,
+        "d": 32,
+        "local_rank": null
+      },
+      "ceiling_configuration": {
+        "n_block": 4096,
+        "d": 512,
+        "local_rank": null
+      },
+      "floor_measured_here": true,
+      "ceiling_measured_here": true,
+      "measured_values": {
+        "floor": 1.8325519089082385,
+        "ceiling": 7.967906580680213
+      },
+      "tall_ratios_measured": [
+        1.8325519089082385,
+        7.934155942668304,
+        7.967906580680213
+      ],
+      "paper_quoted_range": {
+        "min": 1.83,
+        "max": 7.97
+      },
+      "quoted_range_is_reproduced": true,
+      "note": "the paper quotes this range as 1.83x to 7.97x. The floor is n_block=64, d=32 and the ceiling is n_block=4096, d=512, and both reproduce their quoted bound here. Note that the lead configuration, at 7.93x, sits just BELOW that ceiling: it is a configuration the paper reports separately for the absolute byte counts, not the tall regime's maximum, and reading it as one would understate the regime"
+    },
     "flat_regime_no_compression": {
-      "claim": "at full local rank the summary is not smaller than the block in the flat regime, which the paper reports openly as the design's boundary rather than a defect",
+      "claim": "at full local rank the summary is not smaller than the block in the flat and square regime, which the paper reports openly as the design's boundary rather than a defect",
       "configurations_attempted": [
         {
-          "n_block": 256,
-          "d": 512
-        },
-        {
-          "n_block": 128,
-          "d": 512
+          "n_block": 8,
+          "d": 32,
+          "role": "floor"
         },
         {
           "n_block": 64,
-          "d": 128
+          "d": 128,
+          "role": "interior"
+        },
+        {
+          "n_block": 128,
+          "d": 512,
+          "role": "interior"
+        },
+        {
+          "n_block": 512,
+          "d": 512,
+          "role": "ceiling"
         }
       ],
-      "n_reproduced": 3,
-      "at_least_one_reproduced": true,
+      "n_reproduced": 4,
       "ratio_range_measured": {
-        "min": 0.9738882452544336,
-        "max": 0.9939610172335184
+        "min": 0.7932875667429443,
+        "max": 0.9960016204384208
       },
-      "note": "the paper quotes this regime's ratio as running from 0.79 to 1.00. Those bounds are reported here as measured, and any difference from the quoted range is a discrepancy for the paper to reconcile rather than a value to reconcile silently"
+      "paper_quoted_range": {
+        "min": 0.79,
+        "max": 1.0
+      },
+      "quoted_range_is_reproduced": true,
+      "note": "the paper quotes this regime's ratio as running from 0.79x to 1.00x. An earlier draft of this run measured a minimum of 0.977 and so did NOT back that quoted floor. The 0.79 came from n_block=8, d=32 at full local rank, a 2 KiB block, which this run measures and which reproduces the quoted floor exactly. Both ends of the quoted range are therefore measured here, and no claim was deleted to accommodate the data"
     },
     "crossover_full_rank_point": {
       "claim": "at full local rank the summary is smaller than the block above the crossover and not smaller below it, so the boundary is backed by data on both sides",
-      "n_at_or_below_1": 3,
-      "n_above_1": 1,
+      "n_at_or_below_1": 4,
+      "n_above_1": 3,
       "spans_both_sides_of_1": true,
-      "min_ratio": 0.9738882452544336,
-      "max_ratio": 7.934155942668304,
+      "min_ratio": 0.7932875667429443,
+      "max_ratio": 7.967906580680213,
       "measured_here": true
     }
   },
   "scope_limits": {
-    "no_large_block_was_measured": "this run deliberately drops the multi-GiB sweep. SVD cost grows roughly as O(n*d^2) in the sample dimension, so a large block is far more work than its size suggests. A large block, if ever needed, is a separate experiment with its own justification and an agreed time budget",
+    "measured_block_sizes": {
+      "min_bytes": 2048.0,
+      "max_bytes": 16777216.0,
+      "what_was_attempted": "the blocks measured here run from 2 KiB to 16 MiB. An earlier attempt at 8 GiB to 24 GiB blocks was killed after 56 minutes on a single configuration, so the large end of that range was abandoned rather than reported. The 16 MiB ceiling is the largest block this run allocates and costs about a second of the total",
+      "why_large_blocks_are_expensive": "SVD cost grows roughly as O(n*d^2) in the sample dimension, so a block is far more work than its byte size suggests. A large block, if it is ever needed, is a separate experiment with its own justification and an agreed time budget"
+    },
     "flat_at_absolute_scale_not_measured": "a flat point at slab-realistic ABSOLUTE size is not attempted: it needs a block with many features, and an SVD cost that grows with the cube of the feature dimension. That case is the gysela_sizing model's, where it is ARITHMETIC, and arithmetic must never be reported as a measurement however large the machine's memory is",
-    "local_worker_results_out_of_scope": "this artifact reports no local in-process speed number as a benefit. The comparison against NumPy SVD, SciPy SVD, sklearn PCA, sklearn IncrementalPCA and dask-ml IncrementalPCA is the LOCAL COST side: the bridge now pays that CPU to save the transfer. Those numbers stay out of the paper, except at most one sentence acknowledging the local cost the bridge now pays",
+    "local_worker_results_out_of_scope": "the local in-process cost the bridge now pays to buy the transfer reduction is OUT OF SCOPE and is NOT reported here, by instruction. The comparison against NumPy SVD, SciPy SVD, sklearn PCA, sklearn IncrementalPCA and dask-ml IncrementalPCA belongs to the baseline experiment, which measures that CPU on the same decomposition",
     "gysela_anchor": {
       "mesh_tor1_tor2_tor3_vpar_mu": [
         512,
@@ -216,19 +276,21 @@
         128,
         8
       ],
+      "n_features": 524288,
       "measured_here": false,
-      "kind": "arithmetic from the gysela_sizing sizing model, not a measurement",
-      "note": "sizing a full-rank summary for this anchor yields a payload on the order of terabytes against a local slab of a few GiB, i.e. no compression at all. This benchmark does NOT measure it and does not attempt to: the number stays the sizing model's. More memory lets the sizing model be tested at larger scale elsewhere; it does not retroactively turn a model output into a measurement"
-    }
+      "kind": "ARITHMETIC FROM THE SIZING MODEL, NOT A MEASUREMENT",
+      "note": "sizing a full-rank summary for this anchor yields a payload on the order of 2 TB against a local slab of roughly 4 GB, i.e. no compression at all. This benchmark does NOT measure it and does not attempt to, and this run never approached that regime: the number stays the sizing model's. More memory lets the sizing model be tested at larger scale elsewhere; it does not retroactively turn a model output into a measurement"
+    },
+    "no_per_row_timing_or_memory": "this artifact reports NO per-row duration and NO per-row peak memory, and the absence is deliberate. A serialized size is deterministic given its input, so a single pass is the whole measurement; and the blocks measured here are small enough that a per-row peak RSS is the interpreter's own footprint rather than a per-configuration cost. Neither field is filled with an estimate, a null or a placeholder: an absent column is honest and a column holding a value that measures nothing is not"
   },
   "invariant_check": {
     "claim": "on the PCA path the network transfer carries only a mergeable summary; the full chunk never crosses to the analytics engine",
     "how_verified": "for every configuration the scattered payload is asserted to be a PCASummary whose arrays are the summary's own, i.e. the block object itself is neither the payload nor contained in it; any regression to shipping the chunk fails the run",
     "note_on_size": "the check is on IDENTITY, not size: on the flat side a full-rank summary legitimately holds as many elements as the block it summarizes, which is the regime boundary reported separately as summary_not_smaller_than_block and not a violation",
-    "configurations_checked": 5,
-    "configurations_satisfying_invariant": 5,
+    "configurations_checked": 8,
+    "configurations_satisfying_invariant": 8,
     "configurations_shipping_chunk": 0,
-    "configurations_with_no_size_reduction": 3
+    "configurations_with_no_size_reduction": 4
   },
   "results": [
     {
@@ -282,44 +344,8 @@
       },
       "merged_root_rank": 256,
       "merged_root_n_samples": 2048,
-      "local_compute_cost_seconds": {
-        "make_block": 0.0343342968262732,
-        "local_pca": 0.09623979777097702,
-        "serialize_legacy_wire": 0.0018903822638094425,
-        "serialize_pca_wire": 0.00020800624042749405,
-        "merge_tree_single_summary": 4.699919372797012e-06,
-        "total": 0.13267718302085996,
-        "legacy_arm_local_cpu": 0.0,
-        "legacy_arm_local_cpu_note": "the legacy arm ships the chunk and never summarizes it, so it pays NO local CPU for the transform; this is the cost the PCA arm incurs to buy its byte saving"
-      },
-      "timing_policy": {
-        "timed_repeats": 1,
-        "seconds_all": [
-          0.09623979777097702
-        ],
-        "dispersion": null,
-        "dispersion_note": "each configuration is measured ONCE and reports a RATIO rather than a duration, and a serialized size is deterministic given its input, so no dispersion exists to report. dispersion is None rather than 0.0 on purpose: an iqr or stddev of 0.0 from a single sample reads as perfect reproducibility when nothing was repeated"
-      },
       "bytes_saved_vs_legacy_wire": 3665693,
-      "bytes_saved_per_second_of_local_cpu": 27628661.662372403,
-      "claim_supported": "headline_full_rank_network_transfer",
-      "memory": {
-        "peak_rss_bytes": 279363584,
-        "peak_rss": {
-          "bytes": 279363584.0,
-          "KiB": 272816.0,
-          "MiB": 266.421875,
-          "GiB": 0.2601776123046875
-        },
-        "peak_rss_available": true,
-        "peak_rss_attributable_to_this_configuration": true,
-        "peak_rss_attribution_note": "",
-        "rss_before_bytes": 170561536,
-        "cap_bytes": 107374182400,
-        "fraction_of_cap": 0.002601776123046875,
-        "peak_multiple_of_block_bytes": 66.60546875,
-        "peak_rss_within_budget_input": false
-      }
+      "claim_supported": "headline_full_rank_network_transfer"
     },
     {
       "n_block": 2048,
@@ -372,177 +398,159 @@
       },
       "merged_root_rank": 8,
       "merged_root_n_samples": 2048,
-      "local_compute_cost_seconds": {
-        "make_block": 0.016403194051235914,
-        "local_pca": 0.09437416587024927,
-        "serialize_legacy_wire": 0.00021920399740338326,
-        "serialize_pca_wire": 0.0001699342392385006,
-        "merge_tree_single_summary": 5.448237061500549e-06,
-        "total": 0.11117194639518857,
-        "legacy_arm_local_cpu": 0.0,
-        "legacy_arm_local_cpu_note": "the legacy arm ships the chunk and never summarizes it, so it pays NO local CPU for the transform; this is the cost the PCA arm incurs to buy its byte saving"
-      },
-      "timing_policy": {
-        "timed_repeats": 1,
-        "seconds_all": [
-          0.09437416587024927
-        ],
-        "dispersion": null,
-        "dispersion_note": "each configuration is measured ONCE and reports a RATIO rather than a duration, and a serialized size is deterministic given its input, so no dispersion exists to report. dispersion is None rather than 0.0 on purpose: an iqr or stddev of 0.0 from a single sample reads as perfect reproducibility when nothing was repeated"
-      },
       "bytes_saved_vs_legacy_wire": 4175583,
-      "bytes_saved_per_second_of_local_cpu": 37559682.41445412,
-      "claim_supported": "rank_truncation_local_rank_8",
-      "memory": {
-        "peak_rss_bytes": 280031232,
-        "peak_rss": {
-          "bytes": 280031232.0,
-          "KiB": 273468.0,
-          "MiB": 267.05859375,
-          "GiB": 0.2607994079589844
-        },
-        "peak_rss_available": true,
-        "peak_rss_attributable_to_this_configuration": true,
-        "peak_rss_attribution_note": "",
-        "rss_before_bytes": 270561280,
-        "cap_bytes": 107374182400,
-        "fraction_of_cap": 0.0026079940795898436,
-        "peak_multiple_of_block_bytes": 66.7646484375,
-        "peak_rss_within_budget_input": false
-      }
+      "claim_supported": "rank_truncation_local_rank_8"
     },
     {
-      "n_block": 256,
-      "n_features": 512,
-      "n_block_over_d": 0.5,
-      "regime": "flat",
+      "n_block": 64,
+      "n_features": 32,
+      "n_block_over_d": 2.0,
+      "regime": "tall",
       "local_rank_requested": null,
-      "local_rank_effective": 256,
+      "local_rank_effective": 32,
       "local_rank_saturated_at_d": false,
-      "intrinsic_rank": 128,
-      "block_elements": 131072,
+      "intrinsic_rank": 8,
+      "block_elements": 2048,
       "block_bytes": {
-        "bytes": 1048576.0,
-        "KiB": 1024.0,
-        "MiB": 1.0,
-        "GiB": 0.0009765625
+        "bytes": 16384.0,
+        "KiB": 16.0,
+        "MiB": 0.015625,
+        "GiB": 1.52587890625e-05
       },
-      "summary_elements": 131840,
+      "summary_elements": 1088,
       "summary_bytes": {
-        "bytes": 1054720.0,
-        "KiB": 1030.0,
-        "MiB": 1.005859375,
-        "GiB": 0.0009822845458984375
+        "bytes": 8704.0,
+        "KiB": 8.5,
+        "MiB": 0.00830078125,
+        "GiB": 8.106231689453125e-06
       },
       "legacy_wire_bytes": {
-        "bytes": 1048608.0,
-        "KiB": 1024.03125,
-        "MiB": 1.000030517578125,
-        "GiB": 0.0009765923023223877
+        "bytes": 16416.0,
+        "KiB": 16.03125,
+        "MiB": 0.015655517578125,
+        "GiB": 1.5288591384887695e-05
       },
       "pca_wire_bytes": {
-        "bytes": 1054979.0,
-        "KiB": 1030.2529296875,
-        "MiB": 1.0061063766479492,
-        "GiB": 0.000982525758445263
+        "bytes": 8958.0,
+        "KiB": 8.748046875,
+        "MiB": 0.008543014526367188,
+        "GiB": 8.342787623405457e-06
       },
-      "compression_ratio_legacy_vs_pca_wire": 0.9939610172335184,
-      "compression_ratio_full_rank_vs_data": 0.9941747572815534,
+      "compression_ratio_legacy_vs_pca_wire": 1.8325519089082385,
+      "compression_ratio_full_rank_vs_data": 1.8823529411764706,
       "invariant": {
         "payload_is_pca_summary": true,
         "payload_is_the_block_object": false,
         "payload_contains_the_block_object": false,
-        "largest_array_crossing_elements": 131072,
+        "largest_array_crossing_elements": 1024,
         "ships_full_chunk": false,
         "holds": true
       },
       "regime_boundary": {
-        "summary_not_smaller_than_block": true,
-        "note": "expected whenever n_block <= d at full local rank: the summary holds min(n_block,d)*d elements against n_block*d for the data, so it cannot be smaller. This is the design's boundary and is why local_rank < d exists."
+        "summary_not_smaller_than_block": false,
+        "note": ""
       },
-      "merged_root_rank": 256,
-      "merged_root_n_samples": 256,
-      "local_compute_cost_seconds": {
-        "make_block": 0.008880142588168383,
-        "local_pca": 0.05095381382852793,
-        "serialize_legacy_wire": 0.00016497215256094933,
-        "serialize_pca_wire": 0.00015574507415294647,
-        "merge_tree_single_summary": 2.6603229343891144e-06,
-        "total": 0.060157333966344595,
-        "legacy_arm_local_cpu": 0.0,
-        "legacy_arm_local_cpu_note": "the legacy arm ships the chunk and never summarizes it, so it pays NO local CPU for the transform; this is the cost the PCA arm incurs to buy its byte saving"
-      },
-      "timing_policy": {
-        "timed_repeats": 1,
-        "seconds_all": [
-          0.05095381382852793
-        ],
-        "dispersion": null,
-        "dispersion_note": "each configuration is measured ONCE and reports a RATIO rather than a duration, and a serialized size is deterministic given its input, so no dispersion exists to report. dispersion is None rather than 0.0 on purpose: an iqr or stddev of 0.0 from a single sample reads as perfect reproducibility when nothing was repeated"
-      },
-      "bytes_saved_vs_legacy_wire": -6371,
-      "bytes_saved_per_second_of_local_cpu": -105905.62413494416,
-      "claim_supported": "crossover_full_rank_point",
-      "memory": {
-        "peak_rss_bytes": 264720384,
-        "peak_rss": {
-          "bytes": 264720384.0,
-          "KiB": 258516.0,
-          "MiB": 252.45703125,
-          "GiB": 0.24654006958007812
-        },
-        "peak_rss_available": true,
-        "peak_rss_attributable_to_this_configuration": true,
-        "peak_rss_attribution_note": "",
-        "rss_before_bytes": 255533056,
-        "cap_bytes": 107374182400,
-        "fraction_of_cap": 0.002465400695800781,
-        "peak_multiple_of_block_bytes": 252.45703125,
-        "peak_rss_within_budget_input": false
-      }
+      "merged_root_rank": 32,
+      "merged_root_n_samples": 64,
+      "bytes_saved_vs_legacy_wire": 7458,
+      "claim_supported": "tall_regime_floor"
     },
     {
-      "n_block": 128,
+      "n_block": 4096,
       "n_features": 512,
+      "n_block_over_d": 8.0,
+      "regime": "tall",
+      "local_rank_requested": null,
+      "local_rank_effective": 512,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 128,
+      "block_elements": 2097152,
+      "block_bytes": {
+        "bytes": 16777216.0,
+        "KiB": 16384.0,
+        "MiB": 16.0,
+        "GiB": 0.015625
+      },
+      "summary_elements": 263168,
+      "summary_bytes": {
+        "bytes": 2105344.0,
+        "KiB": 2056.0,
+        "MiB": 2.0078125,
+        "GiB": 0.00196075439453125
+      },
+      "legacy_wire_bytes": {
+        "bytes": 16777248.0,
+        "KiB": 16384.03125,
+        "MiB": 16.000030517578125,
+        "GiB": 0.015625029802322388
+      },
+      "pca_wire_bytes": {
+        "bytes": 2105603.0,
+        "KiB": 2056.2529296875,
+        "MiB": 2.008059501647949,
+        "GiB": 0.0019609956070780754
+      },
+      "compression_ratio_legacy_vs_pca_wire": 7.967906580680213,
+      "compression_ratio_full_rank_vs_data": 7.968871595330739,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 262144,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": false,
+        "note": ""
+      },
+      "merged_root_rank": 512,
+      "merged_root_n_samples": 4096,
+      "bytes_saved_vs_legacy_wire": 14671645,
+      "claim_supported": "tall_regime_ceiling"
+    },
+    {
+      "n_block": 8,
+      "n_features": 32,
       "n_block_over_d": 0.25,
       "regime": "flat",
       "local_rank_requested": null,
-      "local_rank_effective": 128,
+      "local_rank_effective": 8,
       "local_rank_saturated_at_d": false,
-      "intrinsic_rank": 128,
-      "block_elements": 65536,
+      "intrinsic_rank": 8,
+      "block_elements": 256,
       "block_bytes": {
-        "bytes": 524288.0,
-        "KiB": 512.0,
-        "MiB": 0.5,
-        "GiB": 0.00048828125
+        "bytes": 2048.0,
+        "KiB": 2.0,
+        "MiB": 0.001953125,
+        "GiB": 1.9073486328125e-06
       },
-      "summary_elements": 66176,
+      "summary_elements": 296,
       "summary_bytes": {
-        "bytes": 529408.0,
-        "KiB": 517.0,
-        "MiB": 0.5048828125,
-        "GiB": 0.0004930496215820312
+        "bytes": 2368.0,
+        "KiB": 2.3125,
+        "MiB": 0.00225830078125,
+        "GiB": 2.205371856689453e-06
       },
       "legacy_wire_bytes": {
-        "bytes": 524320.0,
-        "KiB": 512.03125,
-        "MiB": 0.500030517578125,
-        "GiB": 0.0004883110523223877
+        "bytes": 2080.0,
+        "KiB": 2.03125,
+        "MiB": 0.001983642578125,
+        "GiB": 1.9371509552001953e-06
       },
       "pca_wire_bytes": {
-        "bytes": 529664.0,
-        "KiB": 517.25,
-        "MiB": 0.505126953125,
-        "GiB": 0.0004932880401611328
+        "bytes": 2622.0,
+        "KiB": 2.560546875,
+        "MiB": 0.0025005340576171875,
+        "GiB": 2.4419277906417847e-06
       },
-      "compression_ratio_legacy_vs_pca_wire": 0.9899105848235863,
-      "compression_ratio_full_rank_vs_data": 0.9903288201160542,
+      "compression_ratio_legacy_vs_pca_wire": 0.7932875667429443,
+      "compression_ratio_full_rank_vs_data": 0.8648648648648649,
       "invariant": {
         "payload_is_pca_summary": true,
         "payload_is_the_block_object": false,
         "payload_contains_the_block_object": false,
-        "largest_array_crossing_elements": 65536,
+        "largest_array_crossing_elements": 256,
         "ships_full_chunk": false,
         "holds": true
       },
@@ -550,46 +558,10 @@
         "summary_not_smaller_than_block": true,
         "note": "expected whenever n_block <= d at full local rank: the summary holds min(n_block,d)*d elements against n_block*d for the data, so it cannot be smaller. This is the design's boundary and is why local_rank < d exists."
       },
-      "merged_root_rank": 128,
-      "merged_root_n_samples": 128,
-      "local_compute_cost_seconds": {
-        "make_block": 0.004305030684918165,
-        "local_pca": 0.01873496873304248,
-        "serialize_legacy_wire": 0.0001445547677576542,
-        "serialize_pca_wire": 0.00014776643365621567,
-        "merge_tree_single_summary": 2.3008324205875397e-06,
-        "total": 0.0233346214517951,
-        "legacy_arm_local_cpu": 0.0,
-        "legacy_arm_local_cpu_note": "the legacy arm ships the chunk and never summarizes it, so it pays NO local CPU for the transform; this is the cost the PCA arm incurs to buy its byte saving"
-      },
-      "timing_policy": {
-        "timed_repeats": 1,
-        "seconds_all": [
-          0.01873496873304248
-        ],
-        "dispersion": null,
-        "dispersion_note": "each configuration is measured ONCE and reports a RATIO rather than a duration, and a serialized size is deterministic given its input, so no dispersion exists to report. dispersion is None rather than 0.0 on purpose: an iqr or stddev of 0.0 from a single sample reads as perfect reproducibility when nothing was repeated"
-      },
-      "bytes_saved_vs_legacy_wire": -5344,
-      "bytes_saved_per_second_of_local_cpu": -229015.92858661493,
-      "claim_supported": "flat_regime_no_compression",
-      "memory": {
-        "peak_rss_bytes": 264720384,
-        "peak_rss": {
-          "bytes": 264720384.0,
-          "KiB": 258516.0,
-          "MiB": 252.45703125,
-          "GiB": 0.24654006958007812
-        },
-        "peak_rss_available": true,
-        "peak_rss_attributable_to_this_configuration": true,
-        "peak_rss_attribution_note": "",
-        "rss_before_bytes": 264720384,
-        "cap_bytes": 107374182400,
-        "fraction_of_cap": 0.002465400695800781,
-        "peak_multiple_of_block_bytes": 504.9140625,
-        "peak_rss_within_budget_input": false
-      }
+      "merged_root_rank": 8,
+      "merged_root_n_samples": 8,
+      "bytes_saved_vs_legacy_wire": -542,
+      "claim_supported": "flat_regime_no_compression"
     },
     {
       "n_block": 64,
@@ -642,44 +614,116 @@
       },
       "merged_root_rank": 64,
       "merged_root_n_samples": 64,
-      "local_compute_cost_seconds": {
-        "make_block": 0.0008252058178186417,
-        "local_pca": 0.003167148679494858,
-        "serialize_legacy_wire": 0.0001369561068713665,
-        "serialize_pca_wire": 0.00014576734974980354,
-        "merge_tree_single_summary": 2.2188760340213776e-06,
-        "total": 0.004277296829968691,
-        "legacy_arm_local_cpu": 0.0,
-        "legacy_arm_local_cpu_note": "the legacy arm ships the chunk and never summarizes it, so it pays NO local CPU for the transform; this is the cost the PCA arm incurs to buy its byte saving"
-      },
-      "timing_policy": {
-        "timed_repeats": 1,
-        "seconds_all": [
-          0.003167148679494858
-        ],
-        "dispersion": null,
-        "dispersion_note": "each configuration is measured ONCE and reports a RATIO rather than a duration, and a serialized size is deterministic given its input, so no dispersion exists to report. dispersion is None rather than 0.0 on purpose: an iqr or stddev of 0.0 from a single sample reads as perfect reproducibility when nothing was repeated"
-      },
       "bytes_saved_vs_legacy_wire": -1758,
-      "bytes_saved_per_second_of_local_cpu": -411007.24824207916,
-      "claim_supported": "flat_regime_no_compression",
-      "memory": {
-        "peak_rss_bytes": 264720384,
-        "peak_rss": {
-          "bytes": 264720384.0,
-          "KiB": 258516.0,
-          "MiB": 252.45703125,
-          "GiB": 0.24654006958007812
-        },
-        "peak_rss_available": true,
-        "peak_rss_attributable_to_this_configuration": true,
-        "peak_rss_attribution_note": "",
-        "rss_before_bytes": 264720384,
-        "cap_bytes": 107374182400,
-        "fraction_of_cap": 0.002465400695800781,
-        "peak_multiple_of_block_bytes": 4039.3125,
-        "peak_rss_within_budget_input": false
-      }
+      "claim_supported": "flat_regime_no_compression"
+    },
+    {
+      "n_block": 128,
+      "n_features": 512,
+      "n_block_over_d": 0.25,
+      "regime": "flat",
+      "local_rank_requested": null,
+      "local_rank_effective": 128,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 128,
+      "block_elements": 65536,
+      "block_bytes": {
+        "bytes": 524288.0,
+        "KiB": 512.0,
+        "MiB": 0.5,
+        "GiB": 0.00048828125
+      },
+      "summary_elements": 66176,
+      "summary_bytes": {
+        "bytes": 529408.0,
+        "KiB": 517.0,
+        "MiB": 0.5048828125,
+        "GiB": 0.0004930496215820312
+      },
+      "legacy_wire_bytes": {
+        "bytes": 524320.0,
+        "KiB": 512.03125,
+        "MiB": 0.500030517578125,
+        "GiB": 0.0004883110523223877
+      },
+      "pca_wire_bytes": {
+        "bytes": 529664.0,
+        "KiB": 517.25,
+        "MiB": 0.505126953125,
+        "GiB": 0.0004932880401611328
+      },
+      "compression_ratio_legacy_vs_pca_wire": 0.9899105848235863,
+      "compression_ratio_full_rank_vs_data": 0.9903288201160542,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 65536,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": true,
+        "note": "expected whenever n_block <= d at full local rank: the summary holds min(n_block,d)*d elements against n_block*d for the data, so it cannot be smaller. This is the design's boundary and is why local_rank < d exists."
+      },
+      "merged_root_rank": 128,
+      "merged_root_n_samples": 128,
+      "bytes_saved_vs_legacy_wire": -5344,
+      "claim_supported": "flat_regime_no_compression"
+    },
+    {
+      "n_block": 512,
+      "n_features": 512,
+      "n_block_over_d": 1.0,
+      "regime": "square",
+      "local_rank_requested": null,
+      "local_rank_effective": 512,
+      "local_rank_saturated_at_d": false,
+      "intrinsic_rank": 128,
+      "block_elements": 262144,
+      "block_bytes": {
+        "bytes": 2097152.0,
+        "KiB": 2048.0,
+        "MiB": 2.0,
+        "GiB": 0.001953125
+      },
+      "summary_elements": 263168,
+      "summary_bytes": {
+        "bytes": 2105344.0,
+        "KiB": 2056.0,
+        "MiB": 2.0078125,
+        "GiB": 0.00196075439453125
+      },
+      "legacy_wire_bytes": {
+        "bytes": 2097184.0,
+        "KiB": 2048.03125,
+        "MiB": 2.000030517578125,
+        "GiB": 0.0019531548023223877
+      },
+      "pca_wire_bytes": {
+        "bytes": 2105603.0,
+        "KiB": 2056.2529296875,
+        "MiB": 2.008059501647949,
+        "GiB": 0.0019609956070780754
+      },
+      "compression_ratio_legacy_vs_pca_wire": 0.9960016204384208,
+      "compression_ratio_full_rank_vs_data": 0.9961089494163424,
+      "invariant": {
+        "payload_is_pca_summary": true,
+        "payload_is_the_block_object": false,
+        "payload_contains_the_block_object": false,
+        "largest_array_crossing_elements": 262144,
+        "ships_full_chunk": false,
+        "holds": true
+      },
+      "regime_boundary": {
+        "summary_not_smaller_than_block": true,
+        "note": "expected whenever n_block <= d at full local rank: the summary holds min(n_block,d)*d elements against n_block*d for the data, so it cannot be smaller. This is the design's boundary and is why local_rank < d exists."
+      },
+      "merged_root_rank": 512,
+      "merged_root_n_samples": 512,
+      "bytes_saved_vs_legacy_wire": -8419,
+      "claim_supported": "flat_regime_no_compression"
     }
   ],
   "skipped": []

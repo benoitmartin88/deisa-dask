@@ -243,6 +243,108 @@ def _total_memory_bytes() -> int:
         return -1
 
 
+#: cgroup v2 files that bound this process's memory, probed in order. A benchmark that scales its blocks up to a
+#: large fraction of the box must record the CAP it ran under, not just the physical RAM: the cap is what can
+#: actually kill the run, and on a shared host the two differ.
+_CGROUP_MEMORY_FILES: tuple[str, ...] = (
+    "/sys/fs/cgroup/memory.max",  # cgroup v2
+    "/sys/fs/cgroup/memory/memory.limit_in_bytes",  # cgroup v1
+)
+
+
+def cgroup_memory_limit_bytes() -> int | None:
+    """Memory CAP on this process in bytes, or ``None`` when no cgroup cap is in force.
+
+    Distinguishes three cases rather than collapsing them, because only two of the three are numbers:
+
+    - a finite ``memory.max`` is the usable cap;
+    - cgroup v2 spells "no limit" as the literal string ``"max"``, which is NOT a byte count and must never be
+      parsed as one;
+    - an absent file means no cgroup cap at all, i.e. the physical RAM is the only bound.
+
+    Returning ``None`` rather than a sentinel keeps a reader from quoting ``-1`` or ``"max"`` as a cap.
+    """
+    for candidate in _CGROUP_MEMORY_FILES:
+        try:
+            raw = Path(candidate).read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if not raw or raw == "max":
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            continue
+    return None
+
+
+def cgroup_memory_current_bytes() -> int | None:
+    """Bytes currently charged to this cgroup, or ``None`` when unavailable."""
+    for candidate in ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes"):
+        try:
+            raw = Path(candidate).read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        try:
+            return int(raw)
+        except ValueError:
+            continue
+    return None
+
+
+def peak_rss_bytes() -> int:
+    """This process's peak resident set size in bytes, from the kernel's own high-water mark.
+
+    ``/proc/self/status``'s ``VmHWM`` is used rather than ``resource.getrusage``, because ``getrusage`` reports
+    ``ru_maxrss`` which is ALSO a process-lifetime maximum: once one big configuration has run, it can no longer
+    attribute a peak to the configuration measured after it. Both are monotone over the process lifetime, so
+    neither can answer "what did this call allocate".
+
+    Returns ``-1`` off Linux, where neither file exists, rather than raising: a missing peak is a defect to be
+    recorded, not a reason to lose a measurement that already succeeded.
+    """
+    try:
+        with open("/proc/self/status", encoding="utf-8") as fp:
+            for line in fp:
+                if line.startswith("VmHWM:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:  # pragma: no cover - non-Linux
+        return -1
+    return -1
+
+
+def current_rss_bytes() -> int:
+    """This process's current resident set size in bytes, or ``-1`` when unavailable."""
+    try:
+        with open("/proc/self/status", encoding="utf-8") as fp:
+            for line in fp:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:  # pragma: no cover - non-Linux
+        return -1
+    return -1
+
+
+def reset_peak_rss() -> bool:
+    """Reset the peak-RSS high-water mark to the current RSS, so the NEXT configuration's peak is attributable.
+
+    Writes ``5`` to ``/proc/self/clear_refs``, the documented way to zero the ``VmHWM`` watermark. Without this a
+    sweep that grows its blocks has exactly one attributable peak -- the largest -- and every smaller row's
+    "peak" is really just that one number, which would make the per-configuration memory column a lie for every
+    row except the last.
+
+    Returns ``False`` when the reset is not permitted (a hardened kernel, a non-Linux host, a read-only
+    ``procfs``). A caller must then treat its peak column as process-wide rather than per-configuration, because
+    that is exactly what it has.
+    """
+    try:
+        with open("/proc/self/clear_refs", "w", encoding="ascii") as fp:
+            fp.write("5\n")
+    except OSError:
+        return False
+    return True
+
+
 def machine_info() -> dict[str, Any]:
     """Describe the machine the measurement ran on: CPU, memory, and the BLAS/LAPACK that does the SVD.
 
@@ -275,6 +377,8 @@ def machine_info() -> dict[str, Any]:
         "cpu_count_logical": logical,
         "cpu_count_physical": physical,
         "total_memory_bytes": _total_memory_bytes(),
+        "cgroup_memory_limit_bytes": cgroup_memory_limit_bytes(),
+        "cgroup_memory_current_bytes": cgroup_memory_current_bytes(),
         "numpy_blas": blas,
         "numpy_lapack": lapack,
         "thread_env": {
@@ -741,6 +845,21 @@ def ratio_sweep_points(d: int) -> list[tuple[float, int]]:
     return points
 
 
+def _render_bytes(value: float) -> str:
+    """Render a byte count in a unit that suits its magnitude, so one column can hold five orders of size.
+
+    A fixed unit is wrong the moment a sweep spans it: a byte dict printed only in MiB reads "0.00" for the small
+    end of a sweep whose large end is tens of GiB. Each unit is used only within its own decade, so the smallest
+    non-zero value never renders as "0.00".
+
+    - ``:param value:`` Byte count, in the unit ``value`` was passed in.
+    """
+    for threshold, unit, scale in ((2**30, "GiB", 2**30), (2**20, "MiB", 2**20), (2**10, "KiB", 2**10)):
+        if value >= threshold:
+            return f"{value / scale:.2f} {unit}"
+    return f"{value:.0f} B" if value > 0 else "0 B"
+
+
 def print_summary_table(
     rows: Sequence[Mapping[str, Any]],
     columns: Sequence[tuple[str, Any, str]],
@@ -751,12 +870,13 @@ def print_summary_table(
 
     The JSON is the artifact; this only shows its shape without opening it, and the values are rendered from the
     same rows that are written to JSON -- nothing is recomputed or reformatted numerically, so the display cannot
-    become a second, divergent source of numbers. Byte-valued columns are rendered in MiB for legibility; the JSON
-    keeps the exact byte count.
+    become a second, divergent source of numbers. Byte-valued columns are rendered in a unit chosen per row by
+    :func:`_render_bytes` for legibility; the JSON keeps the exact byte count.
 
     - ``:param rows:`` Result rows.
     - ``:param columns:`` ``(key, header, kind)`` triples in display order, where ``kind`` is one of ``"int"``,
-        ``"float"``, ``"str"`` or ``"mib"`` (renders a ``{"MiB": ...}`` byte dict).
+        ``"float"``, ``"str"``, ``"mib"`` (renders a ``{"MiB": ...}`` byte dict) or ``"auto"`` (renders a
+        ``{"bytes": ...}`` byte dict in whichever unit suits the value).
     - ``:param title:`` Optional heading printed above the table.
     - ``:param stream:`` Output stream, or ``None`` for stdout.
     """
@@ -766,9 +886,12 @@ def print_summary_table(
         if key not in row:
             return "-"
         value = row[key]
-        if kind == "mib":
-            if isinstance(value, Mapping) and "MiB" in value:
-                return f"{float(value['MiB']):.2f}"
+        if kind in ("mib", "auto"):
+            if isinstance(value, Mapping) and "bytes" in value:
+                exact = float(value["bytes"])
+                return _render_bytes(exact) if kind == "auto" else f"{float(value['MiB']):.2f}"
+            if kind == "auto" and isinstance(value, (int, float)):
+                return _render_bytes(float(value))
             return "-"
         if kind == "float":
             if value is None:
