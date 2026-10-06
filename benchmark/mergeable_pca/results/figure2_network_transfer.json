@@ -1,0 +1,375 @@
+{
+  "figure": "network transfer vs block aspect ratio, per bridge, at full local rank",
+  "basis": "per bridge, not per run: b1's block_bytes/summary_bytes and b6's per_bridge_block_measured/per_bridge_leaf_summary_measured are the same quantity, so the two artifacts are combined on that common basis",
+  "generated_by": "benchmark/mergeable_pca/build_figure2_source.py",
+  "measures_anything": false,
+  "provenance": {
+    "sources": [
+      "b6_tradeoff_cost_gapfill.json",
+      "b1_network_transfer.json"
+    ],
+    "rows_total": 22,
+    "rows_by_source": {
+      "b6_tradeoff_cost": 22,
+      "b1_network_transfer": 0
+    }
+  },
+  "tick_coverage": {
+    "0.25": {
+      "rows": 2,
+      "n_features": [
+        32,
+        512
+      ]
+    },
+    "0.5": {
+      "rows": 2,
+      "n_features": [
+        128,
+        512
+      ]
+    },
+    "1": {
+      "rows": 2,
+      "n_features": [
+        128,
+        512
+      ]
+    },
+    "2": {
+      "rows": 3,
+      "n_features": [
+        32,
+        128,
+        512
+      ]
+    },
+    "4": {
+      "rows": 3,
+      "n_features": [
+        32,
+        128,
+        512
+      ]
+    },
+    "8": {
+      "rows": 4,
+      "n_features": [
+        32,
+        128,
+        256,
+        512
+      ]
+    }
+  },
+  "results": [
+    {
+      "n_block": 8,
+      "n_features": 32,
+      "n_block_over_d": 0.25,
+      "local_rank_requested": null,
+      "block_bytes": {
+        "bytes": 2048.0
+      },
+      "summary_bytes": {
+        "bytes": 2368.0
+      },
+      "intrinsic_rank": 8,
+      "measured_by": "b6_tradeoff_cost"
+    },
+    {
+      "n_block": 64,
+      "n_features": 32,
+      "n_block_over_d": 2.0,
+      "local_rank_requested": null,
+      "block_bytes": {
+        "bytes": 16384.0
+      },
+      "summary_bytes": {
+        "bytes": 8704.0
+      },
+      "intrinsic_rank": 8,
+      "measured_by": "b6_tradeoff_cost"
+    },
+    {
+      "n_block": 128,
+      "n_features": 32,
+      "n_block_over_d": 4.0,
+      "local_rank_requested": null,
+      "block_bytes": {
+        "bytes": 32800.0
+      },
+      "summary_bytes": {
+        "bytes": 8958.0
+      },
+      "intrinsic_rank": 8,
+      "measured_by": "b6_tradeoff_cost"
+    },
+    {
+      "n_block": 256,
+      "n_features": 32,
+      "n_block_over_d": 8.0,
+      "local_rank_requested": null,
+      "block_bytes": {
+        "bytes": 65568.0
+      },
+      "summary_bytes": {
+        "bytes": 8959.0
+      },
+      "intrinsic_rank": 8,
+      "measured_by": "b6_tradeoff_cost"
+    },
+    {
+      "n_block": 512,
+      "n_features": 32,
+      "n_block_over_d": 16.0,
+      "local_rank_requested": null,
+      "block_bytes": {
+        "bytes": 131104.0
+      },
+      "summary_bytes": {
+        "bytes": 8959.0
+      },
+      "intrinsic_rank": 8,
+      "measured_by": "b6_tradeoff_cost"
+    },
+    {
+      "n_block": 1024,
+      "n_features": 32,
+      "n_block_over_d": 32.0,
+      "local_rank_requested": null,
+      "block_bytes": {
+        "bytes": 262176.0
+      },
+      "summary_bytes": {
+        "bytes": 8959.0
+      },
+      "intrinsic_rank": 8,
+      "measured_by": "b6_tradeoff_cost"
+    },
+    {
+      "n_block": 2048,
+      "n_features": 32,
+      "n_block_over_d": 64.0,
+      "local_rank_requested": null,
+      "block_bytes": {
+        "bytes": 524320.0
+      },
+      "summary_bytes": {
+        "bytes": 8959.0
+      },
+      "intrinsic_rank": 8,
+      "measured_by": "b6_tradeoff_cost"
+    },
+    {
+      "n_block": 4096,
+      "n_features": 32,
+      "n_block_over_d": 128.0,
+      "local_rank_requested": null,
+      "block_bytes": {
+        "bytes": 1048608.0
+      },
+      "summary_bytes": {
+        "bytes": 8959.0
+      },
+      "intrinsic_rank": 8,
+      "measured_by": "b6_tradeoff_cost"
+    },
+    {
+      "n_block": 64,
+      "n_features": 128,
+      "n_block_over_d": 0.5,
+      "local_rank_requested": null,
+      "block_bytes": {
+        "bytes": 65536.0
+      },
+      "summary_bytes": {
+        "bytes": 67072.0
+      },
+      "intrinsic_rank": 32,
+      "measured_by": "b6_tradeoff_cost"
+    },
+    {
+      "n_block": 128,
+      "n_features": 128,
+      "n_block_over_d": 1.0,
+      "local_rank_requested": null,
+      "block_bytes": {
+        "bytes": 131104.0
+      },
+      "summary_bytes": {
+        "bytes": 133374.0
+      },
+      "intrinsic_rank": 32,
+      "measured_by": "b6_tradeoff_cost"
+    },
+    {
+      "n_block": 256,
+      "n_features": 128,
+      "n_block_over_d": 2.0,
+      "local_rank_requested": null,
+      "block_bytes": {
+        "bytes": 262176.0
+      },
+      "summary_bytes": {
+        "bytes": 133375.0
+      },
+      "intrinsic_rank": 32,
+      "measured_by": "b6_tradeoff_cost"
+    },
+    {
+      "n_block": 512,
+      "n_features": 128,
+      "n_block_over_d": 4.0,
+      "local_rank_requested": null,
+      "block_bytes": {
+        "bytes": 524320.0
+      },
+      "summary_bytes": {
+        "bytes": 133375.0
+      },
+      "intrinsic_rank": 32,
+      "measured_by": "b6_tradeoff_cost"
+    },
+    {
+      "n_block": 1024,
+      "n_features": 128,
+      "n_block_over_d": 8.0,
+      "local_rank_requested": null,
+      "block_bytes": {
+        "bytes": 1048608.0
+      },
+      "summary_bytes": {
+        "bytes": 133375.0
+      },
+      "intrinsic_rank": 32,
+      "measured_by": "b6_tradeoff_cost"
+    },
+    {
+      "n_block": 2048,
+      "n_features": 128,
+      "n_block_over_d": 16.0,
+      "local_rank_requested": null,
+      "block_bytes": {
+        "bytes": 2097184.0
+      },
+      "summary_bytes": {
+        "bytes": 133375.0
+      },
+      "intrinsic_rank": 32,
+      "measured_by": "b6_tradeoff_cost"
+    },
+    {
+      "n_block": 4096,
+      "n_features": 128,
+      "n_block_over_d": 32.0,
+      "local_rank_requested": null,
+      "block_bytes": {
+        "bytes": 4194336.0
+      },
+      "summary_bytes": {
+        "bytes": 133375.0
+      },
+      "intrinsic_rank": 32,
+      "measured_by": "b6_tradeoff_cost"
+    },
+    {
+      "n_block": 2048,
+      "n_features": 256,
+      "n_block_over_d": 8.0,
+      "local_rank_requested": null,
+      "block_bytes": {
+        "bytes": 4194304.0
+      },
+      "summary_bytes": {
+        "bytes": 528384.0
+      },
+      "intrinsic_rank": 64,
+      "measured_by": "b6_tradeoff_cost"
+    },
+    {
+      "n_block": 128,
+      "n_features": 512,
+      "n_block_over_d": 0.25,
+      "local_rank_requested": null,
+      "block_bytes": {
+        "bytes": 524288.0
+      },
+      "summary_bytes": {
+        "bytes": 529408.0
+      },
+      "intrinsic_rank": 128,
+      "measured_by": "b6_tradeoff_cost"
+    },
+    {
+      "n_block": 256,
+      "n_features": 512,
+      "n_block_over_d": 0.5,
+      "local_rank_requested": null,
+      "block_bytes": {
+        "bytes": 1048608.0
+      },
+      "summary_bytes": {
+        "bytes": 1054979.0
+      },
+      "intrinsic_rank": 128,
+      "measured_by": "b6_tradeoff_cost"
+    },
+    {
+      "n_block": 512,
+      "n_features": 512,
+      "n_block_over_d": 1.0,
+      "local_rank_requested": null,
+      "block_bytes": {
+        "bytes": 2097152.0
+      },
+      "summary_bytes": {
+        "bytes": 2105344.0
+      },
+      "intrinsic_rank": 128,
+      "measured_by": "b6_tradeoff_cost"
+    },
+    {
+      "n_block": 1024,
+      "n_features": 512,
+      "n_block_over_d": 2.0,
+      "local_rank_requested": null,
+      "block_bytes": {
+        "bytes": 4194336.0
+      },
+      "summary_bytes": {
+        "bytes": 2105603.0
+      },
+      "intrinsic_rank": 128,
+      "measured_by": "b6_tradeoff_cost"
+    },
+    {
+      "n_block": 2048,
+      "n_features": 512,
+      "n_block_over_d": 4.0,
+      "local_rank_requested": null,
+      "block_bytes": {
+        "bytes": 8388640.0
+      },
+      "summary_bytes": {
+        "bytes": 2105603.0
+      },
+      "intrinsic_rank": 128,
+      "measured_by": "b6_tradeoff_cost"
+    },
+    {
+      "n_block": 4096,
+      "n_features": 512,
+      "n_block_over_d": 8.0,
+      "local_rank_requested": null,
+      "block_bytes": {
+        "bytes": 16777216.0
+      },
+      "summary_bytes": {
+        "bytes": 2105344.0
+      },
+      "intrinsic_rank": 128,
+      "measured_by": "b6_tradeoff_cost"
+    }
+  ]
+}

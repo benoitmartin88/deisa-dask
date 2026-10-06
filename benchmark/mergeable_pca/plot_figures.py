@@ -8,9 +8,9 @@ ACM layout (3.3 in) with type set to remain legible at final print size.
 
 The three data figures are:
 
-  bytes_crossed.pdf    bytes crossing the coupling boundary, legacy full-chunk
-                       scatter versus the bridge-side mergeable summary, full
-                       local rank, over the n_block/d sweep.
+  network_transfer.pdf the network transfer across the coupling boundary, legacy
+                       full-chunk scatter versus the bridge-side mergeable summary,
+                       full local rank, over the block aspect ratio.
   local_rank_curve.pdf local rank R against summary size and against the two
                        sign-invariant accuracy metrics, for a single leaf and
                        for the eight-leaf merge.
@@ -99,26 +99,38 @@ def _rank_series(points, ykey, rankkey="local_rank_effective"):
 
 
 # --------------------------------------------------------------------------
-# Figure B1: bytes crossing the boundary.
+# Figure B1: the network transfer across the coupling boundary.
 # --------------------------------------------------------------------------
-def figure_bytes(results_dir: Path, out_dir: Path) -> Path:
-    b1 = _load(results_dir, "b1_bytes_crossing.json")
-    # full local rank only, so the summary rank is not a second free variable.
-    rows = [r for r in b1["results"] if r["local_rank_requested"] is None]
+def figure_network_transfer(results_dir: Path, out_dir: Path) -> Path:
+    # The combined artifact is built by build_figure2_source.py from every measured row we have.
+    # Neither input artifact alone covers the figure: b1 has four feature dimensions but no x=4,
+    # which the figure labels, and the gap-fill run supplies x=4 but only three feature dimensions.
+    # Every row in the combined artifact carries measured_by, so the provenance survives to the plot.
+    b1 = _load(results_dir, "figure2_network_transfer.json")
+    # build_figure2_source.py already keeps only the rows measured at full local rank, so that is
+    # the invariant here rather than a filter over a field the combined rows do not carry.
+    rows = list(b1["results"])
     dims = sorted({r["n_features"] for r in rows})
 
+    # Four feature dimensions are measured, so four colours; grey is a fallback.
+    colours = {32: COL["blue"], 128: COL["orange"], 256: COL["red"], 512: COL["green"]}
+
     fig, ax = plt.subplots(figsize=(ACM_COLUMN_IN, 2.5))
-    colours = {32: COL["blue"], 128: COL["orange"], 512: COL["green"]}
     for d in dims:
-        c = colours[d]
+        c = colours.get(d, COL["grey"])
         pts = sorted((r for r in rows if r["n_features"] == d), key=lambda r: r["n_block_over_d"])
         x = [r["n_block_over_d"] for r in pts]
-        legacy = [r["legacy_wire_bytes"]["bytes"] for r in pts]
-        summary = [r["pca_wire_bytes"]["bytes"] for r in pts]
-        ax.plot(x, legacy, "-", color=c, marker="o", clip_on=False)
-        ax.plot(x, summary, "--", color=c, marker="s", clip_on=False)
+        # The measured payload bytes, on the same basis as the ratio the paper quotes.
+        legacy = [r["block_bytes"]["bytes"] for r in pts]
+        summary = [r["summary_bytes"]["bytes"] for r in pts]
+        # A line joins only configurations that share a feature dimension and number
+        # more than one; a lone measured point is a marker, never an extrapolation.
+        line_legacy = "-" if len(x) > 1 else "none"
+        line_summary = "--" if len(x) > 1 else "none"
+        ax.plot(x, legacy, line_legacy, color=c, marker="o", clip_on=False)
+        ax.plot(x, summary, line_summary, color=c, marker="s", mfc="white", clip_on=False)
 
-    ax.axvspan(1.0, 9.0, color="0.85", alpha=0.4, zorder=0, linewidth=0)
+    ax.axvspan(1.0, 14.0, color="0.85", alpha=0.4, zorder=0, linewidth=0)
     ax.axvline(1.0, color="0.35", ls=":", lw=0.8, zorder=1)
     ax.set_xscale("log", base=2)
     ax.set_yscale("log")
@@ -127,25 +139,27 @@ def figure_bytes(results_dir: Path, out_dir: Path) -> Path:
     ax.xaxis.set_minor_locator(ticker.NullLocator())
     ax.yaxis.set_minor_locator(ticker.LogLocator(base=10, subs=(2, 5)))
     ax.yaxis.set_minor_formatter(ticker.NullFormatter())
-    ax.set_xlim(0.2, 11)
-    ax.set_ylim(1.2e3, 4e7)
+    # The combined artifact spans x from 0.25 to 128 and per-bridge block bytes from ~3.3e4 to
+    # ~8.4e6, so the limits cover the measured range rather than the narrower original sweep.
+    ax.set_xlim(0.18, 160)
+    ax.set_ylim(6e3, 2e7)
     ax.set_xlabel(r"block aspect ratio $n_{\mathrm{block}}/d$ (dimensionless)")
-    ax.set_ylabel("bytes crossing the boundary (bytes)")
-    ax.set_title("Full local rank: tall blocks compress, flat blocks do not")
+    ax.set_ylabel("network transfer (bytes)")
+    ax.set_title("At full local rank: tall blocks compress, flat blocks do not")
 
     path_leg = [
         Line2D([], [], color="0.2", ls="-", marker="o", label="legacy full chunk"),
-        Line2D([], [], color="0.2", ls="--", marker="s", label="bridge summary"),
+        Line2D([], [], color="0.2", ls="--", marker="s", mfc="white", label="bridge summary"),
     ]
-    dim_leg = [Line2D([], [], color=colours[d], ls="-", marker="o", label=rf"$d={d}$") for d in dims]
+    dim_leg = [Line2D([], [], color=colours.get(d, COL["grey"]), ls="-", marker="o", label=rf"$d={d}$") for d in dims]
     l1 = ax.legend(handles=path_leg, loc="upper left", fontsize=5.9, borderpad=0.1)
     ax.add_artist(l1)
     ax.legend(handles=dim_leg, loc="lower right", fontsize=5.9, borderpad=0.1)
-    ax.text(2.95, 6.5e6, "tall", color="0.35", fontsize=6.5, ha="center")
-    ax.text(0.5, 6.5e6, "flat /\nsquare", color="0.35", fontsize=6.5, ha="center")
-    fig.savefig(out_dir / "bytes_crossed.pdf")
+    ax.text(4.0, 6.5e6, "tall", color="0.35", fontsize=6.5, ha="center")
+    ax.text(0.33, 6.5e6, "flat / square", color="0.35", fontsize=6.5, ha="center")
+    fig.savefig(out_dir / "network_transfer.pdf")
     plt.close(fig)
-    return out_dir / "bytes_crossed.pdf"
+    return out_dir / "network_transfer.pdf"
 
 
 # --------------------------------------------------------------------------
@@ -292,8 +306,24 @@ def main() -> None:
     ap.add_argument("--out", type=Path, default=Path("benchmark/mergeable_pca/figures"))
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
+
+    # Rebuild the Figure 2 source from the committed measurements first, so the plot can never be
+    # drawn from a stale or hand-edited artifact. build_figure2_source.py measures nothing; it only
+    # combines rows that were already measured and records where each one came from.
+    source = args.results / "figure2_network_transfer.json"
+    if not source.exists():
+        print("building the Figure 2 source from the committed measurements")
+        import build_figure2_source
+
+        payload = build_figure2_source.build(args.results)
+        source.write_text(json.dumps(payload, indent=2) + "\n")
+        print(f"  wrote {source.name}: {payload['provenance']['rows_total']} row(s)")
+        for tick, info in payload["tick_coverage"].items():
+            if not info["rows"]:
+                print(f"  WARNING: x={tick} has no measured row, so that tick is unsupported")
+
     made = [
-        figure_bytes(args.results, args.out),
+        figure_network_transfer(args.results, args.out),
         figure_local_rank(args.results, args.out),
         figure_sizing(args.results, args.out),
     ]
