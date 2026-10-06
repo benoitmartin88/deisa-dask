@@ -2,19 +2,19 @@
 """Generate the mergeable-PCA paper's data figures from the benchmark artifacts.
 
 Every plotted value is read from a JSON result file written by the benchmark
-harness (``benchmark/mergeable_pca/results/*.json``); nothing in this script is
+measurement suite (``benchmark/mergeable_pca/results/*.json``); nothing in this script is
 a hand-entered number.  The figures are vector PDFs sized for a single-column
 ACM layout (3.3 in) with type set to remain legible at final print size.
 
 The three data figures are:
 
-  network_transfer.pdf the network transfer across the coupling boundary, legacy
+  network_transfer.png the network transfer across the coupling boundary, legacy
                        full-chunk scatter versus the bridge-side mergeable summary,
                        full local rank, over the block aspect ratio.
-  local_rank_curve.pdf local rank R against summary size and against the two
+  local_rank_curve.png local rank R against summary size and against the two
                        sign-invariant accuracy metrics, for a single leaf and
                        for the eight-leaf merge.
-  gysela_sizing.pdf    the two gysela flattenings for the production-scale mesh:
+  flatten_sizing.png    the two structured_mesh flattenings for the production-scale mesh:
                        compression ratio (slab / summary) versus rank count.
 
 Run:
@@ -106,7 +106,7 @@ def figure_network_transfer(results_dir: Path, out_dir: Path) -> Path:
     # Neither input artifact alone covers the figure: b1 has four feature dimensions but no x=4,
     # which the figure labels, and the gap-fill run supplies x=4 but only three feature dimensions.
     # Every row in the combined artifact carries measured_by, so the provenance survives to the plot.
-    b1 = _load(results_dir, "figure2_network_transfer.json")
+    b1 = _load(results_dir, "fig_network_transfer.json")
     # build_figure2_source.py already keeps only the rows measured at full local rank, so that is
     # the invariant here rather than a filter over a field the combined rows do not carry.
     rows = list(b1["results"])
@@ -157,16 +157,16 @@ def figure_network_transfer(results_dir: Path, out_dir: Path) -> Path:
     ax.legend(handles=dim_leg, loc="lower right", fontsize=5.9, borderpad=0.1)
     ax.text(4.0, 6.5e6, "tall", color="0.35", fontsize=6.5, ha="center")
     ax.text(0.33, 6.5e6, "flat / square", color="0.35", fontsize=6.5, ha="center")
-    fig.savefig(out_dir / "network_transfer.pdf")
+    fig.savefig(out_dir / "network_transfer.png")
     plt.close(fig)
-    return out_dir / "network_transfer.pdf"
+    return out_dir / "network_transfer.png"
 
 
 # --------------------------------------------------------------------------
 # Figure B4: local-rank accuracy and bandwidth curve.
 # --------------------------------------------------------------------------
 def figure_local_rank(results_dir: Path, out_dir: Path) -> Path:
-    b4 = _load(results_dir, "b4_rank_accuracy_curve.json")
+    b4 = _load(results_dir, "rank_accuracy_curve.json")
     d = 128
     ratio = 8.0  # tall regime: n_block/d = 8
 
@@ -252,16 +252,16 @@ def figure_local_rank(results_dir: Path, out_dir: Path) -> Path:
         fontsize=5.8,
     )
 
-    fig.savefig(out_dir / "local_rank_curve.pdf")
+    fig.savefig(out_dir / "local_rank_curve.png")
     plt.close(fig)
-    return out_dir / "local_rank_curve.pdf"
+    return out_dir / "local_rank_curve.png"
 
 
 # --------------------------------------------------------------------------
-# Figure sizing: the two gysela flattenings on the production mesh.
+# Figure sizing: the two structured_mesh flattenings on the production mesh.
 # --------------------------------------------------------------------------
 def figure_sizing(results_dir: Path, out_dir: Path) -> Path:
-    g = _load(results_dir, "gysela_sizing.json")
+    g = _load(results_dir, "flatten_sizing.json")
     mesh = [512, 128, 64, 128, 8]  # production-scale mesh named in the paper
 
     def series(layout, sub):
@@ -295,9 +295,9 @@ def figure_sizing(results_dir: Path, out_dir: Path) -> Path:
     ax.set_title("Production mesh 512$\\times$128$\\times$64$\\times$128$\\times$8")
     ax.text(5.3, 1.35, "break-even (ratio 1)", fontsize=6.0, color="0.35")
     ax.legend(loc="center left", bbox_to_anchor=(0.015, 0.45))
-    fig.savefig(out_dir / "gysela_sizing.pdf")
+    fig.savefig(out_dir / "flatten_sizing.png")
     plt.close(fig)
-    return out_dir / "gysela_sizing.pdf"
+    return out_dir / "flatten_sizing.png"
 
 
 def main() -> None:
@@ -310,7 +310,7 @@ def main() -> None:
     # Rebuild the Figure 2 source from the committed measurements first, so the plot can never be
     # drawn from a stale or hand-edited artifact. build_figure2_source.py measures nothing; it only
     # combines rows that were already measured and records where each one came from.
-    source = args.results / "figure2_network_transfer.json"
+    source = args.results / "fig_network_transfer.json"
     if not source.exists():
         print("building the Figure 2 source from the committed measurements")
         import build_figure2_source

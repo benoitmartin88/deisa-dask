@@ -57,7 +57,7 @@ the single-leaf case would understate the cost of truncation.
 
 Run
 ---
-    PYTHONPATH=src .venv/bin/python benchmark/mergeable_pca/b4_rank_accuracy_curve.py
+    PYTHONPATH=src .venv/bin/python benchmark/mergeable_pca/rank_accuracy_curve.py
 """
 
 from __future__ import annotations
@@ -72,7 +72,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from harness_common import (  # noqa: E402
+from measurement_common import (  # noqa: E402
     SEED,
     byte_dict,
     make_block,
@@ -280,7 +280,7 @@ def run(dims: tuple[int, ...] = FEATURE_DIMS) -> dict[str, Any]:
 
     return {
         "provenance": provenance(
-            script="b4_rank_accuracy_curve",
+            script="rank_accuracy_curve",
             description=(
                 "Accuracy/bandwidth trade against retained local rank: summary bytes and SIGN-INVARIANT accuracy "
                 "(subspace distance and relative explained-variance error) on one axis, swept across both regimes."
@@ -364,7 +364,7 @@ def main() -> int:
     args = parser.parse_args()
 
     payload = run()
-    path = write_result("b4_rank_accuracy_curve", payload)
+    path = write_result("rank_accuracy_curve", payload)
     if args.out:
         Path(args.out).write_text(path.read_text(), encoding="utf-8")
         path = Path(args.out)

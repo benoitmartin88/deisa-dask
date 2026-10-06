@@ -27,7 +27,7 @@
 # POSSIBILITY OF SUCH DAMAGE.
 # =============================================================================
 """
-Shared measurement utilities for the mergeable-PCA benchmark harness.
+Shared measurement utilities for the mergeable-PCA benchmark measurement suite.
 
 Every experiment script in this package imports its machine/version/seed metadata, its JSON writer, its
 sign-INVARIANT accuracy metrics and its timing policy from here, so the four that matter -- that every figure
@@ -82,17 +82,18 @@ import numpy as np
 #: reproducible on its own and two scripts sharing a stream cannot silently share a draw.
 SEED = 20261004
 
-#: The gysela code generation these sizing numbers describe, so a reader knows WHICH sources were sized against.
-#: The Fortran GYSELA decomposition is superseded and is deliberately absent: it is not measured and not cited.
-GYSELA_SOURCES: dict[str, dict[str, str]] = {
-    "gyselalibxx": {
-        "repository": "https://github.com/gyselax/gyselalibxx",
+#: The structured_mesh code generation these sizing numbers describe, so a reader knows WHICH sources were sized
+#: against.
+#: The Fortran STRUCTURED_MESH decomposition is superseded and is deliberately absent: it is not measured and not cited.
+STRUCTURED_MESH_SOURCES: dict[str, dict[str, str]] = {
+    "structured_meshlibxx": {
+        "repository": "https://github.com/structured_meshx/structured_meshlibxx",
         "branch": "devel",
         "commit": "b9aad37bc0d174ce37e95021573d9b846251d86a",
         "role": "MPILayout distribution semantics (src/mpi_parallelisation/mpilayout.hpp)",
     },
-    "gysela-mini-app_io": {
-        "repository": "https://github.com/gyselax/gysela-mini-app_io",
+    "structured_mesh-mini-app_io": {
+        "repository": "https://github.com/structured_meshx/structured_mesh-mini-app_io",
         "branch": "(detached)",
         "commit": "f39e2a57456e82aabefed140ccd97bd06453f747",
         "role": "field and MPI layout types (src/C++/geometry.hpp)",
@@ -101,6 +102,12 @@ GYSELA_SOURCES: dict[str, dict[str, str]] = {
 
 #: Directory every script writes its raw JSON into. Created on demand by :func:`write_result`.
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
+
+#: Directory of per-configuration resume checkpoints. One JSONL file per artifact stem. A sweep that
+#: dies partway keeps every row it already measured, so the next run re-measures one configuration rather
+#: than the whole grid -- three consecutive runs of these benchmarks were lost entirely by writing the
+#: artifact once at the very end.
+CHECKPOINT_DIR = Path(__file__).resolve().parent / "results/_checkpoints"
 
 #: Default timing policy, applied to every timed measurement unless a script overrides it and says so in its JSON.
 #: Stated here once so no script can quietly time a cold import and call it a result.
@@ -136,7 +143,8 @@ def _library_version(name: str) -> str:
 def _repo_root(start: Path) -> Path:
     """Walk up from ``start`` to the nearest ancestor holding a ``.git`` entry, else return ``start``.
 
-    A fixed ``parents[N]`` is wrong the moment the harness moves, and it fails SILENTLY: ``git rev-parse`` in a
+    A fixed ``parents[N]`` is wrong the moment the measurement suite
+    moves, and it fails SILENTLY: ``git rev-parse`` in a
     non-repository directory returns non-zero and the artifact records ``UNAVAILABLE (git rev-parse failed)``, which
     looks like a missing git rather than a wrong index. Searching for the marker makes the stamp self-locating.
 
@@ -398,7 +406,7 @@ def provenance(script: str, description: str, extra: Mapping[str, Any] | None = 
     """Build the provenance block every artifact carries.
 
     Contains the UTC timestamp, the machine, the versions of every library a baseline or the measurement itself
-    depends on, the seed, the timing policy, the deisa-dask commit, and the pinned gysela sources. A reader can
+    depends on, the seed, the timing policy, the deisa-dask commit, and the pinned structured_mesh sources. A reader can
     re-run the script and compare like for like.
 
     ``timing_policy`` reports :data:`TIMING_POLICY`'s DEFAULTS, so a script that runs fewer repeats than the default
@@ -428,11 +436,12 @@ def provenance(script: str, description: str, extra: Mapping[str, Any] | None = 
             "psutil": _library_version("psutil"),
         },
         "deisa_dask_commit": _git_commit(_repo_root(Path(__file__).resolve())),
-        "gysela_sources": GYSELA_SOURCES,
+        "structured_mesh_sources": STRUCTURED_MESH_SOURCES,
         "disclaimer": (
-            "The gysela mesh extents used by the sizing experiments are SYNTHETIC parameter points chosen to span "
-            "a range of shapes in the same family as the application's index ranges. They are NOT read from a "
-            "production input file and no gysela build was run on this machine; the arrays are simulated in numpy "
+            "The structured_mesh mesh extents used by the sizing experiments are SYNTHETIC parameter points chosen "
+            "to span a range of shapes in the same family as the application's index ranges. They are NOT read from "
+            "a production input file and no structured_mesh build was run on this machine; the arrays are simulated "
+            "in numpy "
             "from the TYPE and LAYOUT semantics of the pinned C++ sources."
         ),
     }
@@ -469,6 +478,110 @@ class NpEncoder(json.JSONEncoder):
         if isinstance(o, Path):
             return str(o)
         return super().default(o)
+
+
+def checkpoint_path(script: str) -> Path:
+    """Return the JSONL resume-checkpoint path for ``script``.
+
+    - ``:param script:`` Script name, the artifact file stem.
+    - ``:return:`` Path of the checkpoint file, whether or not it exists.
+    """
+    return CHECKPOINT_DIR / f"{script}.jsonl"
+
+
+def checkpoint_config_key(script: str, key: Any) -> _Checkpoint:
+    """Start a checkpointed sweep for ``script``.
+
+    - ``:param script:`` Script name, the artifact file stem.
+    - ``:param key:`` Value identifying the configuration, compared against what a prior run stored. It
+      must be JSON-serialisable, because it is written next to each row.
+    - ``:return:`` A checkpoint handle with :meth:`_Checkpoint.load`/``append``/``commit`` on it.
+    """
+    return _Checkpoint(script, key)
+
+
+class _Checkpoint:
+    """Append-only per-configuration resume state for one sweep.
+
+    Each measured configuration is appended to ``results/_checkpoints/<script>.jsonl`` the moment it is
+    measured, flushed to disk immediately. :meth:`load` replays a prior run's rows so the grid resumes
+    where it stopped instead of restarting, which is what three prior attempts failed to survive.
+
+    The checkpoint is NOT part of the published artifact: :meth:`commit` only consumes it, and
+    :func:`write_result` remains the single place an artifact is written. A checkpoint whose recorded
+    ``repeats`` differs from the current run is refused rather than silently mixed, because timings taken
+    at different repeat counts are not comparable.
+    """
+
+    def __init__(self, script: str, key: Any) -> None:
+        self.script = script
+        self.key = key
+        self.path = checkpoint_path(script)
+        self.rows: list[dict[str, Any]] = []
+
+    def load(self, repeats: int | None = None) -> list[dict[str, Any]]:
+        """Replay previously checkpointed rows for this configuration.
+
+        Rows recorded at a different ``repeats`` count are discarded and reported, never merged.
+
+        - ``:param repeats:`` Timed repeats the current run will use. ``None`` accepts any prior count.
+        - ``:return:`` The reusable rows, each carrying the ``config_key`` it was measured for.
+        """
+        if not self.path.exists():
+            return []
+        kept: list[dict[str, Any]] = []
+        dropped: list[str] = []
+        for line in self.path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                # A torn final line from a hard kill: ignore it, the configuration is simply re-measured.
+                continue
+            if record.get("status") == "skipped":
+                continue
+            if repeats is not None and record.get("repeats") not in (None, repeats):
+                dropped.append(f"{record.get('config_key')} @ repeats={record.get('repeats')}")
+                continue
+            if record.get("row") is not None:
+                kept.append(record["row"])
+        self.rows = kept
+        if dropped:
+            print(
+                f"  checkpoint: discarded {len(dropped)} row(s) recorded at a different repeat count "
+                f"(repeats={repeats}): {', '.join(dropped[:4])}" + (" ..." if len(dropped) > 4 else ""),
+                flush=True,
+            )
+        return kept
+
+    def append(self, row: Mapping[str, Any], repeats: int | None = None, **extra: Any) -> None:
+        """Persist one measured row immediately, so a later crash cannot lose it.
+
+        - ``:param row:`` The measured configuration row, as it will appear in the artifact.
+        - ``:param repeats:`` Timed repeats this row was measured with, recorded for the mismatch guard.
+        - ``:param extra:`` Additional top-level keys to store alongside the row, e.g. ``status``.
+        """
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        record: dict[str, Any] = {"config_key": self.key, "repeats": repeats, "row": dict(row)}
+        record.update(extra)
+        with self.path.open("a", encoding="utf-8") as fp:
+            fp.write(json.dumps(record, cls=NpEncoder, allow_nan=False) + "\n")
+            fp.flush()
+            os.fsync(fp.fileno())
+
+    def commit(self) -> None:
+        """Delete the checkpoint once its rows are safely inside a written artifact."""
+        self.path.unlink(missing_ok=True)
+
+    def __enter__(self) -> _Checkpoint:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        # Deliberately no-op: the checkpoint must SURVIVE the context exit on failure, or the whole
+        # point of writing it is lost. Only commit(), after a successful write_result(), removes it.
+        return None
 
 
 def write_result(script: str, payload: Mapping[str, Any]) -> Path:
@@ -852,12 +965,17 @@ def _render_bytes(value: float) -> str:
     end of a sweep whose large end is tens of GiB. Each unit is used only within its own decade, so the smallest
     non-zero value never renders as "0.00".
 
+    A NEGATIVE byte count renders with its sign and its magnitude's unit rather than as "0 B". A saving can be
+    negative -- a summary that is larger than the block it summarizes -- and rounding that to "0 B" would hide a
+    measured result behind a rendering artifact: the reader would see a configuration with no saving when the
+    measurement says it sends MORE than the legacy path.
+
     - ``:param value:`` Byte count, in the unit ``value`` was passed in.
     """
     for threshold, unit, scale in ((2**30, "GiB", 2**30), (2**20, "MiB", 2**20), (2**10, "KiB", 2**10)):
-        if value >= threshold:
+        if abs(value) >= threshold:
             return f"{value / scale:.2f} {unit}"
-    return f"{value:.0f} B" if value > 0 else "0 B"
+    return f"{value:.0f} B" if value != 0 else "0 B"
 
 
 def print_summary_table(

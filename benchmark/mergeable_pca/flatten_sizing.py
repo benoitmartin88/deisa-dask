@@ -69,7 +69,7 @@ Sweeping rank count is therefore mandatory; a benchmark at one rank count misses
 
 Run
 ---
-    PYTHONPATH=src .venv/bin/python benchmark/mergeable_pca/gysela_sizing.py
+    PYTHONPATH=src .venv/bin/python benchmark/mergeable_pca/flatten_sizing.py
 """
 
 from __future__ import annotations
@@ -82,7 +82,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from harness_common import (  # noqa: E402
+from measurement_common import (  # noqa: E402
     byte_dict,
     print_summary_table,
     provenance,
@@ -349,7 +349,7 @@ def run() -> dict[str, Any]:
 
     return {
         "provenance": provenance(
-            script="gysela_sizing",
+            script="flatten_sizing",
             description=(
                 "Sizing of the two candidate PCA flattenings for a gyrokinetic distribution indexed "
                 "(Species, Tor1, Tor2, Tor3, Vpar, Mu), swept over mesh shape and RANK COUNT. Layout A "
@@ -427,7 +427,7 @@ def main() -> int:
     args = parser.parse_args()
 
     payload = run()
-    path = write_result("gysela_sizing", payload)
+    path = write_result("flatten_sizing", payload)
     if args.out:
         Path(args.out).write_text(path.read_text(), encoding="utf-8")
         path = Path(args.out)

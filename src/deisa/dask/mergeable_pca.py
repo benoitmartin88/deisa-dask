@@ -802,7 +802,7 @@ class MergeablePCA:
         return transposed.reshape((n_samples, n_features))
 
     def _check_feature_chunks(self, X, features: tuple[int, ...], labels: tuple[str, ...]) -> None:
-        """Refuse a FEATURE axis split across Dask chunks, naming the axes and the gysela remedy.
+        """Refuse a FEATURE axis split across Dask chunks, naming the axes and the structured_mesh remedy.
 
         This guard applies only where it genuinely applies: the feature dimension of a mergeable summary must be
         complete on the rank that holds it, because a merge stacks summaries by feature position. Under Layout A that is

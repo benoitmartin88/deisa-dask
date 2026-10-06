@@ -585,9 +585,9 @@ def test_analyze_strict_raises(source, arr_factory, expected_exc) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Gysela-style patterns
+# StructuredMesh-style patterns
 # ---------------------------------------------------------------------------
-def test_gysela_density_helper() -> None:
+def test_structured_mesh_density_helper() -> None:
     """``density(f, grid) = da.sum(f, axis=(0, 3, 4)) * grid.dvx * grid.dvy``."""
     arr = da.zeros((4, 5, 10, 10, 10), chunks=(1, 5, 5, 5, 5), dtype=np.float64)
     client_stub = _FakeClient()
@@ -605,7 +605,7 @@ def test_gysela_density_helper() -> None:
     assert _hint_keys(hints) == ["f-sum"]
 
 
-def test_gysela_measure_helper_loop() -> None:
+def test_structured_mesh_measure_helper_loop() -> None:
     """The measure() helper has 5 reductions and is called in a loop over species.
 
     The compute boundary is the ``client.compute([...])`` inside measure.

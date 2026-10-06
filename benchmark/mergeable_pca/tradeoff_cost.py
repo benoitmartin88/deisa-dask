@@ -74,8 +74,8 @@ CLAIMED BENEFIT is out of scope: the mergeable path loses that comparison and sa
 
 Run
 ---
-    PYTHONPATH=src .venv/bin/python benchmark/mergeable_pca/b6_tradeoff_cost.py
-    PYTHONPATH=src .venv/bin/python benchmark/mergeable_pca/b6_tradeoff_cost.py --repeats 3
+    PYTHONPATH=src .venv/bin/python benchmark/mergeable_pca/tradeoff_cost.py
+    PYTHONPATH=src .venv/bin/python benchmark/mergeable_pca/tradeoff_cost.py --repeats 3
 """
 
 from __future__ import annotations
@@ -92,7 +92,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from harness_common import (  # noqa: E402
+from measurement_common import (  # noqa: E402
     SEED,
     TIMING_POLICY,
     byte_dict,
@@ -112,7 +112,7 @@ from harness_common import (  # noqa: E402
 from deisa.dask.mergeable_pca import local_pca, merge_tree  # noqa: E402
 
 #: Artifact stem.
-ARTIFACT_STEM = "b6_tradeoff_cost"
+ARTIFACT_STEM = "tradeoff_cost"
 
 #: Bridges per configuration. 32 is the paper's multi-bridge anchor; the merge tree is what this measures,
 #: and the per-bridge work is measured at the SAME shape for every configuration so the two are separable.
@@ -227,7 +227,7 @@ def measure_configuration(
 
     # Accuracy of the 32-way merge against the single-process reference, because a 32-way merge that returns
     # a plausible but WRONG answer is worse than no measurement at all.
-    from harness_common import subspace_distance
+    from measurement_common import subspace_distance
 
     k = min(int(merged.rank), int(pooled_summary.rank))
     merge_vs_full = subspace_distance(merged.components[:k], pooled_summary.components[:k])
@@ -343,7 +343,7 @@ def _grid_key() -> dict[str, Any]:
 def _load_checkpoint_rows(checkpoint: Any, repeats: int) -> dict[str, dict[str, Any]]:
     """Return this run's already-measured configurations, keyed for reuse.
 
-    - ``:param checkpoint:`` The handle from :func:`harness_common.checkpoint_config_key`.
+    - ``:param checkpoint:`` The handle from :func:`measurement_common.checkpoint_config_key`.
     - ``:param repeats:`` Timed repeats this run will use.
     - ``:return:`` ``{config_key: row}`` for rows that are safe to replay.
     """
@@ -455,7 +455,7 @@ def run(
     rows: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
 
-    # Resume support, same rationale as baseline_comparison: each configuration costs minutes, so a sweep
+    # Resume support, same rationale as transfer_comparison: each configuration costs minutes, so a sweep
     # that writes its artifact only at the end loses everything to any single interruption.
     checkpoint = checkpoint_config_key(ARTIFACT_STEM, _grid_key())
     reusable = _load_checkpoint_rows(checkpoint, repeats)
@@ -544,7 +544,7 @@ def run(
             "everything measured here is SINGLE-NODE: bytes and in-process compute. The break-even bandwidth "
             "is DERIVED ARITHMETIC on two measured quantities (bytes_saved / added_compute), not a measured "
             "link speed, and it names no assumed bandwidth of its own. A real transfer time requires the "
-            "multi-node Grid5000 measurement, which is a separate experiment. The Gysela anchor "
+            "multi-node Grid5000 measurement, which is a separate experiment. The Structured mesh anchor "
             "(512,128,64,128,8), d=524288 and a full summary on the order of 2 TB against a roughly 4 GB "
             "slab are ARITHMETIC FROM THE SIZING MODEL, not measurements."
         ),

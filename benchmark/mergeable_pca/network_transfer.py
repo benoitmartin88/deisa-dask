@@ -70,12 +70,28 @@ deliberately does NOT compare sizes: on the flat side a full-rank summary legiti
 elements as the block it summarizes, which is the documented regime boundary reported separately as
 ``summary_not_smaller_than_block``, not a violation.
 
+Bytes saved, not only the factor
+--------------------------------
+Every row reports THREE things: the two absolute wire payloads, the RATIO between them, and the
+absolute ``bytes_saved`` -- ``legacy_wire_bytes - pca_wire_bytes`` -- in bytes, KiB, MiB and GiB. A
+ratio makes the reader do that subtraction themselves, and the number they want ("how much data do
+we stop sending") is the subtraction, not the factor. The saving is ``PER BLOCK PER BRIDGE SEND``,
+the unit this run actually measures: it is never multiplied up by a step count or a block count,
+because this run measures one block and knows neither.
+
+The field name says which it is. ``bytes_saved_per_block_measured`` is arithmetic on two MEASURED
+payloads of the same configuration through the same serializer. Anything computed by multiplying a
+per-block figure by a count -- in this repository that is B6, which measures a multi-bridge run --
+carries ``_derived`` in its name and says so in its own field. A derived total is never presented as
+a measurement, and a negative saving is never clipped to zero: the flat-regime rows genuinely send
+MORE than the legacy path, and that is a result.
+
 Only the transfer reduction is measured
 ---------------------------------------
-The result here is a byte ratio, so a byte ratio is what is reported: how many bytes cross the
-boundary under the legacy full-chunk scatter, and under the bridge-side summary. Nothing else is
-measured because nothing else is reported, and an unmeasured column is the failure mode this script
-is built to avoid.
+The result here is bytes crossing the boundary, so bytes crossing the boundary is what is reported:
+how many bytes cross under the legacy full-chunk scatter, and under the bridge-side summary. Nothing
+else is measured because nothing else is reported, and an unmeasured column is the failure mode this
+script is built to avoid.
 
 So there is deliberately NO per-row duration and NO per-row peak memory, and the omission is a
 decision rather than a phase that failed to run:
@@ -95,7 +111,7 @@ Omitting the number is honest; filling it with a plausible value would not be.
 
 Run
 ---
-    PYTHONPATH=src .venv/bin/python benchmark/mergeable_pca/b1_network_transfer.py
+    PYTHONPATH=src .venv/bin/python benchmark/mergeable_pca/network_transfer.py
 """
 
 from __future__ import annotations
@@ -112,7 +128,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from harness_common import (  # noqa: E402
+from measurement_common import (  # noqa: E402
     SEED,
     byte_dict,
     cgroup_memory_limit_bytes,
@@ -129,9 +145,9 @@ from harness_common import (  # noqa: E402
 
 from deisa.dask.mergeable_pca import PCASummary, local_pca, merge_tree  # noqa: E402
 
-#: Artifact stem. Distinct from ``b1_smoke`` on purpose: the smoke file is a capped dry run of a
+#: Artifact stem. Distinct from ``smoke`` on purpose: the smoke file is a capped dry run of a
 #: retired script and is NOT paper data, so the two must never be confusable in a results directory.
-ARTIFACT_STEM = "b1_network_transfer"
+ARTIFACT_STEM = "network_transfer"
 
 #: The paper's lead configuration, measured at its true shape: a 2048x256 chunk. The quoted result is a
 #: 4.000 MiB legacy payload against a 0.5042 MiB full-rank summary, a 7.9x reduction.
@@ -305,6 +321,18 @@ def measure_one(
         "merged_root_rank": int(merged.rank),
         "merged_root_n_samples": int(merged.n_samples),
         "bytes_saved_vs_legacy_wire": int(legacy_wire) - int(pca_wire),
+        # Absolute saving, in the SAME units as the two wire sizes it comes from. Both operands are measured
+        # through the same serializer on this configuration, so the difference is measured arithmetic on two
+        # measurements -- NOT a per-step or per-run total, and it carries no assumption about how many steps
+        # or blocks a run performs. A ratio makes the reader do this subtraction; the paper needs it done.
+        "bytes_saved_per_block_measured": byte_dict(int(legacy_wire) - int(pca_wire)),
+        "bytes_saved_per_block_measured_is_negative": bool(int(legacy_wire) < int(pca_wire)),
+        "bytes_saved_definition": (
+            "legacy_wire_bytes - pca_wire_bytes, i.e. the number of bytes that do NOT cross the bridge "
+            "boundary on this one block, per bridge send, per timestep. It is negative exactly when the "
+            "summary is larger than the chunk, which is the flat-regime boundary, and the sign is kept "
+            "rather than clipped to zero: a row with no size reduction is a measured result"
+        ),
     }
 
 
@@ -441,7 +469,7 @@ def run() -> dict[str, Any]:
     time remained to report it; with a grid this small that ordering bought nothing and cost the
     headline number its place at the front of the run.
 
-    - ``:return:`` The artifact payload, ready for :func:`harness_common.write_result`.
+    - ``:return:`` The artifact payload, ready for :func:`measurement_common.write_result`.
     """
     cap_bytes = cgroup_memory_limit_bytes()
 
@@ -457,6 +485,7 @@ def run() -> dict[str, Any]:
                 f"  measured n_block={n_block:>7} d={d:<5} rank={str(local_rank):<4} "
                 f"legacy={row['legacy_wire_bytes']['MiB']:9.4f} MiB "
                 f"summary={row['pca_wire_bytes']['MiB']:9.4f} MiB "
+                f"saved={row['bytes_saved_per_block_measured']['MiB']:9.4f} MiB "
                 f"ratio={row['compression_ratio_legacy_vs_pca_wire']:.4f} "
                 f"[{claim}]",
                 flush=True,
@@ -509,7 +538,7 @@ def run() -> dict[str, Any]:
                 # default, so this run must OVERRIDE it rather than restate it to a repeat count of 1: a
                 # restated "1" still reads as a timing policy, and this artifact times nothing. The
                 # override is an empty object rather than null because provenance() stamps the key
-                # unconditionally, and the harness's repeat-count gate reads it as a mapping; emptying it
+                # unconditionally, and the measurement suite's repeat-count gate reads it as a mapping; emptying it
                 # drops every field under it (clock, warmup_rounds, timed_repeats, statistic, dispersion)
                 # while leaving the gate satisfied, since a dict with no timed_repeats claims no count.
                 "timing_policy": {},
@@ -517,7 +546,7 @@ def run() -> dict[str, Any]:
                     "deliberately emptied, not accidentally: this run reports a byte ratio and a serialized "
                     "size is deterministic given its input, so there is no timing to report and no policy "
                     "to declare. There is no repeat count anywhere in this artifact, because a count of 1 "
-                    "with a median and no dispersion behind it is the provenance defect the shared harness "
+                    "with a median and no dispersion behind it is the provenance defect the shared measurement suite "
                     "exists to catch"
                 ),
                 "inputs": {
@@ -572,6 +601,14 @@ def run() -> dict[str, Any]:
                         "it isolates the payload arithmetic from the framing overhead, which is the whole "
                         "reason the flat ratios sit just below 1.0 rather than at 1.0"
                     ),
+                    "bytes_saved_per_block_measured": (
+                        "legacy_wire_bytes - pca_wire_bytes in BYTES, KiB, MiB and GiB. MEASURED in the sense "
+                        "that matters: both operands are measured wire payloads of THIS configuration through "
+                        "the same serializer, so the difference is arithmetic on two measurements rather "
+                        "than a model output. It is PER BLOCK PER BRIDGE SEND, and it is deliberately not "
+                        "multiplied up by any step count or block count here, because this run measures one "
+                        "block and knows neither"
+                    ),
                 },
             },
         ),
@@ -599,6 +636,7 @@ def run() -> dict[str, Any]:
                     "legacy_wire_bytes": headline_row["legacy_wire_bytes"],
                     "pca_wire_bytes": headline_row["pca_wire_bytes"],
                     "ratio": headline_row["compression_ratio_legacy_vs_pca_wire"],
+                    "bytes_saved_per_block_measured": headline_row["bytes_saved_per_block_measured"],
                 },
             },
             "rank_truncation_local_rank_8": {
@@ -619,6 +657,7 @@ def run() -> dict[str, Any]:
                     "pca_wire_bytes": truncated_row["pca_wire_bytes"],
                     "legacy_wire_bytes": truncated_row["legacy_wire_bytes"],
                     "ratio": truncated_row["compression_ratio_legacy_vs_pca_wire"],
+                    "bytes_saved_per_block_measured": truncated_row["bytes_saved_per_block_measured"],
                 },
             },
             "tall_regime_range": {
@@ -636,6 +675,12 @@ def run() -> dict[str, Any]:
                     "ceiling": None
                     if tall_ceiling_row is None
                     else tall_ceiling_row["compression_ratio_legacy_vs_pca_wire"],
+                    "floor_bytes_saved_per_block_measured": None
+                    if tall_floor_row is None
+                    else tall_floor_row["bytes_saved_per_block_measured"],
+                    "ceiling_bytes_saved_per_block_measured": None
+                    if tall_ceiling_row is None
+                    else tall_ceiling_row["bytes_saved_per_block_measured"],
                 },
                 "tall_ratios_measured": sorted(tall_defined),
                 "paper_quoted_range": {"min": 1.83, "max": 7.97},
@@ -711,7 +756,7 @@ def run() -> dict[str, Any]:
             "flat_at_absolute_scale_not_measured": (
                 "a flat point at slab-realistic ABSOLUTE size is not attempted: it needs a block with many "
                 "features, and an SVD cost that grows with the cube of the feature dimension. That case is "
-                "the gysela_sizing model's, where it is ARITHMETIC, and arithmetic must never be reported "
+                "the flatten_sizing model's, where it is ARITHMETIC, and arithmetic must never be reported "
                 "as a measurement however large the machine's memory is"
             ),
             "local_worker_results_out_of_scope": (
@@ -780,7 +825,14 @@ def _print(payload: Mapping[str, Any]) -> None:
     inv = payload["invariant_check"]
     for row in rows:
         missing = [
-            k for k in ("compression_ratio_legacy_vs_pca_wire", "legacy_wire_bytes", "pca_wire_bytes") if k not in row
+            k
+            for k in (
+                "compression_ratio_legacy_vs_pca_wire",
+                "legacy_wire_bytes",
+                "pca_wire_bytes",
+                "bytes_saved_per_block_measured",
+            )
+            if k not in row
         ]
         if missing:
             raise KeyError(f"b1 _print: row {row.get('n_block')}x{row.get('n_features')} is missing {missing}")
@@ -800,9 +852,10 @@ def _print(payload: Mapping[str, Any]) -> None:
             ("block_bytes", "block", "auto"),
             ("legacy_wire_bytes", "transfer_legacy", "auto"),
             ("pca_wire_bytes", "transfer_summary", "auto"),
+            ("bytes_saved_per_block_measured", "saved", "auto"),
             ("compression_ratio_legacy_vs_pca_wire", "ratio", "float"),
         ),
-        title="absolute transfer bytes and ratio, one row per configuration",
+        title="absolute transfer bytes, absolute saving and ratio, one row per configuration",
     )
     print("\nclaims:")
     for name, claim in payload["paper_claims_supported"].items():
@@ -836,7 +889,7 @@ def main() -> int:
     parser.add_argument(
         "--out",
         default=None,
-        help="Optional explicit artifact path (default: results/b1_network_transfer.json)",
+        help="Optional explicit artifact path (default: results/network_transfer.json)",
     )
     args = parser.parse_args()
 

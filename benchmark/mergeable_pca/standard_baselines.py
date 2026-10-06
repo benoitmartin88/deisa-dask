@@ -56,16 +56,16 @@ accuracy number here is therefore one of:
   one. 0 iff the spans coincide, 1 iff orthogonal, and invariant to sign flips AND to rotation inside the span.
 - ``subspace_distance_vs_exact``: the same metric against the exact batch SVD, the INDEPENDENT truth.
 - ``explained_variance_ratio_error`` / ``total_variance_relative_error`` / ``captured_variance_fraction``: from
-  :func:`harness_common.variance_errors`, computed on SINGULAR VALUES, which are sign-free.
+  :func:`measurement_common.variance_errors`, computed on SINGULAR VALUES, which are sign-free.
 - ``reconstruction_relative_error``: ``||Xc - Xc B^T B||_F / ||Xc||_F`` on the centered data. Sign-invariant, because
   ``Xc B^T B`` is the projector onto ``span(B)`` and a sign flip or an in-span rotation leaves it unchanged.
 
-:func:`harness_common.enforce_sign_invariant_results` runs on every write, so a raw component error cannot reach this
-artifact even by accident.
+:func:`measurement_common.enforce_sign_invariant_results` runs on every write, so a raw component error cannot
+reach this artifact even by accident.
 
 Regimes are reported SEPARATELY, never averaged
 -----------------------------------------------
-Every configuration is tagged ``tall`` / ``square`` / ``flat`` by :func:`harness_common.regime_of`, and the summary
+Every configuration is tagged ``tall`` / ``square`` / ``flat`` by :func:`measurement_common.regime_of`, and the summary
 block is computed per regime. This is not bookkeeping. The mergeable path is exact only at FULL local rank
 ``min(n_block, d)``, and a full-rank summary is smaller than its input only when ``n_block > d``. So the flat regime
 runs the mergeable path at a structural DISADVANTAGE -- it does the same work and pays the reduction on top -- and the
@@ -92,8 +92,8 @@ Three asymmetries are stated rather than smoothed over, because each one is a re
 
 Run
 ---
-    PYTHONPATH=src .venv/bin/python benchmark/mergeable_pca/b5_standard_baselines.py
-    PYTHONPATH=src .venv/bin/python benchmark/mergeable_pca/b5_standard_baselines.py --repeats 7
+    PYTHONPATH=src .venv/bin/python benchmark/mergeable_pca/standard_baselines.py
+    PYTHONPATH=src .venv/bin/python benchmark/mergeable_pca/standard_baselines.py --repeats 7
 """
 
 from __future__ import annotations
@@ -111,7 +111,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from harness_common import (  # noqa: E402
+from measurement_common import (  # noqa: E402
     SEED,
     TIMING_POLICY,
     byte_dict,
@@ -173,7 +173,7 @@ METRIC_DEFINITIONS: dict[str, str] = {
     ),
     "explained_variance_ratio_error": (
         "sum over the scored components of |explained-variance ratio of the arm - the same ratio of the exact "
-        "reference|. Computed on SINGULAR VALUES, which are sign-free, via harness_common.variance_errors with "
+        "reference|. Computed on SINGULAR VALUES, which are sign-free, via measurement_common.variance_errors with "
         "ddof=1 to match scikit-learn. 0 means the variance profile matches exactly."
     ),
     "captured_variance_fraction": (
@@ -208,7 +208,7 @@ def load_baselines() -> dict[str, Any]:
     """Import every baseline once and record its availability.
 
     The card makes these baselines mandatory, so an unavailable one is a FINDING recorded in the artifact with its
-    reason, rather than a traceback that loses the whole sweep. :func:`harness_common.safe_import` returns ``None``
+    reason, rather than a traceback that loses the whole sweep. :func:`measurement_common.safe_import` returns ``None``
     instead of raising.
 
     - ``:return:`` ``{name: {"available": bool, "object": ..., "role": str, "import_error": str}}`` per baseline.
@@ -1031,7 +1031,7 @@ def run(
 
     return {
         "provenance": provenance(
-            script="b5_standard_baselines",
+            script="standard_baselines",
             description=(
                 "The mergeable path against the standard libraries: dask_ml.decomposition.IncrementalPCA, "
                 "sklearn.decomposition.PCA, sklearn.decomposition.IncrementalPCA, scipy.linalg.svd and batch "
@@ -1057,7 +1057,7 @@ def run(
                     "a raw component-wise |A - B| reads O(1) even for two IDENTICAL subspaces and is non-monotonic "
                     "in k. "
                     "Every accuracy number here is a span, singular-value or reconstruction metric, and "
-                    "harness_common.enforce_sign_invariant_results refuses to write an artifact carrying a raw "
+                    "measurement_common.enforce_sign_invariant_results refuses to write an artifact carrying a raw "
                     "component error."
                 ),
                 "reference": (
@@ -1167,7 +1167,7 @@ def main() -> int:
     args = parser.parse_args()
 
     payload = run(repeats=args.repeats, memory_repeats=args.memory_repeats)
-    path = write_result("b5_standard_baselines", payload)
+    path = write_result("standard_baselines", payload)
     if args.out:
         Path(args.out).write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
         path = Path(args.out)

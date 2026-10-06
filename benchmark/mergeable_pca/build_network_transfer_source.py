@@ -4,19 +4,21 @@ Figure 2 plots one number per (feature dimension, block aspect ratio): the bytes
 would put on the wire for one bridge, against the bytes a bridge summary occupies. Those two
 quantities were measured by two different scripts, and neither artifact alone covers the figure:
 
-  - ``b1_network_transfer.json`` has 4 feature dimensions (32, 128, 256, 512) but only 5 distinct
+  - ``network_transfer.json`` has 4 feature dimensions (32, 128, 256, 512) but only 5 distinct
     aspect ratios, and no ``x=4``, which the figure draws as a tick.
-  - ``b6_tradeoff_cost_gapfill.json`` supplies the missing ``x=4`` column and many more ratios, but
+  - ``tradeoff_cost_gapfill.json`` supplies the missing ``x=4`` column and many more ratios, but
     only 3 feature dimensions (32, 128, 512).
 
 So the figure is built from both. This script does NOT measure anything: it only projects rows onto
 the two fields the figure needs and records where each row came from, so a reader can tell measured
 from carried and can see that no value in the figure was invented here.
 
-Basis note, which matters for correctness: b1 reports ``block_bytes``/``summary_bytes`` for a single
-bridge, while b6 reports ``*_all_bridges_measured`` totals over 32 bridges. Those are not comparable.
-The figure is per-bridge, so this script uses b6's ``per_bridge_block_measured`` and
-``per_bridge_leaf_summary_measured``, which are the same quantity b1 records.
+Basis note, which matters for correctness: the single-bridge sweep
+    reports ``block_bytes``/``summary_bytes`` for a single
+bridge, while the multi-bridge sweep reports
+    ``*_all_bridges_measured`` totals over 32 bridges. Those are not comparable.
+The figure is per-bridge, so this script uses the multi-bridge sweep's ``per_bridge_block_measured`` and
+``per_bridge_leaf_summary_measured``, which are the same quantity the single-bridge sweep records.
 
 - ``:param results_dir:`` Directory holding the committed result JSON.
 - ``:param out_path:`` Where to write the combined artifact.
@@ -57,7 +59,7 @@ def _project(row: dict[str, Any], source: str) -> dict[str, Any] | None:
         return None
 
     if "block_bytes" in row and "summary_bytes" in row:
-        # b1 schema: already per-bridge.
+        # the single-bridge sweep schema: already per-bridge.
         block = row["block_bytes"]["bytes"]
         summary = row["summary_bytes"]["bytes"]
     else:
@@ -75,7 +77,7 @@ def _project(row: dict[str, Any], source: str) -> dict[str, Any] | None:
         "n_block_over_d": row.get("n_block_over_d", n_block / d),
         # Recorded explicitly so the invariant is visible in the artifact and not only in this code.
         "local_rank_requested": None,
-        # Kept in the same nested shape b1 uses, so plot_figures.py reads either schema unchanged.
+        # Kept in the same nested shape the single-bridge sweep uses, so plot_figures.py reads either schema unchanged.
         "block_bytes": {"bytes": float(block)},
         "summary_bytes": {"bytes": float(summary)},
         "intrinsic_rank": row.get("intrinsic_rank"),
@@ -90,8 +92,8 @@ def build(results_dir: Path) -> dict[str, Any]:
     - ``:return:`` The combined payload.
     """
     sources = (
-        ("b6_tradeoff_cost_gapfill.json", "b6_tradeoff_cost"),
-        ("b1_network_transfer.json", "b1_network_transfer"),
+        ("tradeoff_cost_gapfill.json", "tradeoff_cost"),
+        ("network_transfer.json", "network_transfer"),
     )
 
     rows: list[dict[str, Any]] = []
@@ -104,7 +106,7 @@ def build(results_dir: Path) -> dict[str, Any]:
                 continue
             key = (projected["n_block"], projected["n_features"])
             if key in seen:
-                # b6 is listed first, so it wins. Duplicates are the same configuration measured
+                # the multi-bridge sweep is listed first, so it wins. Duplicates are the same configuration measured
                 # by both scripts; keeping one avoids double-weighting a point in the figure.
                 continue
             seen.add(key)
@@ -123,7 +125,7 @@ def build(results_dir: Path) -> dict[str, Any]:
     return {
         "figure": "network transfer vs block aspect ratio, per bridge, at full local rank",
         "basis": (
-            "per bridge, not per run: b1's block_bytes/summary_bytes and b6's "
+            "per bridge, not per run: the single-bridge sweep's block_bytes/summary_bytes and the multi-bridge sweep's "
             "per_bridge_block_measured/per_bridge_leaf_summary_measured are the same quantity, so "
             "the two artifacts are combined on that common basis"
         ),
@@ -142,7 +144,7 @@ def build(results_dir: Path) -> dict[str, Any]:
 def main() -> int:
     here = Path(__file__).resolve().parent
     results_dir = here / "results"
-    out_path = results_dir / "figure2_network_transfer.json"
+    out_path = results_dir / "fig_network_transfer.json"
 
     payload = build(results_dir)
     out_path.write_text(json.dumps(payload, indent=2) + "\n")

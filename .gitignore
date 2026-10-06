@@ -5,3 +5,5 @@ res/
 *.egg-info/
 uv.lock
 
+benchmark/mergeable_pca/results/
+benchmark/mergeable_pca/figures/

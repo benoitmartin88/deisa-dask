@@ -35,12 +35,12 @@ Why a consolidation script and not a copy of three artifacts
 Three committed artifacts each hold part of the picture, and a reader comparing them by hand has to do
 arithmetic across files that disagree about units and about which rows exist:
 
-- ``b1_network_transfer.json`` measures WIRE BYTES only. It carries no timing at all, deliberately: a
+- ``network_transfer.json`` measures WIRE BYTES only. It carries no timing at all, deliberately: a
   serialized size is deterministic given its input, so a duration for it would be one sample with no
   dispersion behind it.
-- ``b5_standard_baselines.json`` measures TIME, PEAK MEMORY and ACCURACY for five standard methods
+- ``standard_baselines.json`` measures TIME, PEAK MEMORY and ACCURACY for five standard methods
   against the mergeable path, but carries no wire bytes.
-- ``b4_rank_accuracy_curve.json`` sweeps LOCAL RANK for accuracy, and is the only place the truncated-rank
+- ``rank_accuracy_curve.json`` sweeps LOCAL RANK for accuracy, and is the only place the truncated-rank
   degradation is measured.
 
 This script re-derives nothing it does not have to. It runs ONE measurement of its own -- the in-process
@@ -73,8 +73,8 @@ the legacy path, and none is presented as being.
 
 Run
 ---
-    PYTHONPATH=src .venv/bin/python benchmark/mergeable_pca/baseline_comparison.py
-    PYTHONPATH=src .venv/bin/python benchmark/mergeable_pca/baseline_comparison.py --repeats 5
+    PYTHONPATH=src .venv/bin/python benchmark/mergeable_pca/transfer_comparison.py
+    PYTHONPATH=src .venv/bin/python benchmark/mergeable_pca/transfer_comparison.py --repeats 5
 """
 
 from __future__ import annotations
@@ -82,6 +82,7 @@ from __future__ import annotations
 import argparse
 import gc
 import importlib
+import json
 import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -91,11 +92,13 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from harness_common import (  # noqa: E402
+from measurement_common import (  # noqa: E402
     SEED,
     TIMING_POLICY,
     byte_dict,
     cgroup_memory_limit_bytes,
+    checkpoint_config_key,
+    checkpoint_path,
     make_block,
     peak_rss_bytes,
     print_summary_table,
@@ -109,7 +112,7 @@ from harness_common import (  # noqa: E402
 from deisa.dask.mergeable_pca import local_pca, merge_tree  # noqa: E402
 
 #: Artifact stem.
-ARTIFACT_STEM = "baseline_comparison"
+ARTIFACT_STEM = "transfer_comparison"
 
 #: The five standard methods this card requires, in the order the paper should name them. The name is the
 #: ``b5`` arm key, so a row here and an arm there are the same thing and a reader can join on it.
@@ -150,11 +153,15 @@ N_BLOCKS = 8
 #: are here so the accuracy table has BOTH ends of the trade in ONE artifact, not only the exact end.
 LOCAL_RANKS: tuple[int | None, ...] = (8, 32, None)
 
-#: Shapes. Deliberately SMALL: this script times every method with real repeats, and it also runs the
-#: dask-ml arm, so a large block is minutes per method for no extra information. The bandwidth side of the
-#: claim is ``b1``'s and ``b6``'s question, at sizes they can afford.
+#: Shapes. Deliberately SMALL, and CHOSEN FROM A COST PROBE rather than picked for looks. Every method is
+#: timed with real repeats and dask-ml runs on every configuration, so cost is superlinear in the pooled
+#: shape: measured on this machine at 2 timed repeats, 128x512 took 17.6 s and 2048x512 took 180.7 s for ONE
+#: configuration. A naive grid over these two lists would have cost hours, which is how the previous run of
+#: this card exhausted its iteration budget. The rows below keep the whole sweep inside minutes while
+#: covering both regimes and every rank, and every one of them is a ``(n_block, d)`` that ``b5`` also
+#: measured, so the rows JOIN to that artifact instead of merely resembling it.
 FEATURE_DIMS: tuple[int, ...] = (32, 128, 512)
-BLOCK_ROWS: tuple[int, ...] = (128, 512, 1024, 2048, 4096)
+BLOCK_ROWS: tuple[int, ...] = (32, 128, 512, 1024)
 
 #: Intrinsic rank of the synthetic signal as a FRACTION of ``d``. An INPUT, matching ``b5``.
 INTRINSIC_RANK_FRACTION = 0.25
@@ -164,7 +171,7 @@ INTRINSIC_RANK_FRACTION = 0.25
 N_COMPONENTS_SCORED = 8
 
 #: The default timed repeat count. Overridable with ``--repeats``; whatever is used is stamped under
-#: ``inputs`` and cross-checked against the timing policy at write time by the shared harness.
+#: ``inputs`` and cross-checked against the timing policy at write time by the shared measurement suite.
 TIMED_REPEATS = 5
 
 
@@ -269,13 +276,13 @@ def _fit_method(method: str, X: np.ndarray, k: int, n_block: int) -> dict[str, A
 def _subspace_distance(a: np.ndarray, b: np.ndarray) -> float:
     """Sign-invariant distance ``1 - min(svd(A @ B.T))`` between two equal-rank bases.
 
-    Re-exported from the shared harness rather than reimplemented, so this artifact and ``b4``/``b5`` score
+    Re-exported from the shared measurement suite rather than reimplemented, so this artifact and ``b4``/``b5`` score
     with one function and the numbers join.
 
     - ``:param a:`` Basis rows.
     - ``:param b:`` Basis rows, same rank as ``a``.
     """
-    from harness_common import subspace_distance
+    from measurement_common import subspace_distance
 
     return subspace_distance(a, b)
 
@@ -394,6 +401,12 @@ def measure_configuration(
                 "timing": dict(timing) if timing is not None else {},
                 "accuracy": accuracy,
                 "transfer_bytes": dict(transfer),
+                # What the timing policy CLAIMS and what actually happened, side by side. A previous
+                # artifact declared a repeat policy while measuring one sample, which made every spread a
+                # structural zero that read as perfect reproducibility. These two fields are equal on every
+                # timed arm and the measurement suite refuses the artifact if they ever are not.
+                "samples_declared": None if timing is None else int(timing["timed_repeats"]),
+                "samples_present": None if timing is None else len(timing["seconds_all"]),
                 "note": note,
                 "failure": failure,
             }
@@ -534,6 +547,86 @@ def plan_configurations() -> list[tuple[int, int, int | None]]:
 MAX_BLOCK_ELEMENTS_ROWS: dict[int, int] = {32: 4096, 128: 4096, 512: 2048}
 
 
+# ============================================================================= resume checkpointing
+def _config_key(n_block: int, d: int, local_rank: int | None) -> str:
+    """Return the resume key identifying one measured configuration.
+
+    - ``:param n_block:`` Rows per block.
+    - ``:param d:`` Feature dimension.
+    - ``:param local_rank:`` Retained local rank, or ``None`` for full local rank.
+    - ``:return:`` A stable string key, identical across runs so a checkpoint row can be found again.
+    """
+    return json.dumps([int(n_block), int(d), None if local_rank is None else int(local_rank)])
+
+
+def _row_config_key(row: Mapping[str, Any]) -> str:
+    """Return the resume key of an already-measured artifact row.
+
+    - ``:param row:`` A row as it appears in ``results``.
+    - ``:return:`` The same key :func:`_config_key` would produce for that configuration.
+    """
+    return _config_key(int(row["n_block"]), int(row["n_features"]), row.get("local_rank_requested"))
+
+
+def _checkpoint_grid_keys(path: Path) -> set[str]:
+    """Return the distinct grid keys recorded in a checkpoint file.
+
+    - ``:param path:`` The JSONL checkpoint path.
+    - ``:return:`` Grid keys, one per distinct recorded grid. Unparseable lines are ignored, so a torn
+      final line from a hard kill does not raise here.
+    """
+    keys: set[str] = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if record.get("config_key") is not None:
+            keys.add(json.dumps(record["config_key"], sort_keys=True))
+    return keys
+
+
+def _load_checkpoint_rows(checkpoint: Any, repeats: int) -> list[dict[str, Any]]:
+    """Return checkpointed rows recorded under the SAME grid and repeat count as this run.
+
+    A checkpoint written for a different grid, or at a different repeat count, is refused rather than
+    mixed: those rows are not the same measurement, and mixing them is the defect the repeat-count gate
+    exists to catch.
+
+    - ``:param checkpoint:`` The handle returned by :func:`measurement_common.checkpoint_config_key`.
+    - ``:param repeats:`` Timed repeats this run will use.
+    - ``:return:`` Reusable rows.
+    """
+    path: Path = checkpoint.path
+    if not path.exists():
+        return []
+    mine = json.dumps(checkpoint.key, sort_keys=True)
+    if mine not in _checkpoint_grid_keys(path):
+        print(f"  checkpoint: {path.name} belongs to a different grid; starting fresh", flush=True)
+        path.unlink(missing_ok=True)
+        return []
+    return checkpoint.load(repeats=repeats)
+
+
+def _print_row(row: Mapping[str, Any]) -> None:
+    """Print one measured configuration, whether measured now or replayed from a checkpoint.
+
+    - ``:param row:`` The measured row.
+    """
+    mergeable = next(m for m in row["methods"] if m["method"] == MERGEABLE_ARM)
+    print(
+        f"  measured n_block={row['n_block']:>5} d={row['n_features']:<4} "
+        f"rank={str(row['local_rank_requested']):<4} "
+        f"saved={row['bytes_saved_per_block_vs_legacy_measured']['MiB']:9.4f} MiB "
+        f"mergeable={mergeable['seconds_median']:.6f}s "
+        f"d_exact={mergeable['accuracy'].get('subspace_distance_vs_exact')}",
+        flush=True,
+    )
+
+
 # ============================================================================= run
 def run(repeats: int) -> dict[str, Any]:
     """Measure every configuration and return the artifact payload.
@@ -547,7 +640,32 @@ def run(repeats: int) -> dict[str, Any]:
     skipped: list[dict[str, Any]] = []
     plan = plan_configurations()
 
+    # Resume support. Every measured configuration is appended to a JSONL checkpoint as soon as it is
+    # measured, and a prior run's rows are replayed here. This sweep takes minutes per configuration, so
+    # writing the artifact only once at the end loses the whole grid to any single interruption -- which
+    # is exactly what happened to the three previous attempts at this card.
+    checkpoint = checkpoint_config_key(
+        ARTIFACT_STEM,
+        {
+            "grid": "transfer_comparison",
+            "n_blocks": N_BLOCKS,
+            "feature_dims": list(FEATURE_DIMS),
+            "block_rows": list(BLOCK_ROWS),
+            "local_ranks": [None if r is None else int(r) for r in LOCAL_RANKS],
+            "n_components_scored": N_COMPONENTS_SCORED,
+        },
+    )
+    reusable = {_row_config_key(row): row for row in _load_checkpoint_rows(checkpoint, repeats)}
+    if reusable:
+        print(f"  checkpoint: reusing {len(reusable)} configuration(s) already measured by a prior run", flush=True)
+
     for n_block, d, local_rank in plan:
+        key = _config_key(n_block, d, local_rank)
+        cached = reusable.get(key)
+        if cached is not None:
+            rows.append({**cached, "replayed_from_checkpoint": True})
+            _print_row(cached)
+            continue
         intrinsic = max(1, int(INTRINSIC_RANK_FRACTION * d))
         blocks = [make_block(n_block=n_block, n_features=d, rank=intrinsic, seed=SEED + 11) for _ in range(N_BLOCKS)]
         try:
@@ -564,14 +682,8 @@ def run(repeats: int) -> dict[str, Any]:
             )
             continue
         rows.append(row)
-        mb = next(m for m in row["methods"] if m["method"] == MERGEABLE_ARM)
-        print(
-            f"  measured n_block={n_block:>5} d={d:<4} rank={str(local_rank):<4} "
-            f"saved={row['bytes_saved_per_block_vs_legacy_measured']['MiB']:9.4f} MiB "
-            f"mergeable={mb['seconds_median']:.6f}s "
-            f"d_exact={mb['accuracy'].get('subspace_distance_vs_exact')}",
-            flush=True,
-        )
+        checkpoint.append(row, repeats=repeats)
+        _print_row(row)
         del blocks
         gc.collect()
 
@@ -593,7 +705,7 @@ def run(repeats: int) -> dict[str, Any]:
             extra={
                 # Restated, not inherited: provenance() stamps the DEFAULT policy, so a run with a different
                 # repeat count must override it explicitly or the artifact reports a count it did not use --
-                # the exact defect the shared harness's repeat-count gate exists to catch.
+                # the exact defect the shared measurement suite's repeat-count gate exists to catch.
                 "timing_policy": {
                     "clock": TIMING_POLICY["clock"],
                     "warmup_rounds": TIMING_POLICY["warmup_rounds"],
@@ -625,6 +737,20 @@ def run(repeats: int) -> dict[str, Any]:
                     "driver_peak_rss_bytes": peak_rss_bytes(),
                 },
                 "resolved_callables": resolved,
+                "resume_policy": {
+                    "checkpoint_path": str(checkpoint_path(ARTIFACT_STEM)),
+                    "granularity": "one JSONL record per configuration, appended and fsynced as it is measured",
+                    "why": (
+                        "this sweep costs minutes per configuration, so an artifact written only once at "
+                        "the end is lost in full by any single interruption -- which is what happened to three "
+                        "consecutive previous attempts at this card"
+                    ),
+                    "rows_reused_from_a_prior_run": int(sum(1 for r in rows if r.get("replayed_from_checkpoint"))),
+                    "guarded_against": (
+                        "a checkpoint recorded under a different grid or a different repeat count is refused, "
+                        "not merged: such rows are not the same measurement"
+                    ),
+                },
             },
         ),
         "transfer_comparison_policy": {
@@ -654,13 +780,23 @@ def main() -> int:
     doc = __doc__ or ""
     parser = argparse.ArgumentParser(description=doc.splitlines()[0] if doc else "")
     parser.add_argument("--repeats", type=int, default=TIMED_REPEATS, help="Timed repeats per method")
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help="Discard any resume checkpoint and re-measure every configuration from scratch",
+    )
     args = parser.parse_args()
     if args.repeats < 2:
         print("refusing: --repeats < 2 leaves no dispersion behind the median")
         return 1
+    if args.reset:
+        checkpoint_path(ARTIFACT_STEM).unlink(missing_ok=True)
+        print(f"checkpoint: discarded {checkpoint_path(ARTIFACT_STEM).name} (--reset)")
 
     payload = run(args.repeats)
     path = write_result(ARTIFACT_STEM, payload)
+    # Only now are the rows safely inside a written artifact, so the resume state is consumed.
+    checkpoint_path(ARTIFACT_STEM).unlink(missing_ok=True)
 
     print(f"\nconsolidated comparison, {len(payload['results'])} configuration(s)\n")
     print_summary_table(

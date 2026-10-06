@@ -56,8 +56,8 @@ flips, which is machine-independent and is the honest way to state this result.
 
 Run
 ---
-    PYTHONPATH=src .venv/bin/python benchmark/mergeable_pca/b3_time_to_first_result.py
-    PYTHONPATH=src .venv/bin/python benchmark/mergeable_pca/b3_time_to_first_result.py --mbps 125
+    PYTHONPATH=src .venv/bin/python benchmark/mergeable_pca/time_to_first_result.py
+    PYTHONPATH=src .venv/bin/python benchmark/mergeable_pca/time_to_first_result.py --mbps 125
 """
 
 from __future__ import annotations
@@ -70,7 +70,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from harness_common import (  # noqa: E402
+from measurement_common import (  # noqa: E402
     SEED,
     byte_dict,
     make_block,
@@ -107,7 +107,7 @@ def measure(n_block: int, d: int, local_rank: int | None, intrinsic_rank: int, m
     """Time every stage of both pipelines for ONE configuration.
 
     Each stage is timed independently so the trade is attributable, and the composite numbers are sums of the
-    measured medians rather than a separately-timed blend (which would double-count harness noise).
+    measured medians rather than a separately-timed blend (which would double-count measurement suite noise).
 
     - ``:param n_block:`` Rows per block.
     - ``:param d:`` Feature dimension.
@@ -235,7 +235,7 @@ def run(dims: tuple[int, ...] = FEATURE_DIMS, mbps: float = DEFAULT_MBPS) -> dic
 
     return {
         "provenance": provenance(
-            script="b3_time_to_first_result",
+            script="time_to_first_result",
             description=(
                 "Time-to-first-result per timestep for the bridge-side PCA pipeline versus the legacy full-chunk "
                 "scatter, reporting the local SVD cost the design newly pays rather than hiding it."
@@ -307,7 +307,7 @@ def main() -> int:
     args = parser.parse_args()
 
     payload = run(mbps=args.mbps)
-    path = write_result("b3_time_to_first_result", payload)
+    path = write_result("time_to_first_result", payload)
     if args.out:
         Path(args.out).write_text(path.read_text(), encoding="utf-8")
         path = Path(args.out)

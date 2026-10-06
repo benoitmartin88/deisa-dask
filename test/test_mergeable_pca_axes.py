@@ -69,7 +69,7 @@ from test_mergeable_pca_estimator import rel_var_error, subspace_distance
 
 from deisa.dask.mergeable_pca import VELOCITY_AXES, MergeablePCA
 
-# ------------------------------------------------------------------------------ the gysela shape
+# ------------------------------------------------------------------------------ the structured_mesh shape
 AXIS_NAMES_5D = ("species", "tor1", "tor2", "tor3", "vpar", "mu")
 """The distribution's axes, in order, with ``species`` leading as the app declares them."""
 
@@ -95,7 +95,7 @@ def default_scheduler():
         dask.config.set(scheduler=previous)
 
 
-def gysela_field(seed: int = 0, shape: tuple[int, ...] = (2, 8, 4, 4, 6, 2)) -> np.ndarray:
+def structured_mesh_field(seed: int = 0, shape: tuple[int, ...] = (2, 8, 4, 4, 6, 2)) -> np.ndarray:
     """A reproducible array shaped like the distribution, with a low-rank structure in the velocity axes.
 
     The structure is deliberate, not decoration: the assertion that Layout A is EXACT is only meaningful if the data
@@ -149,7 +149,7 @@ def test_layout_a_defaults_to_the_velocity_axes_and_is_exact():
     viable and the merge reproduces the batch SVD to roundoff. Metric: M1 subspace distance at ``k = 5 < d = 12``,
     plus the sign-free singular values and mean.
     """
-    data = gysela_field()
+    data = structured_mesh_field()
     X = da.from_array(data, chunks=(2, 4, 4, 4, 6, 2))  # 4 spatial blocks = 4 ranks
     expected = data.reshape(-1, int(np.prod(data.shape[-2:])))
 
@@ -173,7 +173,7 @@ def test_layout_a_is_exact_for_every_rank_count():
     over ``(tor1, tor2, tor3)`` produces as the rank count grows). At every count the Layout A fit must reproduce the
     batch PCA, because ``d`` is fixed by the physics and does not depend on how the space is split.
     """
-    data = gysela_field(seed=1)
+    data = structured_mesh_field(seed=1)
     expected = data.reshape(-1, 12)
     singular_values, components = batch_reference(expected)
 
@@ -202,7 +202,7 @@ def test_layout_a_compresses_its_own_input_by_a_measured_factor():
     most ``12 * 12 + 12 = 156`` elements against ``256 * 12 = 3072``: at least 19x smaller. Asserting the bound rather
     than the exact count keeps the test honest under any BLAS (it is an inequality on a payload size, not a number).
     """
-    data = gysela_field(seed=2)
+    data = structured_mesh_field(seed=2)
     X = da.from_array(data, chunks=(2, 4, 4, 4, 6, 2))
 
     pca = MergeablePCA(n_components=5, axis_names=AXIS_NAMES_5D).fit(X)
@@ -218,7 +218,7 @@ def test_layout_a_survives_a_5d_field_without_a_species_axis():
     The estimator must key off the names the caller supplies, not off a hard-coded six-axis expectation.
     """
     names = ("tor1", "tor2", "tor3", "vpar", "mu")
-    data = gysela_field(seed=3, shape=(8, 4, 4, 6, 2))
+    data = structured_mesh_field(seed=3, shape=(8, 4, 4, 6, 2))
     X = da.from_array(data, chunks=(4, 4, 4, 6, 2))
 
     pca = MergeablePCA(n_components=3, axis_names=names).fit(X)
@@ -237,7 +237,7 @@ def test_layout_a_transform_projects_the_5d_field():
     retained subspace -- so this needs no sign alignment and no per-column comparison.
     """
     names = ("tor1", "tor2", "tor3", "vpar", "mu")
-    data = gysela_field(seed=4, shape=(8, 4, 4, 6, 2))
+    data = structured_mesh_field(seed=4, shape=(8, 4, 4, 6, 2))
     X = da.from_array(data, chunks=(4, 4, 4, 6, 2))
 
     pca = MergeablePCA(n_components=4, axis_names=names).fit(X)
@@ -268,7 +268,7 @@ def test_layout_b_refuses_the_full_rank_blowup_and_names_the_remedy():
     in the measurement. The refusal must name the remedy (``local_rank``) and the alternative (velocity features).
     """
     # One rank's slab: species=1, a (2, 4, 4) spatial box held complete, and the full (8, 2) velocity space as samples.
-    data = gysela_field(seed=5, shape=(1, 2, 4, 4, 8, 2))
+    data = structured_mesh_field(seed=5, shape=(1, 2, 4, 4, 8, 2))
     X = da.from_array(data, chunks=data.shape)  # one rank owns the whole slab
 
     with pytest.raises(ValueError) as caught:
@@ -290,7 +290,7 @@ def test_layout_b_still_works_once_local_rank_truncates_the_leaves():
     leaf is a drastic truncation of a 32-dimensional feature space, so the retained variance falls well short of the
     batch reference.
     """
-    data = gysela_field(seed=5, shape=(1, 2, 4, 4, 8, 2))
+    data = structured_mesh_field(seed=5, shape=(1, 2, 4, 4, 8, 2))
     X = da.from_array(data, chunks=data.shape)  # one rank owns the whole slab
     # The axis policy transposes the sample axes in front of the feature axes, so the flattened reference has the
     # same row order: (species, vpar, mu) rows by (tor1, tor2, tor3) features.
@@ -315,7 +315,7 @@ def test_layout_b_is_a_different_answer_not_a_rearrangement():
     differ by construction -- ``Nvpar * Nmu`` versus the local box. If they somehow produced the same ``d``, the axis
     policy would be silently ignoring its own input, so the dimensions are asserted to differ.
     """
-    data = gysela_field(seed=6, shape=(1, 2, 4, 4, 8, 2))
+    data = structured_mesh_field(seed=6, shape=(1, 2, 4, 4, 8, 2))
     X = da.from_array(data, chunks=data.shape)
 
     layout_a = MergeablePCA(n_components=2, axis_names=AXIS_NAMES_5D).fit(X)
@@ -348,7 +348,7 @@ def test_ambiguous_or_wrong_axis_specs_are_refused_not_guessed(kwargs, expected_
     The alternative in each case is a silently wrong PCA: a misclassified axis changes which cells are samples and
     which are features, and nothing downstream would notice.
     """
-    data = gysela_field(seed=7)
+    data = structured_mesh_field(seed=7)
     X = da.from_array(data, chunks=(2, 4, 4, 4, 6, 2))
 
     with pytest.raises(ValueError, match=expected_fragment.replace("(", r"\(").replace(", ", r",\s*")):
@@ -361,7 +361,7 @@ def test_axis_names_must_describe_the_array_actually_given():
     The same field is fitted twice, once with the six names it has and once with the five names of the species-free
     variant. The second must raise rather than classify the axes against names that do not line up.
     """
-    data = gysela_field(seed=8)
+    data = structured_mesh_field(seed=8)
     X = da.from_array(data, chunks=(2, 4, 4, 4, 6, 2))
 
     assert MergeablePCA(n_components=2, axis_names=AXIS_NAMES_5D).fit(X).n_features_in_ == 12
@@ -393,7 +393,7 @@ def test_axis_names_may_be_used_without_affecting_a_two_dimensional_fit():
     This is what keeps the existing 2-D call sites valid. A 2-D array's last axis is the feature axis either way, so
     naming its axes cannot move a boundary -- and the fitted attributes prove it did not.
     """
-    data = gysela_field(seed=9, shape=(200, 12))
+    data = structured_mesh_field(seed=9, shape=(200, 12))
     X = da.from_array(data, chunks=(50, 12))
 
     unnamed = MergeablePCA(n_components=4).fit(X)
@@ -405,7 +405,7 @@ def test_axis_names_may_be_used_without_affecting_a_two_dimensional_fit():
 
 
 # =============================================================================
-# The feature-chunk guard: fires only where it applies, and names the gysela remedy
+# The feature-chunk guard: fires only where it applies, and names the structured_mesh remedy
 # =============================================================================
 @pytest.mark.parametrize("split_axis,label", [(4, "vpar"), (5, "mu")])
 def test_a_split_velocity_axis_is_refused_and_names_the_remedy(split_axis, label):
@@ -415,9 +415,9 @@ def test_a_split_velocity_axis_is_refused_and_names_the_remedy(split_axis, label
     by feature position. An MPI split over the spatial axes satisfies this for free -- the whole velocity space stays
     on one rank -- so this guard fires only for a caller who rechunked across velocity, which is exactly when the
     summaries really would be unstackerable. The message names the offending axis, the rechunk that fixes it, and the
-    gysela reason it usually is unnecessary.
+    structured_mesh reason it usually is unnecessary.
     """
-    data = gysela_field(seed=10)
+    data = structured_mesh_field(seed=10)
     blocks = (2, 4, 4, 4, 6, 2)  # the axis extent per block; a halved entry splits that axis in two
     halved = data.shape[split_axis] // 2
     chunks = tuple(halved if i == split_axis else blocks[i] for i in range(6))
@@ -431,7 +431,9 @@ def test_a_split_velocity_axis_is_refused_and_names_the_remedy(split_axis, label
     assert label in message, f"the message must name the split axis, not a position: {message}"
     assert "split across Dask chunks" in message
     assert "rechunk" in message, f"the message must name the remedy: {message}"
-    assert "velocity space on one rank" in message, "the message must give the gysela reason the rechunk is unneeded"
+    assert "velocity space on one rank" in message, (
+        "the message must give the structured_mesh reason the rechunk is unneeded"
+    )
 
 
 def test_the_split_velocity_axis_remedy_actually_works():
@@ -440,7 +442,7 @@ def test_the_split_velocity_axis_remedy_actually_works():
     Otherwise the message would be advice that does not fix the problem, which is the failure mode this whole
     refuse-not-approximate convention exists to prevent.
     """
-    data = gysela_field(seed=11)
+    data = structured_mesh_field(seed=11)
     X = da.from_array(data, chunks=(2, 4, 4, 3, 3, 2))  # vpar split in two
 
     with pytest.raises(ValueError) as caught:
@@ -459,7 +461,7 @@ def test_a_split_spatial_axis_is_fine_because_it_is_a_sample_axis():
     One leaf is built per block of the sample axes -- that is the entire parallelism of the reduction, and it is what
     makes one leaf per MPI rank. So the guard must read the feature axes only, and this pins that.
     """
-    data = gysela_field(seed=12)
+    data = structured_mesh_field(seed=12)
     X = da.from_array(data, chunks=(2, 1, 4, 4, 6, 2))  # tor1 split into 8 blocks
     assert len(X.chunks[1]) == 8
 
@@ -486,7 +488,7 @@ def test_local_rank_sweep_under_layout_a(local_rank):
     :func:`test_layout_a_local_rank_degrades_monotonically`; this test pins the per-rank contract and the exact
     endpoint.
     """
-    data = gysela_field(seed=13)
+    data = structured_mesh_field(seed=13)
     X = da.from_array(data, chunks=(2, 4, 4, 4, 6, 2))
     singular_values, components = batch_reference(data.reshape(-1, 12))
 
@@ -508,7 +510,7 @@ def test_layout_a_local_rank_degrades_monotonically():
     (maximally different) at exact reconstruction. The slack absorbs float noise where two consecutive ranks produce
     the same summary; it is far below the smallest measured step, so it cannot hide a regression.
     """
-    data = gysela_field(seed=14)
+    data = structured_mesh_field(seed=14)
     X = da.from_array(data, chunks=(2, 4, 4, 4, 6, 2))
     singular_values, components = batch_reference(data.reshape(-1, 12))
 
@@ -555,7 +557,7 @@ def test_the_default_velocity_feature_selection_is_derived_not_hard_coded():
     differently gets the last axis, because the estimator cannot know their intent. That difference is the point of
     passing names at all, and it is asserted here so the default cannot become a hard-coded axis position.
     """
-    data = gysela_field(seed=15, shape=(8, 4, 4, 6, 2))
+    data = structured_mesh_field(seed=15, shape=(8, 4, 4, 6, 2))
 
     with_velocity_names = MergeablePCA(n_components=2, axis_names=("tor1", "tor2", "tor3", "vpar", "mu")).fit(
         da.from_array(data, chunks=(4, 4, 4, 6, 2))
