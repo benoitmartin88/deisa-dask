@@ -142,7 +142,7 @@ def figure_network_transfer(results_dir: Path, out_dir: Path) -> Path:
     # The combined artifact spans x from 0.25 to 128 and per-bridge block bytes from ~3.3e4 to
     # ~8.4e6, so the limits cover the measured range rather than the narrower original sweep.
     ax.set_xlim(0.18, 160)
-    ax.set_ylim(6e3, 2e7)
+    ax.set_ylim(2e3, 3e7)
     ax.set_xlabel(r"block aspect ratio $n_{\mathrm{block}}/d$ (dimensionless)")
     ax.set_ylabel("network transfer (bytes)")
     ax.set_title("At full local rank: tall blocks compress, flat blocks do not")
@@ -154,8 +154,12 @@ def figure_network_transfer(results_dir: Path, out_dir: Path) -> Path:
     dim_leg = [Line2D([], [], color=colours.get(d, COL["grey"]), ls="-", marker="o", label=rf"$d={d}$") for d in dims]
     l1 = ax.legend(handles=path_leg, loc="upper left", fontsize=5.9, borderpad=0.1)
     ax.add_artist(l1)
-    ax.legend(handles=dim_leg, loc="lower right", fontsize=5.9, borderpad=0.1)
-    ax.text(4.0, 6.5e6, "tall", color="0.35", fontsize=6.5, ha="center")
+    # The measured dashed flats run at 1e4-2e5 low band and the solids rise; the only clear patch is
+    # upper-centre, between the two flat bands and left of the tall band's right edge.
+    ax.legend(handles=dim_leg, loc="upper center", fontsize=5.9, borderpad=0.1, bbox_to_anchor=(0.62, 0.55))
+    # High band, x where only the d=512 solid reaches: text sits at 1.1e7, x=1.7, well above the
+    # smaller-d solids and below their legacy line only where the reader already sees the band.
+    ax.text(1.7, 1.1e7, "tall", color="0.35", fontsize=6.5, ha="center")
     ax.text(0.33, 6.5e6, "flat / square", color="0.35", fontsize=6.5, ha="center")
     fig.savefig(out_dir / "network_transfer.png")
     plt.close(fig)
@@ -326,9 +330,175 @@ def main() -> None:
         figure_network_transfer(args.results, args.out),
         figure_local_rank(args.results, args.out),
         figure_sizing(args.results, args.out),
+        figure_baselines(args.results, args.out),
     ]
     for m in made:
         print("wrote", m)
+
+
+# --------------------------------------------------------------------------
+# Figure: baselines — time and accuracy of the mergeable pipeline against the
+# standard alternatives, over the same measured parameters.
+# --------------------------------------------------------------------------
+def figure_baselines(results_dir: Path, out_dir: Path) -> Path:
+    """Two panels from standard_baselines.json, all arms with timing dispersion.
+
+    Panel (a): per-problem total seconds (median with min/max whiskers) against the
+    d=128 tall ladder for the mergeable pipeline total and the measured alternatives.
+    Panel (b): principal-subspace distance against the exact batch SVD reference,
+    same ladder. The mergeable path must sit at roundoff: that is the point.
+    """
+    sb = _load(results_dir, "standard_baselines.json")
+    rows = sb["results"]
+
+    # Panel arms, in drawing order: the path under test first, then the alternatives.
+    draws = [
+        "mergeable_pca_total",
+        "numpy_svd",
+        "sklearn_pca_full",
+        "sklearn_incremental_pca",
+        "dask_ml_incremental_pca",
+    ]
+    labels = {
+        "mergeable_pca_total": "mergeable PCA (total)",
+        "numpy_svd": "numpy batch SVD",
+        "sklearn_pca_full": "sklearn PCA (full)",
+        "sklearn_incremental_pca": "sklearn IncrementalPCA",
+        "dask_ml_incremental_pca": "dask-ml IncrementalPCA",
+    }
+    colours = {
+        "mergeable_pca_total": COL["blue"],
+        "numpy_svd": COL["green"],
+        "sklearn_pca_full": COL["orange"],
+        "sklearn_incremental_pca": COL["red"],
+        "dask_ml_incremental_pca": COL["purple"],
+    }
+    markers = {
+        "mergeable_pca_total": "o",
+        "numpy_svd": "s",
+        "sklearn_pca_full": "^",
+        "sklearn_incremental_pca": "v",
+        "dask_ml_incremental_pca": "D",
+    }
+
+    # Full local rank (requested None) is the precision operating point: the mergeable path is
+    # exact there, which is the claim the baselines figure argues. Truncated-rank rows belong to
+    # the rank-accuracy figure, not this one.
+    operating_rank: int | None = None
+
+    def _series(arm: str, d: int, ykey, with_err: bool = False):
+        # One row per (n_block, arm) at the operating rank, so rank variations of the same shape
+        # do not overplot each other.
+        pts = [
+            r
+            for r in rows
+            if r["n_features"] == d and r["regime"] == "tall" and r["local_rank_requested"] == operating_rank
+        ]
+        by_n = {}
+        for r in pts:
+            a = next(a for a in r["arms"] if a["arm"] == arm)
+            if a.get("measured") and (ykey(a) is not None):
+                by_n[r["n_block"]] = (a, r)
+        ns = sorted(by_n)
+        ys, los, his = [], [], []
+        for n in ns:
+            a, r = by_n[n]
+            y = ykey(a)
+            ys.append(y)
+            t = a.get("timing") or {}
+            if with_err and t.get("seconds_all"):
+                alls = sorted(t["seconds_all"])
+                los.append(max(y - alls[0], 0.0))
+                his.append(max(alls[-1] - y, 0.0))
+            else:
+                los.append(0.0)
+                his.append(0.0)
+        return ns, ys, los, his
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(ACM_COLUMN_IN, 4.3), sharex=True, gridspec_kw={"hspace": 0.55})
+
+    # ---- (a) time ----------------------------------------------------------
+    # Two feature dimensions share each arm's marker; d is carried by fill (solid d=128, open d=32).
+    ladders = sorted({r["n_features"] for r in rows if r["regime"] == "tall"}, reverse=True)[:2]
+    for arm in draws:
+        for i, d in enumerate(ladders):
+            ns, ys, lo, hi = _series(arm, d, lambda a: a["seconds_median"], with_err=True)
+            if not ns:
+                continue
+            c = colours.get(arm, COL["grey"])
+            filled = i == 0
+            ax1.errorbar(
+                ns,
+                ys,
+                yerr=[lo, hi],
+                marker=markers.get(arm, "o"),
+                color=c,
+                label=labels.get(arm, arm) if filled else None,
+                ls="-" if filled else "--",
+                mfc=c if filled else "white",
+                capsize=1.8,
+                elinewidth=0.5,
+                markersize=2.8,
+            )
+    ax1.set_yscale("log")
+    ax1.set_xscale("log", base=2)
+    ax1.xaxis.set_minor_locator(ticker.NullLocator())
+    ax1.set_ylabel("time per fit (s)")
+    ax1.set_title(
+        "(a) end-to-end time, tall, 8 blocks, full rank\n"
+        "(solid $d=128$, dashed $d=32$; median, min/max over 5 repeats)",
+        loc="left",
+        fontsize=6.4,
+        pad=18,
+    )
+    ax1.legend(fontsize=5.2, loc="lower left", borderpad=0.15, ncols=3, bbox_to_anchor=(0.0, 1.02), frameon=False)
+
+    # ---- (b) accuracy ------------------------------------------------------
+    for arm in draws:
+        for i, d in enumerate(ladders):
+            ns, ys, _, _ = _series(arm, d, lambda a: (a.get("accuracy") or {}).get("subspace_distance_vs_exact"))
+            if not ns:
+                continue
+            c = colours.get(arm, COL["grey"])
+            filled = i == 0
+            ax2.plot(
+                ns,
+                ys,
+                marker=markers.get(arm, "o"),
+                color=c,
+                ls="-" if filled else "--",
+                mfc=c if filled else "white",
+                markersize=2.8,
+            )
+    # error bars on accuracy: the metrics' floor is numerical roundoff; show a roundoff band
+    ax2.set_yscale("log")
+    ax2.set_xscale("log", base=2)
+    ax2.xaxis.set_minor_locator(ticker.NullLocator())
+    ax2.axhline(1e-15, color="0.4", ls=":", lw=0.7)
+    ax2.text(
+        ax2.get_xlim()[1] * 0.55,
+        2.1e-15,
+        "IEEE-754 double roundoff",
+        fontsize=5.0,
+        color="0.35",
+        ha="center",
+        va="bottom",
+    )
+    ax2.set_xlabel(r"rows per block $n_{\mathrm{block}}$ (8 blocks, full local rank)")
+    ax2.set_ylabel("principal-subspace\ndistance vs exact SVD")
+    ax2.set_title(
+        "(b) principal-subspace distance vs exact batch SVD",
+        loc="left",
+        fontsize=6.6,
+    )
+    ax2.set_ylim(1e-16, 4.0)
+    ax2.set_xticks([64, 128, 256, 512, 1024])
+    ax2.set_xticklabels([str(n) for n in (64, 128, 256, 512, 1024)])
+    ax2.xaxis.set_minor_locator(ticker.NullLocator())
+
+    fig.savefig(out_dir / "baselines.png")
+    plt.close(fig)
+    return out_dir / "baselines.png"
 
 
 if __name__ == "__main__":

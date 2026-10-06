@@ -458,6 +458,19 @@ def plan_configurations() -> list[tuple[int, int, int | None, str]]:
     for n_block, d in FLAT_REGIME_POINTS:
         _add(n_block, d, None, "flat_regime_no_compression")
 
+    # Per-dimension ladders for Figure 2. The curated points above leave d=256 with a single
+    # distinct full-rank row, so the figure shows an isolated marker where the reader expects a
+    # line, and leaves d=32 and d=128 without a flat-side left edge. These ladders give every
+    # feature dimension the same aspect-ratio span (0.25 to 32) at full local rank, so lines join
+    # within each colour for the whole measured range. Costs stay on this machine: the ladder
+    # caps each block at 16 MiB, the same ceiling TALL_CEILING already pays.
+    for d in (32, 128, 256, 512):
+        for x in (0.25, 0.5, 1, 2, 4, 8, 16, 32):
+            n_block = int(x * d)
+            if n_block * d * 8 > 16 * 1024 * 1024:
+                continue
+            _add(n_block, d, None, "figure2_ladder")
+
     return plan
 
 
