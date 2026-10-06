@@ -24,6 +24,10 @@ Types of changes:
   instead of the full array chunk. Branches are registered per array, so a multi-array callback gets one branch set per 
   array. Expressions whose reduction depends on another reduction's output are refused with`UnsupportedReductionError`.
 
+### Changed
+
+- `mpi4py` is now a required dependency.
+
 ### Fixed
 
 - Bridge: `asyncio.run()` is no longer called with a running event loop. On the no-client path
