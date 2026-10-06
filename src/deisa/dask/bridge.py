@@ -47,7 +47,7 @@ from deisa.dask.branch import BranchSpec
 from deisa.dask.constants import CLIENT_KEY, FEEDBACK_QUEUE_PREFIX, KEY_PREFIX, WAIT_FOR_EXECUTE_CB_EVENT
 from deisa.dask.handshake import Handshake
 from deisa.dask.precompute_analyzer import PrecomputeRuntimeError
-from deisa.dask.utils import get_client
+from deisa.dask.utils import get_client, run_coro_on_private_loop
 
 logger = logging.getLogger(__name__)
 
@@ -592,7 +592,26 @@ class Bridge(IBridge):
         if self.client:
             return self.client.sync(self._scatter_blocking, workers, data, hash=hash)
         else:
-            return asyncio.run(self._scatter_blocking(workers, data, hash=hash))
+            return self._run_async(self._scatter_blocking(workers, data, hash=hash))
+
+    def _run_async(self, coro):
+        """Run ``coro`` to completion from synchronous code.
+        ``asyncio.run`` cannot be called when the calling thread already has a running event loop; it raises
+        ``RuntimeError: asyncio.run() cannot be called from a running event loop``.
+        The no-client path reaches this from bridge teardown, where a loop is frequently still running on this thread.
+        Use the existing loop when there is one, and ``asyncio.run`` otherwise.
+        """
+        try:
+            # Probe for a running loop on this thread. We are in synchronous code, so a running loop here cannot make
+            # progress while we block on run_until_complete, that would deadlock.
+            # Hand the coroutine to a private loop on a worker thread instead, which runs concurrently with the caller's
+            # loop.
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # No loop on this thread: asyncio.run is safe and needs no cleanup.
+            return asyncio.run(coro)
+
+        return run_coro_on_private_loop(coro)
 
     async def _scatter_blocking(self, workers, data, hash=False):
         """Scatter ``data`` to ``workers`` and return the legacy per-key result (one future key per element)."""
@@ -757,7 +776,7 @@ class Bridge(IBridge):
         if self.client is not None:
             who_has, nbytes = self.client.sync(self._scatter_to_workers_async, [target_worker], payload2)
         else:
-            who_has, nbytes = asyncio.run(self._scatter_to_workers_async([target_worker], payload2))
+            who_has, nbytes = self._run_async(self._scatter_to_workers_async([target_worker], payload2))
 
         future_keys = list(payload.keys())
         return {
