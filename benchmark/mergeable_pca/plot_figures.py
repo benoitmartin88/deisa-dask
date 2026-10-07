@@ -14,8 +14,8 @@ The three data figures are:
   local_rank_curve.png local rank R against summary size and against the two
                        sign-invariant accuracy metrics, for a single leaf and
                        for the eight-leaf merge.
-  flatten_sizing.png    the two structured_mesh flattenings for the production-scale mesh:
-                       compression ratio (slab / summary) versus rank count.
+  flatten_sizing.png    the two flattenings sized over the two meshes that fit memory:
+                       compression ratio (chunk bytes / summary bytes) versus rank count.
 
 Run:
     python -m benchmark.mergeable_pca.plot_figures \
@@ -268,27 +268,47 @@ def figure_local_rank(results_dir: Path, out_dir: Path) -> Path:
 
 
 # --------------------------------------------------------------------------
-# Figure sizing: the two structured_mesh flattenings on the production mesh.
+# Figure sizing: the two flattenings sized over two mesh sizes that fit memory side by
+# side. The largest example mesh (512x128x64x128x8) never fit in memory on any machine we
+# had, so plotting it next to the smaller ones implied a run that did not happen. The
+# figure now shows only measured-capable meshes; the sizing table of the paper carries the
+# larger-mesh arithmetic.
 # --------------------------------------------------------------------------
 def figure_sizing(results_dir: Path, out_dir: Path) -> Path:
     g = _load(results_dir, "flatten_sizing.json")
-    mesh = [512, 128, 64, 128, 8]  # production-scale mesh named in the paper
+    meshes = [(128, 32, 16, 64, 8), (256, 64, 32, 128, 8)]
 
-    def series(layout, sub):
-        rows = [r for r in g[layout][sub] if r["mesh_tor1_tor2_tor3_vpar_mu"] == mesh]
+    def series(layout, sub, mesh):
+        rows = [r for r in g[layout][sub] if tuple(r["mesh_tor1_tor2_tor3_vpar_mu"]) == mesh]
         rows = sorted(rows, key=lambda r: r["n_ranks"])
         return ([r["n_ranks"] for r in rows], [r["compression_ratio_slab_over_summary"] for r in rows])
 
     fig, ax = plt.subplots(figsize=(ACM_COLUMN_IN, 2.5))
+    # Colour = layout, solid = full rank, dashed = truncated local rank R=32.
+    # Line weight distinguishes the two mesh sizes; the heavier line is the larger mesh.
+    style = {
+        (128, 32, 16, 64, 8): {"lw": 1.0},
+        (256, 64, 32, 128, 8): {"lw": 2.0},
+    }
     specs = [
-        ("layout_a_velocity_space", "full_rank", COL["blue"], "-", "o", "A velocity: full rank"),
-        ("layout_a_velocity_space", "truncated", COL["blue"], "--", "s", r"A velocity: $R=32$"),
-        ("layout_b_spatial_box", "full_rank", COL["red"], "-", "o", "B spatial: full rank"),
-        ("layout_b_spatial_box", "truncated", COL["red"], "--", "s", r"B spatial: $R=32$"),
+        ("layout_a_velocity_space", "full_rank", COL["blue"], "-", "o", "velocity axis, full rank"),
+        ("layout_a_velocity_space", "truncated", COL["blue"], "--", "s", "velocity axis, capped rank 32"),
+        ("layout_b_spatial_box", "full_rank", COL["red"], "-", "o", "spatial axis, full rank"),
+        ("layout_b_spatial_box", "truncated", COL["red"], "--", "s", "spatial axis, capped rank 32"),
     ]
     for layout, sub, c, ls, mk, label in specs:
-        x, y = series(layout, sub)
-        ax.plot(x, y, ls, color=c, marker=mk, label=label)
+        for mesh in meshes:
+            x, y = series(layout, sub, mesh)
+            first = mesh == meshes[0]
+            ax.plot(x, y, ls, color=c, marker=mk, lw=style[mesh]["lw"], label=label if first else None)
+
+    # One extra legend entry pair naming the two mesh sizes via line weight.
+    from matplotlib.lines import Line2D
+
+    weight_leg = [
+        Line2D([], [], color="0.3", lw=1.0, label="mesh 128$\\times$32$\\times$16$\\times$64$\\times$8"),
+        Line2D([], [], color="0.3", lw=2.0, label="mesh 256$\\times$64$\\times$32$\\times$128$\\times$8"),
+    ]
 
     ax.axhline(1.0, color="0.35", ls=":", lw=0.9, zorder=1)
     ax.set_xscale("log", base=2)
@@ -300,11 +320,29 @@ def figure_sizing(results_dir: Path, out_dir: Path) -> Path:
     ax.yaxis.set_minor_formatter(ticker.NullFormatter())
     ax.set_xlim(3.2, 150)
     ax.set_ylim(0.008, 34000)
-    ax.set_xlabel("number of ranks")
-    ax.set_ylabel("compression ratio\n(slab / summary, dimensionless)")
-    ax.set_title("Production mesh 512$\\times$128$\\times$64$\\times$128$\\times$8")
-    ax.text(5.3, 1.35, "break-even (ratio 1)", fontsize=6.0, color="0.35")
-    ax.legend(loc="center left", bbox_to_anchor=(0.015, 0.45))
+    ax.set_xlabel("number of MPI ranks")
+    ax.set_ylabel("chunk bytes / summary bytes")
+    ax.text(9.0, 0.5, "break-even (ratio 1)", fontsize=6.0, color="0.35", ha="center")
+    # One legend band BELOW the axes: interior legends sit over the curves whichever
+    # corner we pick, because every quadrant of this chart carries a line. The two mesh
+    # sizes ride on line weight, which the paper caption explains.
+    ax.legend(
+        handles=[
+            Line2D([], [], color=COL["blue"], ls="-", marker="o", label="velocity axis, full rank"),
+            Line2D([], [], color=COL["blue"], ls="--", marker="s", label="velocity axis, capped rank 32"),
+            Line2D([], [], color=COL["red"], ls="-", marker="o", label="spatial axis, full rank"),
+            Line2D([], [], color=COL["red"], ls="--", marker="s", label="spatial axis, capped rank 32"),
+        ]
+        + weight_leg,
+        loc="upper left",
+        bbox_to_anchor=(0.0, -0.16),
+        ncol=2,
+        fontsize=5.8,
+        borderpad=0.1,
+        frameon=False,
+        handlelength=1.6,
+        columnspacing=0.8,
+    )
     fig.savefig(out_dir / "flatten_sizing.png")
     plt.close(fig)
     return out_dir / "flatten_sizing.png"
