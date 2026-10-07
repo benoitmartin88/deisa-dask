@@ -134,8 +134,8 @@ def figure_network_transfer(results_dir: Path, out_dir: Path) -> Path:
     ax.axvline(1.0, color="0.35", ls=":", lw=0.8, zorder=1)
     ax.set_xscale("log", base=2)
     ax.set_yscale("log")
-    ax.set_xticks([0.25, 0.5, 1, 2, 4, 8])
-    ax.set_xticklabels(["0.25", "0.5", "1", "2", "4", "8"])
+    ax.set_xticks([0.25, 0.5, 1, 2, 4, 8, 16, 32, 64, 128])
+    ax.set_xticklabels(["0.25", "0.5", "1", "2", "4", "8", "16", "32", "64", "128"], fontsize=5.2)
     ax.xaxis.set_minor_locator(ticker.NullLocator())
     ax.yaxis.set_minor_locator(ticker.LogLocator(base=10, subs=(2, 5)))
     ax.yaxis.set_minor_formatter(ticker.NullFormatter())
@@ -143,24 +143,30 @@ def figure_network_transfer(results_dir: Path, out_dir: Path) -> Path:
     # ~8.4e6, so the limits cover the measured range rather than the narrower original sweep.
     ax.set_xlim(0.18, 160)
     ax.set_ylim(2e3, 3e7)
-    ax.set_xlabel(r"block aspect ratio $n_{\mathrm{block}}/d$ (dimensionless)")
+    ax.set_xlabel(r"blocks per feature, $n_{\mathrm{block}}/d$")
     ax.set_ylabel("network transfer (bytes)")
-    ax.set_title("At full local rank: tall blocks compress, flat blocks do not")
 
     path_leg = [
-        Line2D([], [], color="0.2", ls="-", marker="o", label="legacy full chunk"),
+        Line2D([], [], color="0.2", ls="-", marker="o", label="full chunk"),
         Line2D([], [], color="0.2", ls="--", marker="s", mfc="white", label="bridge summary"),
-    ]
-    dim_leg = [Line2D([], [], color=colours.get(d, COL["grey"]), ls="-", marker="o", label=rf"$d={d}$") for d in dims]
-    l1 = ax.legend(handles=path_leg, loc="upper left", fontsize=5.9, borderpad=0.1)
-    ax.add_artist(l1)
-    # The measured dashed flats run at 1e4-2e5 low band and the solids rise; the only clear patch is
-    # upper-centre, between the two flat bands and left of the tall band's right edge.
-    ax.legend(handles=dim_leg, loc="upper center", fontsize=5.9, borderpad=0.1, bbox_to_anchor=(0.62, 0.55))
+    ] + [Line2D([], [], color=colours.get(d, COL["grey"]), ls="-", marker="o", label=rf"$d={d}$") for d in dims]
+    # One figure-level legend above the axes: add_artist legend pairs are silently
+    # dropped by savefig(bbox="tight") in this matplotlib, a figure-level legend is
+    # not, and no line is ever covered.
+    fig.legend(
+        handles=path_leg,
+        loc="lower left",
+        bbox_to_anchor=(0.02, 0.985),
+        ncol=6,
+        fontsize=5.8,
+        borderpad=0.1,
+        frameon=False,
+        handlelength=1.5,
+        columnspacing=0.7,
+    )
     # High band, x where only the d=512 solid reaches: text sits at 1.1e7, x=1.7, well above the
     # smaller-d solids and below their legacy line only where the reader already sees the band.
-    ax.text(1.7, 1.1e7, "tall", color="0.35", fontsize=6.5, ha="center")
-    ax.text(0.33, 6.5e6, "flat / square", color="0.35", fontsize=6.5, ha="center")
+    ax.text(4.5, 1.1e7, "tall", color="0.35", fontsize=6.5, ha="center")
     fig.savefig(out_dir / "network_transfer.png")
     plt.close(fig)
     return out_dir / "network_transfer.png"
