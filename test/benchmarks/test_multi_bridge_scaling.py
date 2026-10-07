@@ -89,7 +89,7 @@ from conftest import _load_measurement_common
 from deisa.dask.mergeable_pca import local_pca, merge_tree
 
 #: The bridge-count ladder the sweep runs. Every entry divides ``N_SAMPLES`` exactly.
-BRIDGE_LADDER: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128)
+BRIDGE_LADDER: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024)
 
 #: Total samples across ALL bridges together, constant for the whole sweep.
 N_SAMPLES = 16384
