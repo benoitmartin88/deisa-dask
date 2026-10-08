@@ -213,6 +213,8 @@ def make_precomputed_view(
     signatures: dict,
     reapply,
     registered_ndim: int,
+    pca_summary=None,
+    registered_shape=None,
 ) -> _PrecomputedDeisaArray:
     """Build the per-callback dispatch view WITHOUT touching ``Array.__new__``.
 
@@ -221,14 +223,41 @@ def make_precomputed_view(
     ``DeisaArray``/``dask.array.Array`` instances are plain objects whose state lives in ``__dict__``, so the layout is
     identical across subclasses and the swap is safe (dask itself returns plain ``Array`` instances when a derived
     subclass cannot be preserved).
+
+    ``signatures`` may be EMPTY here, but only when ``pca_summary`` is given: a callback whose only precomputable work
+    is a bridge-side PCA has no combined reduction to route, so it would otherwise trip the "non-empty signatures"
+    guard below for a view that is perfectly legitimate.
+
+    - ``:param first:`` The carrier array the view is instantiated from. For a reduction callback this is the combined
+      array of its first reduction; for a PCA-only callback it is the one-element placeholder from
+      ``Deisa._pca_carrier_array``, whose own shape is 1 along every axis and therefore NOT the registered array's
+      shape.
+    - ``:param t:`` The timestep stamped onto the built ``DeisaArray``.
+    - ``:param signatures:`` ``{(op_name, reduction_axes): combined_array}``, routed by
+      ``_PrecomputedDeisaArray._dispatch``.
+    - ``:param reapply:`` The subset of ``signatures`` whose stored array is per-bridge partials to re-aggregate, not a
+      final value.
+    - ``:param registered_ndim:`` ``ndim`` of the REGISTERED array, so a caller's axis is normalized against the shape
+      the callback was written against, not the reduced delivered shape.
+    - ``:param pca_summary:`` The merged in-situ PCA delivery (:class:`~deisa.dask.branch.DeliveredPCA`, or a bare
+      ``Delayed`` / ``PCASummary``), or ``None`` for a reduction-only callback. Stored as ``_deisa_pca_summary`` because
+      that is the attribute :meth:`~deisa.dask.mergeable_pca.MergeablePCA.fit` looks for.
+    - ``:param registered_shape:`` ``shape`` of the REGISTERED array, or ``None`` when it is unknown. Stored as
+      ``_deisa_registered_shape`` because the PCA carrier's own shape is a one-element placeholder, so the estimator
+      needs the REGISTERED shape to know the real feature dimension ``d``; it is None only when no registered metadata
+      was available at delivery time, in which case that check falls back to trusting the summary.
     """
-    if not isinstance(signatures, dict) or not signatures:
+    if not isinstance(signatures, dict) or (not signatures and pca_summary is None):
         got = f"{type(signatures).__name__}={signatures!r}"
-        raise PrecomputeRuntimeError(f"make_precomputed_view: signatures must be a non-empty dict, got {got}")
+        raise PrecomputeRuntimeError(
+            f"make_precomputed_view: signatures must be a non-empty dict, or a pca_summary must be delivered, got {got}"
+        )
     view = build_deisa_array(first, t)
     view._signatures = dict(signatures)
     view._reapply = frozenset(reapply)
     view._registered_ndim = registered_ndim
+    view._deisa_registered_shape = tuple(registered_shape) if registered_shape is not None else None
+    view._deisa_pca_summary = pca_summary
     view.__class__ = _PrecomputedDeisaArray
     return view
 

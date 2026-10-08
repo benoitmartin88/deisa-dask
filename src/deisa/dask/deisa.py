@@ -42,8 +42,10 @@ from distributed import Client, Event, Future, Queue
 
 import dask.array as da
 from deisa.dask.branch import (
+    _BRANCH_KIND_PCA,
     _analyze_callback_for_branches,
     _combine_array_from_partials,
+    _combine_pca_summaries,
     merge_branches,
 )
 from deisa.dask.constants import (
@@ -539,7 +541,17 @@ class Deisa(IDeisa):
                                 f"{len(partial_futures)}. A bridge dropped or failed a branch; refusing to "
                                 f"deliver a corrupted reduction."
                             )
-                        if kind == "scalar" and _weak_self._is_full_reduction(array_name, output_key):
+                        if kind == "pca":
+                            # Bridge-side PCA: each bridge already summarized ITS OWN chunk, so the tree below consumes
+                            # summaries only. The root is where n_components/whiten are applied -- never on a bridge --
+                            # so what the callback receives is the exact pooled PCA, truncated to the requested
+                            # components at the last possible moment.
+                            spec = _weak_self._branch_spec_for(array_name, output_key)
+                            combined_by_key[output_key] = _combine_pca_summaries(
+                                partial_futures,
+                                config=(dict(spec.summary_config) if spec is not None else {}),
+                            )
+                        elif kind == "scalar" and _weak_self._is_full_reduction(array_name, output_key):
                             # Full scalar reduction: stack per-bridge partials along a new axis so the callback's
                             # reduction combines them via dask's natural graph.
                             sorted_partials = sorted(partial_futures, key=lambda p: tuple(p["chunk_position"]))
@@ -572,11 +584,16 @@ class Deisa(IDeisa):
                             raise PrecomputeRuntimeError(
                                 f"topic_handler: unknown precompute kind {kind!r} for {output_key}, refusing to deliver"
                             )
-                    # Every combined array must stay alive for the callback(s) that hold it.
-                    _weak_self.client.persist(list(combined_by_key.values()))
+                    # Every combined array must stay alive for the callback(s) that hold it. The pca
+                    # entry is a DeliveredPCA, not a dask array, and has no shape to persist, so it is skipped here: its
+                    # per-bridge LEAF futures are already retained by __update_futures_ownership, and the merge tree is
+                    # rebuilt on demand from those same keys each time a callback fits it.
+                    _persistable = [c for c in combined_by_key.values() if isinstance(c, da.Array)]
+                    if _persistable:
+                        _weak_self.client.persist(_persistable)
                     logger.debug(
                         f"topic_handler: precompute path produced {len(combined_by_key)} reduction chunk(s) "
-                        f"with shapes {[c.shape for c in combined_by_key.values()]}"
+                        f"with shapes {[c.shape for c in _persistable]}"
                     )
                     # Per-callback dispatch view: each callback sees its OWN combined array; the view rejects unrecorded
                     # calls.
@@ -650,6 +667,8 @@ class Deisa(IDeisa):
         reduction. Callbacks whose branches all live on other arrays get no view here (nothing to deliver).
         """
         views: Dict[str, Any] = {}
+        registered_shape = tuple(self.arrays_metadata.get(array_name, {}).get("global_shape", ()) or ())
+        registered_ndim = len(registered_shape)
         for callback_id in list(self._callbacks_by_array.get(array_name, [])):
             descriptors = self._callback_reductions.get(callback_id, {}).get(array_name)
             if not descriptors:
@@ -657,6 +676,7 @@ class Deisa(IDeisa):
                 continue
             signatures: Dict[Tuple[str, Tuple[int, ...]], Any] = {}
             reapply: Set[Tuple[str, Tuple[int, ...]]] = set()
+            pca_summary = None
             first = None
             for output_key, op_name, reduction_axes, kind in descriptors:
                 array = combined_by_key.get(output_key)
@@ -667,6 +687,12 @@ class Deisa(IDeisa):
                         f"carried no partials for it (delivered keys: {sorted(combined_by_key)}). "
                         f"Refusing to deliver a callback with a missing reduction."
                     )
+                if kind == _BRANCH_KIND_PCA:
+                    # The merged in-situ summary. Attached to the view rather than routed through the signature
+                    # map: the callback consumes it via MergeablePCA().fit(<view>), not via a reduction-signature
+                    # lookup, so it must not be reachable as if it were an already-final combined array.
+                    pca_summary = array
+                    continue
                 sig = (op_name, reduction_axes)
                 if sig not in signatures:
                     signatures[sig] = array
@@ -674,16 +700,48 @@ class Deisa(IDeisa):
                     reapply.add(sig)
                 if first is None:
                     first = array
-            if first is None:
+            if pca_summary is not None and not signatures:
+                # A PCA-only callback has no combined reduction to use as the view's carrier array, so build the
+                # placeholder below instead of refusing to deliver a callback that is perfectly precomputable.
+                first = self._pca_carrier_array(array_name)
+            elif first is None:
                 continue
             views[callback_id] = make_precomputed_view(
                 first,
                 t=iteration,
                 signatures=signatures,
                 reapply=reapply,
-                registered_ndim=len(self.arrays_metadata[array_name].get("global_shape", ())),
+                registered_ndim=registered_ndim,
+                pca_summary=pca_summary,
+                # The REGISTERED shape, never the carrier's own: a PCA-only carrier is a one-element placeholder whose
+                # shape[-1] is 1 for every array, so the estimator reading it would declare d=1 and refuse every real
+                # fit. This is the registered metadata the callback was written against.
+                registered_shape=registered_shape,
             )
         return views
+
+    def _pca_carrier_array(self, array_name: str) -> da.Array:
+        """A one-element zero array used ONLY as the ``DeisaArray`` carrier for a PCA-only dispatch view.
+
+        The PCA path delivers a merged :class:`~deisa.dask.mergeable_pca.PCASummary`, not array data, yet
+        :func:`~deisa.dask.utils.make_precomputed_view` instantiates its view from a real ``da.Array`` (whose ``dask``
+        graph, ``chunks``, ``dtype`` and ``shape`` the ``DeisaArray`` constructor reads). This is that array.
+
+        It carries no field data: one element, allocated at view-build time, never fetched from the bridge, and never
+        readable as the array the callback asked about. The callback must not read it -- the precompute contract does
+        not deliver the field, which is the whole point of the feature -- and the estimator takes the summary from
+        ``_deisa_pca_summary``, never from this.
+
+        Its ``shape`` is therefore NOT a source of truth about ``d``: every axis is 1, so an estimator that read
+        ``shape[-1]`` would declare a 1-feature array and refuse every real fit. The registered ``global_shape`` is
+        delivered alongside it (``registered_shape=``), which is where ``d`` is read from.
+
+        - ``:param array_name:`` The registered array the PCA was requested on, used for the metadata and the task name.
+        """
+        meta = self.arrays_metadata.get(array_name, {})
+        ndim = len(meta.get("global_shape", ())) or 1
+        shape = (1,) * ndim
+        return da.zeros(shape, chunks=shape, dtype=np.float64, name=f"deisa-pca-carrier-{array_name}")
 
     def _process_callback(self, callback_id, cb_data, array_name: str, darr: da.Array | DeisaArray, iteration: int):
         state = cb_data["state"]

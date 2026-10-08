@@ -23,6 +23,24 @@ Types of changes:
   `min`, `max`, `prod`) are analyzed at registration time and shipped to Dask workers as small per-bridge partials 
   instead of the full array chunk. Branches are registered per array, so a multi-array callback gets one branch set per 
   array. Expressions whose reduction depends on another reduction's output are refused with`UnsupportedReductionError`.
+- `deisa.dask.mergeable_pca`: exact mergeable PCA primitives. A local summary of one data block
+  (`n_samples`, `mean`, `components`, `singular_values`) merges with another summary into the exact summary of their
+  union, without either source sample ever reaching a merge node, so only a compact summary has to cross a process or
+  network boundary. `merge_tree` reduces summaries with a balanced pairwise tree. The merge algebra is classical and is
+  attributed as such in the module docstring: the between-block mean-correction term is the Chan-Golub-LeVeque (1979)
+  covariance merge and the merge-and-truncate tree shape is Qin & Yan (arXiv:1601.07010) / Kjolstad, Demmel et al.
+  (arXiv:1710.02812).
+- `deisa.dask.mergeable_pca.MergeablePCA`: a scikit-learn-style PCA estimator for Dask arrays, built on those
+  primitives. `fit` reduces one `local_pca` summary per input block with a balanced tree of `merge_pca` tasks, so no
+  source sample reaches a merge node and the result is the exact batch PCA at full local rank. `local_rank=R`
+  truncates each leaf summary to rank `R` before merging, shrinking what crosses a process boundary at the cost of a
+  retained subspace that drifts from the batch one; both effects are documented in the class docstring. `fit` refuses
+  rather than approximates: input that is not 2-D, a feature dimension split across chunks, a zero-size axis, or an
+  `n_components` above the achievable rank each raise a `ValueError` naming the condition and the remedy.
+  `_fit_dask_delayed` builds the tree WITHOUT computing and returns a real Dask graph, so it can be inspected or
+  `.visualize()`d; `_fit_dask` is the `.compute()` on top. The merged root summary is kept as `_summary_` for further
+  merging (and for the bridge to emit), separate from the truncated public `components_` / `singular_values_` /
+  `explained_variance_`, so nothing destroys mergeability mid-tree.
 
 ### Changed
 
