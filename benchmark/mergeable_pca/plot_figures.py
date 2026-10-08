@@ -292,9 +292,9 @@ def figure_sizing(results_dir: Path, out_dir: Path) -> Path:
     }
     specs = [
         ("layout_a_velocity_space", "full_rank", COL["blue"], "-", "o", "velocity axis, full rank"),
-        ("layout_a_velocity_space", "truncated", COL["blue"], "--", "s", "velocity axis, capped rank 32"),
+        ("layout_a_velocity_space", "truncated", COL["blue"], "--", "s", "velocity axis, capped summary rank, $R=32$"),
         ("layout_b_spatial_box", "full_rank", COL["red"], "-", "o", "spatial axis, full rank"),
-        ("layout_b_spatial_box", "truncated", COL["red"], "--", "s", "spatial axis, capped rank 32"),
+        ("layout_b_spatial_box", "truncated", COL["red"], "--", "s", "spatial axis, capped summary rank, $R=32$"),
     ]
     for layout, sub, c, ls, mk, label in specs:
         for mesh in meshes:
@@ -329,9 +329,9 @@ def figure_sizing(results_dir: Path, out_dir: Path) -> Path:
     ax.legend(
         handles=[
             Line2D([], [], color=COL["blue"], ls="-", marker="o", label="velocity axis, full rank"),
-            Line2D([], [], color=COL["blue"], ls="--", marker="s", label="velocity axis, capped rank 32"),
+            Line2D([], [], color=COL["blue"], ls="--", marker="s", label="velocity axis, capped summary rank, $R=32$"),
             Line2D([], [], color=COL["red"], ls="-", marker="o", label="spatial axis, full rank"),
-            Line2D([], [], color=COL["red"], ls="--", marker="s", label="spatial axis, capped rank 32"),
+            Line2D([], [], color=COL["red"], ls="--", marker="s", label="spatial axis, capped summary rank, $R=32$"),
         ]
         + weight_leg,
         loc="upper left",
