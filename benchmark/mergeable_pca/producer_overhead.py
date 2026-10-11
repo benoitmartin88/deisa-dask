@@ -126,9 +126,9 @@ def main() -> None:
         ("layoutA_4GiB_cap32", (2048, 8, 64, 32, 16), (3, 4), 32),
         # Layout B: features are spatial; the per-chunk volumes are matched by growing velocity
         # extents (the realistic case: vpar/mu refine faster than the box grows).
-        ("layoutB_512MiB", (32, 64, 32, 64, 16), (0, 1, 2), None),  # d=131072, n=1024, 512 MiB
-        ("layoutB_2GiB", (128, 64, 64, 32, 64), (0, 1, 2), None),  # d=524288, n=8192, 2 GiB
-        ("layoutB_4GiB", (128, 64, 64, 32, 64), (0, 1, 2), None),  # d=524288, n=16384, 4 GiB
+        ("layoutB_512MiB", (32, 64, 32, 64, 16), (0, 1, 2), None),  # d=65536, n=1024, 0.5 GiB
+        ("layoutB_8GiB_a", (128, 64, 64, 32, 64), (0, 1, 2), None),  # d=524288, n=2048, 8 GiB
+        ("layoutB_8GiB_b", (128, 64, 64, 32, 64), (0, 1, 2), None),  # repeat rung for run-to-run noise
     ]
     for label, shape, feature_axes, rank in layouts:
         print(f"=== {label}: shape {shape}, feature_axes {feature_axes}, rank {rank} ===", flush=True)
