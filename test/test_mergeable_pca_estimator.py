@@ -128,6 +128,23 @@ COMPUTED_BLOCKS: list[int] = []
 """Appended to by :func:`counting_block`; a non-empty list means a block was materialized."""
 
 
+@pytest.fixture(autouse=True)
+def _tripwire_isolated():
+    """Clear the module-global tripwire BEFORE and AFTER every test in this module.
+
+    ``COMPUTED_BLOCKS`` is plain module state, and not every ``counting_array`` consumer
+    drains it (a test that legitimately computes — e.g. a payload-size or fit-refusal
+    test — leaves stale ``1``s behind). Any later "nothing was computed" assertion would
+    then read the PREVIOUS test's blocks, which is exactly the cross-test leak that made
+    ``test_batch_size_creates_more_leaves_than_row_chunks`` fail on CI whenever
+    pytest-xdist happened to schedule the two tests onto the same worker. Isolating the
+    tripwire per test makes every such assertion about that test's own graph only.
+    """
+    COMPUTED_BLOCKS.clear()
+    yield
+    COMPUTED_BLOCKS.clear()
+
+
 def counting_block(block):
     """Materialize one block and record it, so "the graph was not computed" is observable deterministically.
 
