@@ -77,8 +77,8 @@ not say which is which. This module never guesses. Three constructor parameters 
 
 - ``axis_names``: what each axis is called, positionally. A Dask array carries no axis names of its own, so the
   caller is the only place the names can come from; they then appear verbatim in every refusal message.
-- ``feature_axes``: which of those axes are features. Defaults to the VELOCITY axes ``("vpar", "mu")`` when
-  ``axis_names`` names them, which is the layout a gyrokinetic distribution wants (Layout A below).
+- ``feature_axes``: which of those axes are features. Defaults to the axes the array's CHUNKING leaves WHOLE, which
+  are the axes complete on the rank that holds them (see the default rule below).
 - ``sample_axes``: which axes are samples. Defaults to every axis that is not a feature, so giving ``feature_axes``
   alone is enough.
 
@@ -86,10 +86,32 @@ Both ``feature_axes`` and ``sample_axes`` accept names or positions, and if BOTH
 axes exactly: an axis claimed by neither, by both, or twice, is refused rather than guessed. A 2-D array needs none of
 this -- its last axis is the feature axis -- so the existing 2-D call sites are untouched.
 
+The default feature axes come from the chunk layout, never from a name
+---------------------------------------------------------------------
+A mergeable summary stacks by feature position, so the feature dimension has to be COMPLETE on the rank that holds
+it. Where an array has already been distributed, that fact is in the array itself: the distributed axes carry more
+than one Dask chunk and the axes each rank holds whole carry exactly one. So the default reads that structure
+instead of matching a name:
+
+1. The caller's ``feature_axes`` wins whenever it is given, verbatim.
+2. Else, if the array splits SOME but not ALL of its axes, the axes it leaves WHOLE are the features and the axes it
+   splits are the samples. A registration that distributes the sample axes and keeps the feature space whole on
+   every rank therefore needs no configuration at all.
+3. Else -- every axis whole, or every axis split, so the chunking says nothing -- the LAST axis is the feature axis,
+   which keeps single-rank and fully materialized slabs working under a defined, non-guessing rule. A 2-D array
+   always takes this branch, exactly as it always has.
+
+A numpy bridge chunk carries no chunk structure of its own (it is ONE rank's slab), so the bridge leaf takes the
+caller's specification or, when the caller gave none, the same no-structure fallback of rule 3 -- which is the rule
+the estimator applies to a materialized array. A caller who wants a specific partition in situ states
+``feature_axes``, which is shipped verbatim to the bridge.
+
 Two layouts, measured, and they behave OPPOSITELY
 -------------------------------------------------
-For a gyrokinetic distribution indexed ``(species, tor1, tor2, tor3, vpar, mu)`` split across MPI ranks by the three
-spatial axes (each rank therefore owns a contiguous spatial box with the COMPLETE velocity space):
+The two branches of rule 2 are the two ways to read a distributed field. For a gyrokinetic distribution indexed
+``(species, tor1, tor2, tor3, vpar, mu)`` split across MPI ranks by the three spatial axes (each rank therefore owns
+a contiguous spatial box with the COMPLETE velocity space), the split axes are the samples and the whole velocity
+space is the feature set -- rule 2, with no configuration:
 
 - **Layout A -- PCA over velocity space, per spatial cell.** The features are ``(vpar, mu)``, so ``d = Nvpar * Nmu``
   is fixed by the physics and INDEPENDENT of the rank count. Samples are the spatial cells of the rank's own box.
@@ -105,7 +127,8 @@ spatial axes (each rank therefore owns a contiguous spatial box with the COMPLET
 
 Consequence for the API: the axis policy makes the difference explicit instead of hiding it, and a full-rank summary
 that is not smaller than its input is REFUSED rather than produced -- see :class:`MergeablePCA` for the guard and its
-measured reason. There is no auto-default that hides the trade.
+measured reason. The default is not a guess about the field's meaning: it is the partition the chunk layout already
+implies, and the guard still refuses the partition that cannot compress.
 
 Repository constraints honoured here
 -------------------------------------
@@ -309,6 +332,11 @@ def _flatten_chunk_to_2d(chunk: np.ndarray, axis_names, feature_axes, sample_axe
     The 2-D case is returned untouched, byte for byte, so the common deisa-dask case (a 2-D field split over ranks)
     goes through the bridge with no reshape at all.
 
+    A bridge chunk is ONE rank's slab, so it carries no chunk structure of its own: the axes the ranks were split
+    along are not visible from it. The default policy here is therefore the caller's explicit specification, or the
+    same no-structure fallback (the last axis) the estimator applies to a materialized array -- and a caller who wants
+    the structural partition in situ passes ``feature_axes``, which the bridge receives verbatim.
+
     - ``:param chunk:`` The bridge's own numpy chunk, of any dimensionality.
     - ``:param axis_names:`` The estimator's ``axis_names``, or ``None``.
     - ``:param feature_axes:`` The estimator's ``feature_axes``, or ``None``.
@@ -364,7 +392,11 @@ def local_pca_from_chunk(
     that turns a multi-dimensional field into ``(n_samples, n_features)`` has to be applied to numpy. Routing BOTH
     sides through this one function is what makes "bridge-side == standalone" testable rather than merely asserted:
     the bridge calls this, the estimator's own leaf calls :func:`local_pca` on the already-flattened block, and both
-    bottom out in the identical SVD-and-mean code with no second implementation to drift.
+    bottom out in the identical SVD-and-mean code with no second implementation to drift. The axis CLASSIFICATION is
+    shared too -- :func:`_partition_axes`, the same function :meth:`MergeablePCA._as_2d` calls -- with one difference
+    that is a property of the input, not of the policy: a bridge chunk is one rank's numpy slab and has no chunk
+    structure to read, so the default here is the caller's ``feature_axes`` or the last-axis fallback, exactly as the
+    estimator resolves a materialized array.
 
     A 2-D chunk takes the identical path :func:`local_pca` takes, because the policy leaves it untouched. A chunk
     whose feature dimension is SPLIT across ranks is refused rather than summarized: every per-bridge summary must
@@ -439,12 +471,29 @@ def _validate_optional_positive_int(name: str, value: object) -> None:
         raise ValueError(f"MergeablePCA: {name} must be None or a positive integer, got {value!r}.")
 
 
-# The velocity axes a gyrokinetic distribution is indexed by. They are the DEFAULT feature axes, because the feature
-# dimension of a mergeable summary must stay complete on one rank for summaries to be stackable, and the spatial split
-# is exactly what leaves the velocity space whole on every rank. Named as constants so the error messages, the
-# docstrings and the tests cannot drift apart.
-VELOCITY_AXES: tuple[str, ...] = ("vpar", "mu")
-"""The velocity axes of a ``(species, tor1, tor2, tor3, vpar, mu)`` distribution, in that order."""
+def _feature_axes_from_chunks(chunks, ndim: int) -> tuple[int, ...] | None:
+    """Derive the feature axes from an array's chunk layout, or return ``None`` when the layout says nothing.
+
+    The rule reads STRUCTURE, not meaning: a mergeable summary stacks by feature position, so the feature dimension
+    must be complete on the rank that holds it -- and the axes a distributed array leaves WHOLE are exactly the axes
+    each rank holds complete, while the axes it SPLITS are the distributed (sample) ones. So the features are the
+    unchunked axes and the samples are the chunked ones.
+
+    Returning ``None`` means "no structure to read", which the caller turns into the last-axis fallback: that is the
+    case when every axis is a single chunk (a single-rank registration, or a materialized array) and also when every
+    axis is split (a uniform chunking says nothing about which side is which). No contiguity requirement is imposed
+    on either group: the transpose and reshape are defined for any partition, and refusing a non-contiguous grouping
+    would only make the default harder to predict.
+
+    - ``:param chunks:`` The array's per-axis chunk sizes (a Dask ``chunks`` tuple), or ``None``.
+    - ``:param ndim:`` Number of axes of the array being classified.
+    """
+    if chunks is None or len(tuple(chunks)) != ndim:
+        return None
+    split = [axis for axis in range(ndim) if len(tuple(chunks[axis])) != 1]
+    if not split or len(split) == ndim:
+        return None
+    return tuple(axis for axis in range(ndim) if axis not in split)
 
 
 def _describe_axes(axis_names: Sequence[str] | None, ndim: int) -> tuple[str, ...]:
@@ -530,13 +579,16 @@ def _partition_axes(
     axis_names: Sequence[str] | None,
     feature_axes: object,
     sample_axes: object,
+    chunks: object = None,
 ) -> tuple[tuple[int, ...], tuple[int, ...]]:
     """Decide which axes are features and which are samples, refusing every ambiguous or overlapping spec.
 
     The rules, in order:
 
     1. A 1-D array is refused by the caller before this runs: one axis cannot be both kinds.
-    2. ``feature_axes`` defaults to the VELOCITY axes when ``axis_names`` names them, else to the LAST axis.
+    2. ``feature_axes`` defaults to the axes the chunk layout leaves WHOLE (:func:`_feature_axes_from_chunks`), i.e.
+       the axes complete on the rank that holds them, and to the LAST axis when the layout says nothing. A 2-D array
+       always takes the last axis, so its behaviour is unchanged.
     3. ``sample_axes`` defaults to every axis that is not a feature.
     4. If BOTH are given explicitly they must partition the axes exactly. An axis in neither set, in both, or named
        twice, is a refusal: the alternatives are a silently wrong PCA or a guess the caller never made.
@@ -545,15 +597,15 @@ def _partition_axes(
     - ``:param axis_names:`` Caller-supplied axis names, positional, or ``None``.
     - ``:param feature_axes:`` The ``feature_axes`` constructor argument, verbatim.
     - ``:param sample_axes:`` The ``sample_axes`` constructor argument, verbatim.
+    - ``:param chunks:`` The array's per-axis chunk sizes when it has them (the Dask path), else ``None``. A numpy
+      bridge chunk has no chunk structure of its own, so the bridge path passes ``None`` and the default falls back
+      to the last axis -- the same rule the estimator applies to a materialized array.
     """
     labels = _describe_axes(axis_names, ndim)
-    named_velocity = axis_names is not None and all(name in axis_names for name in VELOCITY_AXES)
     if feature_axes is None:
-        if named_velocity:
-            # Layout A: the velocity space is the feature basis, which is complete on every rank under a spatial split.
-            features = _resolve_axes(VELOCITY_AXES, ndim, axis_names, "feature_axes")
-        else:
-            features = (ndim - 1,)
+        # The last-axis rule is the 2-D contract (its last axis IS its feature axis) and the no-structure fallback.
+        structural = None if ndim == 2 else _feature_axes_from_chunks(chunks, ndim)
+        features = structural if structural is not None else (ndim - 1,)
     else:
         features = _resolve_axes(feature_axes, ndim, axis_names, "feature_axes")
 
@@ -641,9 +693,10 @@ class MergeablePCA:
 
     - ``axis_names``: what each axis is called, positionally. A Dask array carries no axis names of its own (it has no
       ``dims`` attribute), so the caller is the only place names can come from -- and they then appear verbatim in
-      every refusal message, so a message can say ``vpar`` rather than ``axis4``.
-    - ``feature_axes``: which axes are features. Defaults to ``("vpar", "mu")`` when ``axis_names`` names them
-      (Layout A, the default the measurements below justify), else to the last axis.
+      every refusal message, so a message can name the offending axis rather than its position.
+    - ``feature_axes``: which axes are features. Defaults to the axes the CHUNK LAYOUT leaves WHOLE, i.e. the axes
+      complete on the rank that holds them, and to the last axis when the layout says nothing (every axis a single
+      chunk, or every axis split). A 2-D array always takes the last axis, as it always has.
     - ``sample_axes``: which axes are samples. Defaults to every axis that is not a feature.
 
     Both ``feature_axes`` and ``sample_axes`` accept names or positions, and when BOTH are given they must partition
@@ -652,32 +705,39 @@ class MergeablePCA:
     input ``axis_names`` is accepted and used only in messages.
 
     The array is transposed so the feature axes come last, then reshaped to ``(n_samples, n_features)``. That reshape
-    is the ONLY flattening performed, it is value-preserving, and it is explicit in the reported shapes: with
-    ``axis_names=("species", "tor1", "tor2", "tor3", "vpar", "mu")`` and the default feature axes, the features are
-    ``vpar * mu`` and the samples are ``species * tor1 * tor2 * tor3``. One leaf is built per Dask block of the SAMPLE
-    axes, which is exactly one leaf per rank: a rank's contiguous spatial box is one leaf, complete in velocity space,
-    as a spatial split guarantees.
+    is the ONLY flattening performed, it is value-preserving, and it is explicit in the reported shapes: for an array
+    whose split axes are the three spatial ones and whose whole axes are the two velocity ones, the features are
+    ``Nvpar * Nmu`` and the samples are the product of the split axes. One leaf is built per Dask block of the SAMPLE
+    axes, which is exactly one leaf per rank: a rank's contiguous box is one leaf, complete in the feature space,
+    because the split axes define the leaves and the whole axes define the features.
 
-    Why Layout A is the default and Layout B is refused
-    ---------------------------------------------------
+    On the BRIDGE path the leaf sees ONE rank's numpy slab, which carries no chunk structure of its own, so there the
+    default is the caller's specification, or, with none, the same last-axis fallback this estimator applies to a
+    materialized array -- one policy function (:func:`_partition_axes`), one place it can be read. A caller who wants
+    a specific partition in situ states ``feature_axes``, which is shipped to the bridge verbatim.
+
+    Why the structural default is the compressing one, and the other is refused
+    ---------------------------------------------------------------------------
     For a gyrokinetic distribution split across MPI ranks by the three spatial axes, each rank holds a contiguous
-    ``(tor1, tor2, tor3)`` box with the COMPLETE velocity space. Which axes are the features therefore decides the
+    ``(tor1, tor2, tor3)`` box with the COMPLETE velocity space -- so the SPLIT axes are the samples and the WHOLE
+    axes are the features, which is exactly what the default reads. Which axes are the features therefore decides the
     whole regime, and the two choices behave oppositely. Measured on
     ``(tor1, tor2, tor3, vpar, mu) = (512, 128, 64, 128, 8)``, a leaf summary being ``(rank, d) + d`` float64:
 
     - **Layout A, features ``(vpar, mu)``** -- ``d = 1024``, fixed by the physics and INDEPENDENT of the rank count. A
       full-rank leaf summary is 8.0 MiB against a 4096 MiB slab at 8 ranks (511x) and a 512 MiB slab at 64 ranks
       (64x): it compresses at every rank count measured, so full local rank is viable and the merge is EXACT.
-    - **Layout B, features ``(tor1, tor2, tor3)``** -- ``d`` is the LOCAL box size and GROWS AS RANKS DECREASE, the
-      opposite of the usual scaling intuition. At 8 ranks ``d = 524288`` with ``n_samples = 1024`` velocity cells, and
-      the merged full-rank summary reaches rank 8199: 32800 MiB against a distributed slab of 32768 MiB, i.e. 1.00x.
-      No compression. (Sizing a leaf at the naive ``r = d`` rather than the true ``min(n_block, d) = 1024`` yields
-      the 2097156 MiB figure quoted elsewhere; either way the summary is not smaller than the data.)
+    - **Layout B, features ``(tor1, tor2, tor3)``** -- the other partition of the same array, declared explicitly:
+      ``d`` is the LOCAL box size and GROWS AS RANKS DECREASE, the opposite of the usual scaling intuition. At 8 ranks
+      ``d = 524288`` with ``n_samples = 1024`` velocity cells, and the merged full-rank summary reaches rank 8199:
+      32800 MiB against a distributed slab of 32768 MiB, i.e. 1.00x. No compression. (Sizing a leaf at the naive
+      ``r = d`` rather than the true ``min(n_block, d) = 1024`` yields the 2097156 MiB figure quoted elsewhere; either
+      way the summary is not smaller than the data.)
 
     A summary that is not smaller than its input is refused by :meth:`_check_summary_smaller_than_input`, which names
-    the measured reason and the remedy (``local_rank=R``). Under Layout B ``local_rank`` is therefore effectively
-    mandatory and is documented as such; there is no auto-default that hides the trade. Under Layout A the default
-    ``local_rank=None`` is the right answer.
+    the measured reason and the remedy (``local_rank=R``, or the other axis partition). Under Layout B ``local_rank``
+    is therefore effectively mandatory and is documented as such. Under Layout A the default ``local_rank=None`` is
+    the right answer.
 
     Repository constraints honoured here
     -------------------------------------
@@ -700,9 +760,9 @@ class MergeablePCA:
       Under Layout B it is effectively MANDATORY: the feature dimension is the local spatial box, so a full-rank
       summary is not smaller than its input and :meth:`_check_summary_smaller_than_input` refuses it.
     - ``:param axis_names:`` Optional name per axis, positionally, used in messages and in the ``feature_axes`` /
-      ``sample_axes`` lookup. ``None`` for 2-D input, or to select the last axis as the feature axis by default.
-    - ``:param feature_axes:`` Which axes are features, by name or position. ``None`` defaults to
-      :data:`VELOCITY_AXES` when ``axis_names`` names them, else to the last axis.
+      ``sample_axes`` lookup. ``None`` for 2-D input, or when the axes are to be classified by position alone.
+    - ``:param feature_axes:`` Which axes are features, by name or position. ``None`` defaults to the axes the chunk
+      layout leaves WHOLE (the axes complete on the rank that holds them), else to the last axis.
     - ``:param sample_axes:`` Which axes are samples, by name or position. ``None`` defaults to every axis that is
       not a feature. Give it only when the features do NOT cover the rest, because giving both partitions exactly.
     """
@@ -758,6 +818,10 @@ class MergeablePCA:
         The 2-D case is returned untouched -- no transpose, no reshape -- so a plain ``(n_samples, n_features)`` array
         costs nothing and existing call sites keep byte-identical graphs.
 
+        The feature/sample partition itself is :func:`_partition_axes`'s decision, and this method hands it the
+        array's chunk structure: when the caller declares no ``feature_axes``, the axes the chunking leaves WHOLE are
+        the features (see the class docstring's default rule). That is the only place the structural default is read.
+
         - ``:param X:`` Array of any dimensionality, already wrapped in ``dask.array``.
         """
         ndim = int(X.ndim)
@@ -782,7 +846,9 @@ class MergeablePCA:
                 f"MergeablePCA: X must be 2-dimensional (one sample axis, one feature axis), got ndim=1. "
                 f"Add the axis you meant, e.g. X.reshape(1, -1) for a single sample ({', '.join(labels)})."
             )
-        features, samples = _partition_axes(ndim, self.axis_names, self.feature_axes, self.sample_axes)
+        features, samples = _partition_axes(
+            ndim, self.axis_names, self.feature_axes, self.sample_axes, chunks=getattr(X, "chunks", None)
+        )
 
         if ndim == 2 and features == (1,) and samples == (0,):
             return X
@@ -802,13 +868,14 @@ class MergeablePCA:
         return transposed.reshape((n_samples, n_features))
 
     def _check_feature_chunks(self, X, features: tuple[int, ...], labels: tuple[str, ...]) -> None:
-        """Refuse a FEATURE axis split across Dask chunks, naming the axes and the structured_mesh remedy.
+        """Refuse a FEATURE axis split across Dask chunks, naming the axes and the rechunk that fixes it.
 
         This guard applies only where it genuinely applies: the feature dimension of a mergeable summary must be
-        complete on the rank that holds it, because a merge stacks summaries by feature position. Under Layout A that is
-        satisfied NATURALLY -- a spatial MPI split leaves the whole ``(vpar, mu)`` space on one rank, so ``chunks`` of a
-        bridge's slab has one entry per feature axis and this guard never fires. It fires only when the caller
-        rechunked across velocity, i.e. exactly when the summaries really would be unstackerable.
+        complete on the rank that holds it, because a merge stacks summaries by feature position. Under the structural
+        default that is satisfied BY CONSTRUCTION -- the features ARE the axes the chunking leaves whole, so
+        ``chunks`` of a bridge's slab has one entry per feature axis and this guard never fires. It fires for an
+        EXPLICIT feature choice that the caller then split, and for the no-structure fallback landing on a split last
+        axis; both are cases where the summaries really would be unstackerable.
 
         Note the asymmetry with the SAMPLE axes, which may be split freely (that is the whole point): this guard
         ignores them entirely.
@@ -826,9 +893,10 @@ class MergeablePCA:
         raise ValueError(
             f"MergeablePCA: the feature axes ({named}) are split across Dask chunks, got {chunks}. A mergeable PCA "
             "needs the COMPLETE feature dimension on one rank, because a merge stacks summaries by feature position. "
-            f"Rechunk the feature axes together: X = X.rechunk({remedy}). If those axes are the velocity axes "
-            "(vpar, mu) you may not need to rechunk at all: an MPI split over the spatial axes keeps the whole "
-            "velocity space on one rank by construction, so a bridge's slab satisfies this already."
+            f"Rechunk the feature axes together: X = X.rechunk({remedy}). If those axes are the ones you meant to keep "
+            "whole, note that the axes you chunked are the samples: an array distributed over the sample axes keeps "
+            "the whole feature space complete on every rank by construction, so a bridge's slab satisfies this "
+            "already."
         )
 
     # ---------------------------------------------------------------------------- fitting
@@ -911,7 +979,11 @@ class MergeablePCA:
 
         The classification goes through the same :func:`_partition_axes` policy :meth:`_as_2d` applies, so the count
         agrees with the layout the bridge summarized under by construction rather than by coincidence: a multi-axis
-        feature dimension multiplies out exactly as the reshape to ``(n_samples, n_features)`` would.
+        feature dimension multiplies out exactly as the reshape to ``(n_samples, n_features)`` would. It is called
+        WITHOUT a chunk layout, and that is the point: the bridge leaf summarizes one rank's numpy slab, which carries
+        no chunk structure either, so both sides resolve a declared policy or fall back to the same last axis. A
+        caller who wants the structural partition in situ declares ``feature_axes``, which the bridge receives
+        verbatim and this count resolves identically.
 
         Returns ``None`` when the shape is absent or unusable, meaning "unknown" -- the caller then trusts the summary
         rather than refusing a fit it has nothing to contradict.
@@ -1060,8 +1132,8 @@ class MergeablePCA:
         if len(X.chunks[1]) != 1:
             raise ValueError(
                 "MergeablePCA requires the complete feature dimension in a single Dask chunk, "
-                f"got chunks={X.chunks}. Rechunk with X = X.rechunk({{1: -1}}) before fitting -- for an array with "
-                "named axes, rechunk the velocity axes (vpar, mu) together rather than the axis position alone."
+                f"got chunks={X.chunks}. Rechunk with X = X.rechunk({{1: -1}}) before fitting -- for an array whose "
+                "axes are named, rechunk the feature axes together rather than the axis position alone."
             )
 
     def _check_summary_smaller_than_input(self, summary: PCASummary, n_features: int) -> None:
@@ -1069,14 +1141,15 @@ class MergeablePCA:
 
         This is the guard that makes the axis choice safe. A merged full-rank summary holds
         ``rank * d + d`` float64 elements against ``n_samples * d`` for the data, so it compresses exactly when
-        ``n_samples > d``. Under Layout A (``d = Nvpar * Nmu``, fixed by the physics) that holds comfortably: on
-        ``(tor1, tor2, tor3, vpar, mu) = (512, 128, 64, 128, 8)`` a full-rank leaf summary is 8.0 MiB against a
-        4096 MiB slab at 8 ranks (511x) and a 512 MiB slab at 64 ranks (64x).
+        ``n_samples > d``. The structural default holds comfortably, because the axes it picks as features are the
+        ones the ranks hold whole: on ``(tor1, tor2, tor3, vpar, mu) = (512, 128, 64, 128, 8)`` the features are the
+        whole velocity space (``d = 1024``, fixed by the physics, independent of the rank count) and a full-rank leaf
+        summary is 8.0 MiB against a 4096 MiB slab at 8 ranks (511x) and a 512 MiB slab at 64 ranks (64x).
 
-        Under Layout B (``d`` = the local spatial box, which GROWS as ranks decrease) it fails: at 8 ranks
-        ``d = 524288`` with ``n_samples = 1024``, the merged summary reaches rank 8199 and needs 32800 MiB against a
-        distributed slab of 32768 MiB -- 1.00x, no compression at all. Producing that silently would spend more
-        memory than the data it summarizes, which is worse than refusing, so it is refused by default.
+        The OTHER partition -- the distributed axes as features -- fails: ``d`` is then the local box and GROWS as
+        ranks decrease, so at 8 ranks ``d = 524288`` with ``n_samples = 1024``, the merged summary reaches rank 8199
+        and needs 32800 MiB against a distributed slab of 32768 MiB -- 1.00x, no compression at all. Producing that
+        silently would spend more memory than the data it summarizes, which is worse than refusing, so it is refused.
 
         ``local_rank`` is the remedy and the caller knows the trade: ``local_rank=R`` shrinks the summary to
         ``~R * d`` elements per leaf, so ``R`` below ``n_samples`` restores compression at the cost of the discarded
@@ -1095,12 +1168,13 @@ class MergeablePCA:
         raise ValueError(
             f"MergeablePCA: the merged summary would not compress the data -- {payload} float64 elements "
             f"(rank {summary.rank} x d {n_features} + d) against {data} for n_samples={n_samples}, d={n_features}, "
-            f"a ratio of {ratio:.2f}x. This happens when the FEATURE axes outnumber the samples: with velocity "
-            "axes (vpar, mu) as features d is fixed by the physics and this never triggers, but with the spatial axes "
-            "(tor1, tor2, tor3) as features d is the local box and grows as the rank count drops (measured: d=524288 "
-            "against n_samples=1024 at 8 ranks, 32800 MiB of summary for a 32768 MiB distributed slab). "
-            "Remedy: pass local_rank=R with R well below n_samples to truncate each leaf summary, or make the "
-            "velocity axes the features instead."
+            f"a ratio of {ratio:.2f}x. This happens when the FEATURE axes outnumber the samples, i.e. when the axes "
+            "you left WHOLE are the many and the axes you chunked are the few -- a distributed feature space that "
+            "the rank count shrinks, which is the layout the structural default deliberately does NOT pick "
+            "(measured: d=524288 against n_samples=1024 at 8 ranks, 32800 MiB of summary for a 32768 MiB distributed "
+            "slab). Remedy: pass local_rank=R with R well below n_samples to truncate each leaf summary, or declare "
+            "the other partition -- the axes you chunked are the samples and the axes left whole are the features, so "
+            "pass the axes complete on one rank to feature_axes."
         )
 
     def _check_root_rank(self, summary: PCASummary) -> None:

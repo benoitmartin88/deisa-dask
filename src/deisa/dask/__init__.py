@@ -12,7 +12,6 @@ except PackageNotFoundError:
 from .bridge import Bridge
 from .deisa import Deisa
 from .mergeable_pca import (
-    VELOCITY_AXES,
     MergeablePCA,
     PCASummary,
     local_pca,
@@ -23,7 +22,6 @@ from .mergeable_pca import (
 from .utils import get_connection_info
 
 __all__ = [
-    "VELOCITY_AXES",
     "Bridge",
     "Deisa",
     "MergeablePCA",
