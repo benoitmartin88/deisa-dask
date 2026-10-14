@@ -40,6 +40,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 
 import dask.array as da
+from deisa.dask.mergeable_pca import MergeablePCA as _PCAConstructor
 from deisa.dask.task_branches import extract_reduction_hints
 
 logger = logging.getLogger(__name__)
@@ -111,6 +112,73 @@ class NoComputeBoundaryError(PrecomputeError):
 
 # --------------------------------------------------------------------------- Source-array attribution
 # ---------------------------------------------------------------------------
+# The one name the analyzer resolves to a concrete class rather than treating as opaque. A callback that wants a PCA
+# of the registered field writes the ordinary estimator call, so this is the sole binding needed to recognize it:
+#
+#     @deisa.register("density")
+#     def cb(window):
+#         arr = window[-1]
+#         pca = MergeablePCA(n_components=3).fit(arr)
+#         return pca.singular_values_
+#
+# Recognizing it here is what keeps the PCA path out of the raw-field contract by construction: the ``fit`` call is a
+# KNOWN consumer of the registered array, so it is recorded as a bridge-executed branch instead of being refused as an
+# opaque raw read. Any OTHER consumer of the same array in the same callback is still refused -- one PCA request does
+# not license a raw read (that per-boundary rule is unchanged and is covered by its own test).
+#
+# This is a name binding, not a pattern match: the analyzer resolves ``MergeablePCA`` the way it already resolves
+# ``numpy`` and ``dask.array``, and everything after it is ordinary symbolic evaluation.
+_PCA_CONSTRUCTOR_NAMES = ("MergeablePCA",)
+
+# Constructor parameters the analyzer reads symbolically. Each is stored on the request and reaches the bridge branch.
+# The recorded config holds ONLY the parameters the caller WROTE: an omitted parameter is ABSENT, never None-filled, so
+# replaying it lets the constructor's own default apply and can never present it with an explicit ``None`` for a
+# parameter that rejects ``None``.
+# ``local_rank`` is OPTIONAL: leaving it unset means the full local rank ``min(n_block, d)``, which is the exact merge
+# and the auto-detected default (the rank law is fixed by the data, so there is nothing for the user to choose). Setting
+# it truncates each leaf and is the knob that turns the path into a bandwidth win.
+_PCA_CONFIG_PARAMS = ("n_components", "whiten", "local_rank", "axis_names", "feature_axes", "sample_axes")
+
+
+class _PCAFitRequest:
+    """Symbolic stand-in for ``MergeablePCA(...).fit(<registered array>)`` -- a recorded bridge-side branch.
+
+    Carries the estimator's constructor configuration verbatim and the array the ``fit`` was applied to. It is NOT a
+    dask array and never becomes one: the point is that the local PCA runs on the BRIDGE, over the rank's own numpy
+    chunk, so no such graph exists on the Dask side.
+
+    - ``:param config:`` The constructor configuration, as a dict over :data:`_PCA_CONFIG_PARAMS`.
+    """
+
+    __slots__ = ("config", "fitted_array")
+
+    def __init__(self, config: Dict[str, Any]):
+        self.config = dict(config)
+        self.fitted_array: Any = None
+
+    def __repr__(self) -> str:
+        return f"<PCAFitRequest {self.config!r} fitted_on={type(self.fitted_array).__name__}>"
+
+
+class _PCAFitted:
+    """Symbolic stand-in for a fitted :class:`~deisa.dask.mergeable_pca.MergeablePCA` inside a callback.
+
+    Attribute reads on it are allowed and inert (a callback legitimately wants ``components_`` / ``singular_values_`` /
+    ``explained_variance_ratio_``), and it can be returned. What it does NOT do is silently compute anything: the
+    analysis only records that the callback consumes a PCA of the registered array.
+
+    - ``:param request:`` The :class:`_PCAFitRequest` this was fitted from.
+    """
+
+    __slots__ = ("request",)
+
+    def __init__(self, request: _PCAFitRequest):
+        self.request = request
+
+    def __repr__(self) -> str:
+        return f"<PCAFitted {self.request!r}>"
+
+
 def _match_source_arrays(darr: Any, registered_arrays: Dict[str, Any]) -> List[str]:
     """Return the registered array names whose stub layer appears in the expression's task graph.
 
@@ -148,12 +216,42 @@ def analyze_callback(
     callback: Callable,
     registered_arrays: Dict[str, Any],
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Analyze the callback's source and return ``(reduction_hints, dask_arrays)``.
+    """
+    Analyze the callback's source and return ``(reduction_hints, dask_arrays)``.
 
     Strict: every condition that makes the callback unanalyzable raises its own :class:`PrecomputeError`
     subclass directly (there is no leniency left in the precompute path to defer an error to). ``dask_arrays``
     carries the walker's boundary expressions (e.g. ``(arr*arr).sum()``) so
     :func:`deisa.dask.branch._analyze_branch` can walk their graphs without a second AST pass.
+
+    This is the two-tuple half of :func:`analyze_callback_full`, kept as its own function because that pair is the
+    long-standing contract of every reduction-only call site. A callback that also requests a bridge-side PCA still
+    analyzes correctly through this wrapper -- the PCA request is validated and its refusals raised -- but its branch
+    metadata is only visible through the full call.
+
+    - ``:param callback:`` The user callback to analyze. Never invoked.
+    - ``:param registered_arrays:`` ``{array_name: stub}`` for every array the callback is registered on.
+    """
+    hints, dask_arrays, _pca_requests = analyze_callback_full(callback, registered_arrays)
+    return hints, dask_arrays
+
+
+def analyze_callback_full(
+    callback: Callable,
+    registered_arrays: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """The full analysis: ``(reduction_hints, dask_arrays, pca_requests)``.
+
+    The third element is the list of recorded ``MergeablePCA(...).fit(<registered array>)`` requests, one dict per
+    request with ``array`` / ``array_name`` / ``request`` / ``lineno``. It is empty for every reduction-only callback,
+    so the two-tuple :func:`analyze_callback` is the exact same function minus this argument.
+
+    A PCA request has no dask graph: the local decomposition runs on the BRIDGE over the rank's own numpy chunk, so
+    there is nothing for a graph walker to find. It is therefore returned separately rather than smuggled into
+    ``dask_arrays``, where every entry is contractually a dask array.
+
+    - ``:param callback:`` The user callback to analyze. Never invoked.
+    - ``:param registered_arrays:`` ``{array_name: stub}`` for every array the callback is registered on.
     """
     # 1. Parse callback source
     callback_src = _get_source(callback)
@@ -178,6 +276,11 @@ def analyze_callback(
     for alias in ("da", "dask_array", "dask"):
         scope.set(alias, da)
     scope.set("np", np)
+    # ``MergeablePCA`` resolves to its real class, so ``MergeablePCA(n_components=3).fit(arr)`` is recognized as a
+    # bridge-executed branch rather than refused as an opaque raw read (see :class:`_PCAFitRequest`). The class itself
+    # is imported at module level (``_PCAConstructor``); binding it into the scope is what makes the NAME resolve.
+    for name in _PCA_CONSTRUCTOR_NAMES:
+        scope.set(name, _PCAConstructor)
 
     for idx, pname in enumerate(param_names):
         if pname == "window":
@@ -263,8 +366,11 @@ def analyze_callback(
                 f"to switch it to the legacy full-chunk scatter path."
             )
 
-    # 8. No hints means the callback is unanalyzable: raise the specific reason.
-    if not hints:
+    # 8. No hints AND no PCA request means the callback is unanalyzable: raise the specific reason. A PCA request
+    # counts as a precomputable branch: the bridge decomposes it locally and ships a summary, which is exactly what the
+    # precompute path exists to do. So a PCA-only callback is NOT "no precomputable reduction" -- refusing it would
+    # make the feature unusable for its own motivating example.
+    if not hints and not walker.pca_requests:
         if not had_boundaries:
             raise NoComputeBoundaryError(
                 f"Callback {callback.__name__!r} contains dask operations but no compute boundaries "
@@ -275,7 +381,7 @@ def analyze_callback(
             f"Callback {callback.__name__!r} contains compute boundaries but no reductions we can precompute."
         )
 
-    return hints, dask_arrays
+    return hints, dask_arrays, list(walker.pca_requests)
 
 
 # --------------------------------------------------------------------------- Source file: AST cache + helper lookup
@@ -608,6 +714,11 @@ class _BoundaryWalker:
         self.dask_arrays: List[Dict[str, Any]] = []
         self.boundaries: List[Dict[str, Any]] = []
         self.had_materialization: bool = False
+        # One entry per recognized ``MergeablePCA(...).fit(<registered array>)``: the array, the attributed array
+        # name, the symbolic request (whose config becomes the bridge branch's callable), and the source line. Kept
+        # apart from ``dask_arrays`` because a PCA request has NO dask graph to walk -- its branch is built from the
+        # recorded config, not from a layer walk.
+        self.pca_requests: List[Dict[str, Any]] = []
 
     def _check_taint(self, args: List[Any], node: ast.AST, ctx: str) -> None:
         """Raise :class:`RawFieldReadError` when a raw-data value reaches a non-reduction consumer.
@@ -1034,6 +1145,16 @@ class _BoundaryWalker:
                 self._register_compute_boundary(recv_value, "compute", node.lineno)
             return _Missing(f"{func.value}.compute()")
 
+        # ---- ``MergeablePCA(...).fit(arr)``: the bridge-side PCA request is CONSUMED here ----
+        # This must come before the generic attribute path below, which would treat the request as an opaque receiver
+        # and then refuse the registered array as a raw read. The array named as the fit ARGUMENT is precisely the one
+        # consumer the PCA branch exists for, so it is recorded rather than refused. Its own attribute reads afterwards
+        # (``pca.singular_values_``) are inert and never reach this path.
+        if isinstance(func, ast.Attribute) and func.attr in {"fit", "fit_transform"}:
+            recv_value = self._eval(func.value, scope)
+            if isinstance(recv_value, _PCAFitRequest):
+                return self._record_pca_fit(recv_value, node, scope)
+
         # ---- dask/np submodule calls (e.g. da.fft.fft2(arr)) ----
         if isinstance(func, ast.Attribute):
             recv_value = self._eval(func.value, scope)
@@ -1081,7 +1202,12 @@ class _BoundaryWalker:
                     f"the analyzer cannot reason about."
                 )
 
-            # 2. Dask reduction builtins -- the analyzer detects these specifically because the resulting dask Array is
+            # 2. ``MergeablePCA(...)``: a bridge-side PCA request. Read the constructor configuration symbolically and
+            #    return a request object; the real object is NOT instantiated, so no SVD ever runs at registration.
+            if name in _PCA_CONSTRUCTOR_NAMES:
+                return self._build_pca_request(node, scope)
+
+            # 3. Dask reduction builtins -- the analyzer detects these specifically because the resulting dask Array is
             #    the target of precompute analysis. They must be called as bare names (``sum(arr)``) or as methods
             #    (``arr.sum()``) on a dask array.
             if name in {"sum", "min", "max"}:
@@ -1094,19 +1220,19 @@ class _BoundaryWalker:
                 py_fn = {"sum": sum, "min": min, "max": max}[name]
                 return py_fn(*args, **kwargs) if args else None
 
-            # 3. Pure Python builtins -- always safe (cannot reach the scheduler, cannot mutate outer state). Resolved
+            # 4. Pure Python builtins -- always safe (cannot reach the scheduler, cannot mutate outer state). Resolved
             #    locally; the result is a plain Python value.
             if name in _PURE_BUILTINS:
                 args = [self._eval(a, scope) for a in node.args]
                 kwargs = self._eval_kwargs(node.keywords, scope)
                 return _PURE_BUILTINS[name](args, kwargs)
 
-            # 4. User-defined helper (same source file). The walker descends into the helper's body recursively.
+            # 5. User-defined helper (same source file). The walker descends into the helper's body recursively.
             helper_def = self.source_file.find_function(name)
             if helper_def is not None:
                 return self._call_helper(helper_def, node, scope)
 
-            # 5. Unknown bare name -- treat as opaque (_Missing) so analysis can continue. This is the **default** for
+            # 6. Unknown bare name -- treat as opaque (_Missing) so analysis can continue. This is the **default** for
             #    anything the analyzer doesn't recognize: logging calls, custom modules, etc. The callback may still
             #    produce a result (the bridge falls back to the full chunk scatter path for that callback), but it does
             #    not fail the registration.
@@ -1134,6 +1260,125 @@ class _BoundaryWalker:
         return result
 
     # -- Helpers -----------------------------------------------------------
+    def _build_pca_request(self, node: ast.Call, scope: _Scope) -> _PCAFitRequest:
+        """Turn ``MergeablePCA(...)`` into a symbolic request carrying the estimator's configuration.
+
+        Every constructor argument is evaluated SYMBOLICALLY and validated here, at registration, so a malformed
+        configuration is refused before any bridge ever runs rather than surfacing as a runtime error deep in a
+        simulation. Validation delegates to the estimator's own constructor via the real class: that is what keeps the
+        analyzer's accepted set and the estimator's accepted set identical, with no second copy of the rules.
+
+        ``local_rank`` is left at its default (``None``, full local rank) when the user does not pass it. That is the
+        auto-detected default in the sense that matters: the rank of a leaf is fixed by the data
+        (``min(n_block, d)``), not chosen, so a user who says nothing gets the exact merge.
+
+        - ``:param node:`` The ``MergeablePCA(...)`` call node.
+        - ``:param scope:`` The walker scope, used to evaluate the arguments.
+        """
+        kwargs = self._eval_kwargs(node.keywords, scope)
+        positional = [self._eval(a, scope) for a in node.args]
+        if positional:
+            raise IncompatibleCallbackError(
+                f"MergeablePCA() must be called with keyword arguments only (got {len(positional)} positional) at "
+                f"line {node.lineno}. The precompute analyzer reads the configuration symbolically and a positional "
+                "argument would be ambiguous to attribute to a parameter. Use e.g. MergeablePCA(n_components=3)."
+            )
+        unknown = sorted(set(kwargs) - set(_PCA_CONFIG_PARAMS))
+        if unknown:
+            raise IncompatibleCallbackError(
+                f"MergeablePCA() got parameter(s) {unknown} at line {node.lineno} that the precompute analyzer cannot "
+                f"record; supported are {sorted(_PCA_CONFIG_PARAMS)}. Everything the bridge needs to reproduce the "
+                "estimator's configuration must be readable at registration, so name one of the supported "
+                "parameters (compute the rest from data on the bridge instead)."
+            )
+        # ONLY the parameters the caller actually WROTE are recorded. An omitted parameter is ABSENT rather than
+        # None-filled, and that is the whole rule: omission is how "use the estimator's own default" is spelled, so a
+        # replayed config can never present the constructor with an explicit ``None`` for a parameter that REJECTS
+        # ``None`` (e.g. ``whiten``). None-filling instead would make ``MergeablePCA(n_components=3)`` -- the documented
+        # motivating example -- die at registration on a value the user never wrote, and it would make the recorded
+        # config indistinguishable from one where ``None`` WAS written, which is a different request entirely. An
+        # explicit ``None`` in ``kwargs`` still reaches the constructor below and is still refused by its own guard.
+        config: Dict[str, Any] = dict(kwargs)
+        # Validate with the REAL constructor so the analyzer accepts exactly what the estimator accepts. The instance
+        # is discarded: it is the CONFIG that is recorded, not an object, and nothing is fitted at registration.
+        try:
+            _PCAConstructor(**config)
+        except Exception as e:
+            raise IncompatibleCallbackError(
+                f"MergeablePCA() configuration rejected at line {node.lineno}: {e}. Fix the estimator's arguments; "
+                "the same configuration is applied to the bridge-side local PCA."
+            ) from e
+        # ``axis_names`` must be a concrete tuple for the partial that crosses the bridge to be hashable and to survive
+        # pickling; a generator or other opaque sequence cannot, and a list is stored as-is by the estimator anyway.
+        names = config.get("axis_names")
+        if names is not None:
+            if isinstance(names, (list, tuple)):
+                config["axis_names"] = tuple(str(n) for n in names)
+            else:
+                raise IncompatibleCallbackError(
+                    f"MergeablePCA(axis_names=...) must be a literal list or tuple of names at line {node.lineno}, got "
+                    f"{type(names).__name__}. The analyzer has to record the names to send them to the bridge, so they "
+                    "cannot be computed from data."
+                )
+        return _PCAFitRequest(config)
+
+    def _record_pca_fit(self, request: _PCAFitRequest, node: ast.Call, scope: _Scope) -> _PCAFitted:
+        """Record ``request.fit(<registered array>)`` as a bridge-executed branch, and return the fitted stand-in.
+
+        The array named in the ``fit`` argument must descend from exactly ONE registered array. Two refusals, both
+        structural rather than silent:
+
+        - NO array (``fit()`` with nothing, or an opaque one): there is nothing for the bridge to decompose.
+        - MORE THAN ONE array (``fit(a + b)``): the bridge owns one chunk of each array, so it cannot form a single
+          per-bridge summary of a cross-array expression -- the same reason the reduction path refuses ``multi_source``.
+
+        - ``:param request:`` The symbolic request from :meth:`_build_pca_request`.
+        - ``:param node:`` The ``.fit(...)`` call node.
+        - ``:param scope:`` The walker scope, used to evaluate the ``fit`` argument.
+        """
+        args = [self._eval(a, scope) for a in node.args]
+        kwargs = self._eval_kwargs(node.keywords, scope)
+        candidates: List[da.Array] = [a for a in args if isinstance(a, da.Array)]
+        for value in kwargs.values():
+            if isinstance(value, da.Array):
+                # ``fit(X=arr)``: the keyword form names the array, which is legitimate.
+                candidates.append(value)
+                continue
+            # ``fit(X, y)`` is scikit-learn parity and ``y`` is accepted and ignored by the estimator, so a plain
+            # ``y`` is harmless. A dask ``y`` is not: it is a second raw-data read, refused like any other one.
+            items = list(value) if isinstance(value, (list, tuple)) else [value]
+            for item in items:
+                if isinstance(item, da.Array) and _is_stub_derived(item, self.registered_arrays):
+                    raise RawFieldReadError(
+                        f"Callback passes the registered array's raw data to MergeablePCA().fit as a keyword at line "
+                        f"{getattr(node, 'lineno', -1)}. Fit the array positionally; the precompute path only delivers "
+                        "per-bridge summaries of the registered array, never the full chunk."
+                    )
+        if not candidates:
+            raise UnsupportedReductionError(
+                f"MergeablePCA().fit() at line {getattr(node, 'lineno', -1)} was given no dask array, so the bridge "
+                "has no local chunk to decompose. Fit it on one of the callback's registered arrays."
+            )
+        matched = sorted({name for c in candidates for name in _match_source_arrays(c, self.registered_arrays)})
+        if not matched:
+            raise UnsupportedReductionError(
+                f"MergeablePCA().fit() at line {getattr(node, 'lineno', -1)} was given an array that descends from "
+                "none of the registered arrays, so the bridge cannot attribute a local chunk to it. Fit it on one of "
+                f"the callback's registered arrays ({sorted(self.registered_arrays)})."
+            )
+        if len(matched) > 1:
+            raise UnsupportedReductionError(
+                f"MergeablePCA().fit() at line {getattr(node, 'lineno', -1)} was given an expression descending from "
+                f"registered arrays {matched}. Each bridge owns one chunk of ONE array, so it cannot form a single "
+                "per-bridge PCA summary of a cross-array expression. Fit each registered array separately, or "
+                "register with precompute=False to use the legacy full-chunk scatter path."
+            )
+        request.fitted_array = candidates[0]
+        self.pca_requests.append(
+            {"array": candidates[0], "array_name": matched[0], "request": request, "lineno": node.lineno}
+        )
+        return _PCAFitted(request)
+
     def _register_compute_boundary(self, darr: da.Array, kind: str, lineno: int) -> None:
         if isinstance(darr, da.Array):
             self.dask_arrays.append({"array": darr, "kind": kind, "lineno": lineno})

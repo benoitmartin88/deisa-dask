@@ -11,6 +11,25 @@ except PackageNotFoundError:
 
 from .bridge import Bridge
 from .deisa import Deisa
+from .mergeable_pca import (
+    MergeablePCA,
+    PCASummary,
+    local_pca,
+    local_pca_from_chunk,
+    merge_pca,
+    merge_tree,
+)
 from .utils import get_connection_info
 
-__all__ = ["Bridge", "Deisa", "get_connection_info", "__version__"]
+__all__ = [
+    "Bridge",
+    "Deisa",
+    "MergeablePCA",
+    "PCASummary",
+    "__version__",
+    "get_connection_info",
+    "local_pca",
+    "local_pca_from_chunk",
+    "merge_pca",
+    "merge_tree",
+]

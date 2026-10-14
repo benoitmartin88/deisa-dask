@@ -47,7 +47,7 @@ import functools
 import itertools
 import logging
 import pickle
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -55,11 +55,12 @@ import numpy as np
 import dask.array as da
 from dask import delayed
 from dask.array.reductions import mean_agg, moment_agg
+from deisa.dask.mergeable_pca import PCASummary, _build_pca_branch_func
 from deisa.dask.precompute_analyzer import (
     PrecomputeRuntimeError,
     UnsupportedReductionError,
     _match_source_arrays,
-    analyze_callback,
+    analyze_callback_full,
 )
 from deisa.dask.task_branches import (
     _aggregate_output_feeds_other_reduction,
@@ -86,6 +87,17 @@ logger = logging.getLogger(__name__)
 _BRANCH_KIND_SCALAR = "scalar"
 _BRANCH_KIND_MEAN = "mean"
 _BRANCH_KIND_MOMENT = "moment"
+# "pca" is not a reduction but a per-bridge DECOMPOSITION: the bridge runs a local PCA on its own chunk and ships
+# the MERGEABLE SUMMARY (:class:`deisa.dask.mergeable_pca.PCASummary`), never the truncated public representation.
+# Truncating at the bridge would silently destroy the mergeability that is the whole point of the branch, so the
+# Deisa side merges summaries with the tree of :func:`deisa.dask.mergeable_pca.merge_pca` and only the ROOT applies
+# ``n_components``/``whiten``.
+_BRANCH_KIND_PCA = "pca"
+
+# The op name recorded for a PCA branch. It is NOT a dask reduction op: it names the decomposition the bridge runs, so
+# it takes the same path through ``output_key`` (``{array}-pca``), ``op_name`` and the dispatch signatures as every
+# other op without pretending to be one of ``SUPPORTED_OPS`` in :mod:`deisa.dask.task_branches`.
+_PCA_OP_NAME = "pca"
 
 
 @dataclass
@@ -135,6 +147,11 @@ class BranchSpec:
     deliver_direct: bool = True
     window_read: bool = False
     reduction_axes: Tuple[int, ...] = ()
+    # For a "pca" branch: the recorded MergeablePCA configuration, applied at the ROOT of the merge tree on the Dask
+    # side and deliberately NOT on the bridge. Empty for every reduction branch. The bridge's payload must stay the
+    # mergeable summary, so ``n_components``/``whiten`` cannot travel inside ``branch_func`` -- truncating per bridge
+    # would destroy exactly the mergeability the branch exists to provide.
+    summary_config: Dict[str, Any] = field(default_factory=dict)
 
 
 def merge_branches(existing: List[BranchSpec], new: List[BranchSpec]) -> List[BranchSpec]:
@@ -343,6 +360,77 @@ def _nest_partial_dicts_by_grid(
     return nested, grid_shape
 
 
+def _combine_pca_summaries(
+    partial_futures: List[Dict[str, Any]],
+    config: Optional[Dict[str, Any]] = None,
+) -> Any:
+    """Reduce the per-bridge PCA summaries into ONE delivered in-situ PCA, without a worker ever seeing a sample.
+
+    This is the Deisa-side half of the in-situ placement. Each entry of ``partial_futures`` is a scattered
+    :class:`~deisa.dask.mergeable_pca.PCASummary` produced by a bridge running
+    :func:`~deisa.dask.mergeable_pca.local_pca_from_chunk` over its OWN chunk; the returned object merges them with the
+    balanced pairwise tree of :func:`~deisa.dask.mergeable_pca.merge_pca` (the reduction shape of Qin & Yan,
+    arXiv:1601.07010, Algorithm 1, and Kjolstad/Demmel et al., arXiv:1710.02812, merge-and-truncate).
+
+    Three properties this is built to have, each of which the acceptance tests assert:
+
+    - **No sample crosses.** The tree's leaves are the scattered summaries, so a merge node consumes summaries only. No
+      task in the graph ever holds a raw sample, which is what makes "the chunk never reaches a worker" provable rather
+      than asserted: there is no task that COULD return one.
+    - **Not truncated at the bridge.** ``n_components`` and ``whiten`` in ``config`` are applied at the ROOT only,
+      inside :meth:`MergeablePCA._fit_delivered`. Truncating per bridge would drop directions before the cross-bridge
+      Chan-Golub-LeVeque (1979) correction term ever runs and silently destroy exactness.
+    - **A real Dask graph, returned unbuilt.** The result is a ``Delayed`` carrying the merged ``PCASummary``, so each
+      merge node costs ``O(d^3)`` -- independent of the sample count -- and the graph is inspectable before it runs.
+
+    The merge algebra is classical (Chan-Golub-LeVeque 1979; Qin & Yan; Kjolstad/Demmel); what is claimed as ours is
+    only that the leaves are evaluated inside the simulation's MPI bridge rather than on the analytics workers.
+
+    - ``:param partial_futures:`` One ``{"future": Future, ...}`` entry per bridge, each holding a scattered
+      ``PCASummary``.
+    - ``:param config:`` The recorded root-only estimator configuration (``n_components`` / ``whiten`` / ...), used to
+      build the same estimator the user wrote. ``None`` or empty means the defaults.
+    """
+    from deisa.dask.mergeable_pca import merge_pca
+
+    # Sort by chunk_position for determinism: merge_pca is associative, so the ORDER cannot change the result, but a
+    # stable order makes the graph reproducible and the tests comparable run to run.
+    ordered = sorted(partial_futures, key=lambda p: tuple(p["chunk_position"]))
+    level = [delayed(p["future"]) for p in ordered]
+    while len(level) > 1:
+        merged = [delayed(merge_pca)(level[i], level[i + 1]) for i in range(0, len(level) - 1, 2)]
+        if len(level) % 2:
+            # An odd level carries its last node up unchanged, keeping the tree balanced instead of degenerating into
+            # a chain -- the same reasoning merge_tree makes, and safe because merge_pca is associative.
+            merged.append(level[-1])
+        level = merged
+    return DeliveredPCA(level[0], dict(config or {}))
+
+
+@dataclass(frozen=True)
+class DeliveredPCA:
+    """A merged in-situ PCA summary plus the estimator configuration that should consume it.
+
+    Carried as an attribute (``_deisa_pca_summary``) on the per-callback dispatch view, which is what
+    :meth:`MergeablePCA._fit_delivered` looks for. A frozen dataclass pickles by value: no reconstruction callback, no
+    globals to resolve on a worker, and the ``Delayed`` inside it rebuilds its own graph when it does.
+
+    - ``:param merged:`` ``Delayed`` (or any object with ``.compute()``) yielding the merged ``PCASummary``.
+    - ``:param config:`` Root-only estimator configuration: ``n_components``, ``whiten``, and the axis policy.
+    """
+
+    merged: Any
+    config: Dict[str, Any]
+
+    def compute(self) -> Any:
+        """Materialize the merged summary. Equivalent to ``self.merged.compute()``.
+
+        Named explicitly so the estimator's ``hasattr(delivered, "compute")`` branch treats this wrapper and a bare
+        ``Delayed`` identically, instead of a wrapper silently reading ``.merged`` as if it were the summary.
+        """
+        return self.merged.compute()
+
+
 def _flatten_grid_entries(nested: Any) -> List[Any]:
     """Flatten a (possibly nested) grid structure of partial values into a flat list."""
     out: List[Any] = []
@@ -513,7 +601,13 @@ def _discover_partial_metadata(
         partial_dtype = str(branch.get("dtype", "float64"))
     else:
         sample = branch_func(placeholder)
-        if isinstance(sample, dict):
+        if isinstance(sample, PCASummary):
+            # A "pca" branch ships the mergeable summary, whose largest array is ``components``. Read the shape off the
+            # summary instead of ``np.asarray``-ing the dataclass, which would build a 0-d object array and record
+            # ``()``/``object`` -- metadata the Deisa side cannot use to reason about the payload at all.
+            partial_shape = tuple(sample.components.shape)
+            partial_dtype = str(sample.components.dtype)
+        elif isinstance(sample, dict):
             # mean / moment : the per-bridge partial is a dict with per-key shape. Pick ``total`` as the representative
             # (it always has the reduction-output shape).
             if "total" in sample:
@@ -532,13 +626,22 @@ def _discover_partial_metadata(
 
 
 def _analyze_branch(callback: Callable, registered_arrays: Dict[str, Any]) -> List[BranchSpec]:
-    """Walk the callback's dask graph and emit a :class:`BranchSpec` per branch."""
-    # Single AST walk: analyze_callback returns reduction hints AND the walker's dask_arrays in one pass. The
-    # dask_arrays are the walker's expressions at each compute boundary (e.g. ``(arr*arr).sum()``); the registered
-    # placeholders only have the root layer, so the chain walker needs these.
-    hints, walker_dask_arrays = analyze_callback(callback, registered_arrays)
+    """Walk the callback's dask graph and emit a :class:`BranchSpec` per branch.
 
-    if not hints:
+    Two kinds of branch come out of one analysis pass, in the same list, because they share everything downstream
+    (the bridge call site, the scatter, the merge tree, the dispatch view):
+
+    - reduction branches, from the hint/graph walk below;
+    - ``pca`` branches, one per recorded ``MergeablePCA(...).fit(<registered array>)``. Those are built by
+      :func:`_build_pca_branch` from the recorded estimator configuration rather than from a graph, because the
+      decomposition runs on the BRIDGE and therefore has no Dask graph to walk.
+    """
+    # Single AST walk: analyze_callback_full returns reduction hints, the walker's dask_arrays AND the recorded PCA
+    # requests in one pass. The dask_arrays are the walker's expressions at each compute boundary (e.g.
+    # ``(arr*arr).sum()``); the registered placeholders only have the root layer, so the chain walker needs these.
+    hints, walker_dask_arrays, pca_requests = analyze_callback_full(callback, registered_arrays)
+
+    if not hints and not pca_requests:
         return []
 
     # Candidate map keyed by (array_name, op_name): from ALL walker graphs, each aggregate layer maps its canonical op
@@ -639,7 +742,66 @@ def _analyze_branch(callback: Callable, registered_arrays: Dict[str, Any]) -> Li
                 f"Inspect with the failing branch's chunk_kwargs."
             )
         branches.append(branch)
+
+    # PCA branches: one per recorded request, built from the estimator configuration rather than from a graph walk.
+    # They are appended AFTER the reductions so a callback that asks for both gets its reductions first, and both share
+    # the same ``output_key`` namespace (``{array}-pca`` vs ``{array}-{op}``) through the same dedup.
+    for pca_request in pca_requests:
+        branches.append(_build_pca_branch(pca_request))
     return branches
+
+
+def _build_pca_branch(pca_request: Dict[str, Any]) -> BranchSpec:
+    """Build the ``pca`` :class:`BranchSpec` for one recorded ``MergeablePCA(...).fit(<registered array>)``.
+
+    The branch is deliberately a LENGTH-1 branch over the module-level :func:`_pca_branch_func` partial, so it reuses
+    the existing bridge call site (:meth:`Bridge._execute_operations_on_chunk`, which is just
+    ``branch.branch_func(chunk)``) unchanged. There is no chain to fold: the bridge's whole job is to decompose its own
+    chunk, so there is nothing upstream of ``local_pca``.
+
+    The payload is the MERGEABLE summary, never the truncated public representation. That is the whole point: a summary
+    truncated at the bridge to ``n_components`` cannot be merged, because the discarded directions are gone before the
+    cross-bridge correction term ever runs. So ``n_components`` and ``whiten`` are recorded here as ROOT-ONLY
+    configuration (``_summary_``-time work on the Dask side) and are deliberately absent from ``branch_func``.
+
+    ``partial_shape`` / ``partial_dtype`` describe the summary's components array, the largest array it carries. The
+    Deisa side re-derives the root shape from the merged summary itself, so these only inform the topic-event metadata.
+
+    - ``:param pca_request:`` One entry of ``analyze_callback_full``'s ``pca_requests``: ``array_name``, ``request``
+      and ``lineno``.
+    """
+    config: Dict[str, Any] = dict(pca_request["request"].config)
+    array_name = str(pca_request["array_name"])
+    branch_func = _build_pca_branch_func(
+        config.get("local_rank"),
+        config.get("axis_names"),
+        config.get("feature_axes"),
+        config.get("sample_axes"),
+    )
+    # ``deliver_direct=True`` and ``reduction_axes=()``: the PCA branch reads the registered chunk ITSELF and consumes
+    # the WHOLE feature dimension, so it passes the same "the callback's own op can consume this delivery" gate every
+    # reduction branch passes. The runtime dispatch is NOT by ``op_name``: there is no ``_PrecomputedDeisaArray.pca``
+    # method to route to. The summary is attached to the view as ``_deisa_pca_summary`` and consumed by
+    # ``MergeablePCA.fit`` looking that attribute up, which is the explicit separate route this comment used to name
+    # wrongly.
+    return BranchSpec(
+        output_key=f"{array_name}-{_PCA_OP_NAME}",
+        input_name=array_name,
+        output_kind=_BRANCH_KIND_PCA,
+        branch_func=branch_func,
+        # No reduction axis: the local PCA needs every row of the chunk as samples, and every column as features.
+        chunk_axis=None,
+        finalize=None,
+        partial_shape=(0, 0),
+        partial_dtype="float64",
+        op_name=_PCA_OP_NAME,
+        deliver_direct=True,
+        window_read=False,
+        reduction_axes=(),
+        # ROOT-ONLY estimator configuration. Not applied on the bridge; consumed by the Deisa-side combine to build the
+        # same estimator the user wrote, so the merge result and the public attributes agree with a standalone fit.
+        summary_config=config,
+    )
 
 
 def _candidate_chain_classify(branch: Dict[str, Any], aggregate_candidates: Dict) -> Tuple[bool, bool]:
