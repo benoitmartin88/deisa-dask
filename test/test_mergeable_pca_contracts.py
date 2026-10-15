@@ -240,10 +240,15 @@ def test_the_sweep_grid_actually_exercises_both_outcomes():
 def test_transform_width_agrees_with_the_component_matrix(n_components, local_rank):
     """``transform`` emits exactly ``components_.shape[0]`` columns, for every configuration in the sweep.
 
-    Separated from the invariant above because this is the consequence a caller actually trips over: ``transform``
-    validates ``Z.shape[1] == n_components_``, so a lying ``n_components_`` is what turns a buffer mismatch into a hard
-    error far from the fit that caused it. A refused configuration is skipped rather than failed: there is no estimator
-    to project with, and refusing IS the contract holding. The honoured cases are where the width has to be right.
+    Separated from the invariant above because this is the consequence a caller actually trips over: a caller sizes its
+    own buffer from ``n_components_``, and ``inverse_transform`` validates ``Z.shape[1] == n_components_``, so a
+    projection narrower than the declared count is rejected by the estimator's OWN companion method. The width is
+    therefore asserted against BOTH numbers -- the declared ``n_components_`` the caller reads and the
+    ``components_.shape[0]`` actually available -- and then round-tripped, which is what turns a lying ``n_components_``
+    into a hard error far from the fit that caused it. Before the fix this test failed with a projection of 11 columns
+    against ``n_components_=12`` and ``inverse_transform`` raising "Z has 11 columns but this estimator kept 12
+    components". A refused configuration is skipped rather than failed: there is no estimator to project with, and
+    refusing IS the contract holding. The honoured cases are where the width has to be right.
 
     - ``:param n_components:`` Swept request: ``None`` means "keep everything".
     - ``:param local_rank:`` Swept per-leaf truncation.
@@ -258,9 +263,20 @@ def test_transform_width_agrees_with_the_component_matrix(n_components, local_ra
         return
 
     Z = np.asarray(pca.transform(X))
+    declared = int(pca.n_components_)
+    assert Z.shape[1] == declared, (
+        f"n_components={n_components}, local_rank={local_rank}: transform emitted {Z.shape[1]} columns but "
+        f"n_components_={declared}; a caller sizing a buffer from n_components_ reads past the projection's end"
+    )
     assert Z.shape[1] == int(pca.components_.shape[0]), (
         f"n_components={n_components}, local_rank={local_rank}: transform emitted {Z.shape[1]} columns but "
         f"components_.shape[0]={pca.components_.shape[0]}"
+    )
+    # The round trip is what the mismatch costs a caller: inverse_transform refuses the projection its own transform
+    # just produced, so the failure surfaces far from the fit that caused it.
+    back = np.asarray(pca.inverse_transform(Z))
+    assert back.shape == (Z.shape[0], int(pca.n_features_in_)), (
+        f"n_components={n_components}, local_rank={local_rank}: the round trip came back as {back.shape}"
     )
     # The projection is centred by the pooled mean, so its own sample mean is ~0 over the fitted data.
     assert float(np.max(np.abs(np.mean(Z, axis=0)))) < 1e-8, "the projection must be centred by mean_"
