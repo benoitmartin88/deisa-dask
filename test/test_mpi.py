@@ -187,7 +187,18 @@ def test_mpi_bridge(global_size: Tuple, parallelism: int, comm: str):
 
     try:
         assert result.returncode == 0, f"MPI test failed\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
-        assert async_result.get(timeout=10) == 0
+        # This bound covers only what remains AFTER the bridge process has exited: the Deisa side still has to
+        # drain its callback loop, and the callback itself computes on the cluster (``darr.sum().compute()``
+        # above), i.e. one more scheduler -> worker round trip. That round trip is normally ~30 ms, but this
+        # container is descheduled in bursts of 100 ms to several seconds on a shared host (measured: a canary
+        # thread in the test process sees dozens of 50-400 ms preemptions exactly during those windows, while
+        # distributed reports "Event loop was unresponsive in Nanny for X s" for its own processes), which
+        # stretches it to 10-30 s. Measured by alternating HEAD and ebda460^ on the same config: ebda460^
+        # exceeded this bound once in 8 runs (21.9 s), HEAD never in 8 (max 2.7 s); the stalls hit
+        # ``mpi-comm-world`` as readily as ``mpi-comm-cart`` (20.9 s observed), so the cart-only failures in the
+        # original report are sampling noise, not a product regression. 60 s keeps the assertion as a deadlock
+        # detector while tolerating the host's scheduling stalls.
+        assert async_result.get(timeout=60) == 0
     finally:
         pool.terminate()
         pool.join()
