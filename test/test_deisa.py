@@ -930,8 +930,9 @@ class TestUsingDaskCluster:
         del deisa
 
         # 1 because of HandshakeActor
-        assert len(cluster.scheduler.tasks) == 1, \
+        assert len(cluster.scheduler.tasks) == 1, (
             f"Only 1 task should be left, but there are {len(cluster.scheduler.tasks)}"
+        )
 
     def test_multi_array_callback_consistent_iterations(self, env_setup):
         """Regression test for issue #128: missing iterations when using multiple arrays in a callback.
@@ -1000,5 +1001,3 @@ class TestUsingDaskCluster:
             assert x_t == y_t, f"callback received inconsistent iterations: x at {x_t}, y at {y_t}"
 
         async_close_bridges(sim.bridges, 1)
-
-
