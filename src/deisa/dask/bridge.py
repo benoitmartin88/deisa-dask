@@ -61,6 +61,18 @@ except Exception:
     _UNDEFINED = 2147483647
 
 
+def _called_from_event_loop() -> bool:
+    """Whether the current thread is running an asyncio event loop, i.e. we are inside a callback.
+
+    - ``:return:`` True if an event loop is running in this thread, False otherwise.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
 class Bridge(IBridge):
     def __init__(self, comm: ICommunicator, arrays_metadata: Dict[str, Dict], *args, **kwargs):
         """
@@ -246,11 +258,29 @@ class Bridge(IBridge):
         (``sys.is_finalizing()``): ``close()`` synchronizes all bridges with an
         MPI barrier, and at shutdown the peer ranks may already be torn down,
         so that barrier would hang forever -- a hang is worse than an
-        exception. During normal (non-shutdown) garbage collection the full
-        ``close()`` still runs.
+        exception.
+
+        Never runs it from an event-loop callback either. The collector runs
+        ``__del__`` on whichever thread dropped the last reference, and for a
+        leaked bridge that is a distributed "IO loop" thread. ``close()``
+        synchronizes with the world (MPI barrier) and with the scheduler
+        (``Handshake.set_bridges_done`` -> ``Client.sync()``), and ``Client.sync()``
+        blocks the calling thread until the client's loop runs the callback: from
+        inside that very loop the callback can never run, so the thread sits out the
+        whole ``sync()`` timeout (60 s measured) and, with an in-process cluster whose
+        scheduler, workers and client share that loop, freezes the whole cluster.
+
+        During normal (non-shutdown) garbage collection from any other thread the
+        full ``close()`` still runs.
         """
         if sys.is_finalizing():
             logger.debug(f"[{self.id}] Bridge.__del__ during interpreter shutdown: skipping close()")
+            return
+        if _called_from_event_loop():
+            logger.debug(
+                f"[{self.id}] Bridge.__del__ from inside an event-loop callback: skipping close(), it would "
+                f"block the loop that has to service its collectives"
+            )
             return
         try:
             self.close(timestep=sys.maxsize)
