@@ -27,10 +27,12 @@
 # POSSIBILITY OF SUCH DAMAGE.
 # =============================================================================
 import asyncio
+import gc
 import logging
 import os
 import sys
 import time
+import weakref
 
 import numpy as np
 import pytest
@@ -262,6 +264,42 @@ class TestPrecomputeRegressions:
         bridge.close = spy_close
         bridge.__del__()
         assert calls == [], "__del__ must skip close() during interpreter shutdown"
+
+    def test_del_does_not_block_the_event_loop(self, env_setup, caplog):
+        """Teardown: __del__ must not make blocking calls from inside an event-loop callback.
+
+        The collector runs ``__del__`` on whichever thread dropped the last reference; for a leaked bridge
+        that is a distributed "IO loop" thread. ``close()`` synchronizes with the scheduler through
+        ``Client.sync()``, which blocks until *that* loop runs the callback -- from inside the loop the
+        callback never runs, so the thread waits out the whole ``sync()`` timeout and, with an in-process
+        cluster, freezes the scheduler, its workers and the client that share the loop.
+
+        Deterministic sister of the intermittent serial teardown flake: the collection is forced onto the
+        client's loop thread instead of waiting for the garbage collector to pick that thread by chance.
+        """
+        client, _ = env_setup
+        bridge, _ = self.get_plain_bridge()
+        # Keep the bridge alive through a reference cycle: refcounting alone cannot free it, so only the
+        # gc.collect() below -- running on the client's loop thread -- can collect it (and run __del__).
+        bridge._probe_cycle = [bridge]
+        collected = weakref.ref(bridge)
+        del bridge
+        assert collected() is not None, "the reference cycle should keep the bridge alive"
+
+        async def collect_on_the_loop():
+            gc.collect()
+
+        with caplog.at_level(logging.DEBUG, logger="deisa.dask.bridge"):
+            start = time.monotonic()
+            client.sync(collect_on_the_loop)
+            elapsed = time.monotonic() - start
+
+        assert collected() is None, "the bridge should have been collected inside the loop callback"
+        assert elapsed < 30, f"__del__ blocked the event loop for {elapsed:.1f}s"
+        assert any("event-loop callback" in record.getMessage() for record in caplog.records), (
+            "close() must be skipped: it cannot complete while the loop that has to service its collectives "
+            "is blocked by the very call waiting for it"
+        )
 
     def test_close_skips_collectives_at_interpreter_shutdown(self, env_setup, monkeypatch):
         """Teardown: close() skips the barrier / sub-comm Free() at shutdown.
