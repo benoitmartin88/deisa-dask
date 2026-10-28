@@ -211,6 +211,35 @@ class PartialReport:
     error: Optional[str] = None
 
 
+def _value_payload(value: Any) -> Dict[str, Any]:
+    """Encode ONE menu value as a msgpack-safe tree, keeping its dtype and shape.
+
+    The topic event bus is ``distributed.Client.log_event``, which carries msgpack primitives only: it rejects the
+    dataclass, and it rejects a numpy scalar or array too. A menu value is either a numpy scalar or the
+    ``{n, total[, M]}`` partial of the mean/moment chunk stages, so each leaf travels as
+    ``{"dtype": ..., "shape": ..., "data": ...}`` and :func:`_value_from_payload` rebuilds it EXACTLY -- widening a
+    float32 partial to a Python float would change the dtype the merge reports, and a list-valued total would make the
+    aggregation algebra concatenate instead of add.
+
+    - ``:param value:`` One menu value: a numpy scalar/array, or a mapping of them.
+    """
+    if isinstance(value, Mapping):
+        return {"dict": {str(key): _value_payload(item) for key, item in value.items()}}
+    array = np.asarray(value)
+    return {"dtype": str(array.dtype), "shape": [int(size) for size in array.shape], "data": array.ravel().tolist()}
+
+
+def _value_from_payload(payload: Mapping[str, Any]) -> Any:
+    """Rebuild the numpy value :func:`_value_payload` encoded, dtype and shape included.
+
+    - ``:param payload:`` One encoded menu value.
+    """
+    if "dict" in payload:
+        return {key: _value_from_payload(item) for key, item in payload["dict"].items()}
+    array = np.asarray(payload["data"], dtype=payload["dtype"]).reshape(tuple(payload["shape"]))
+    return array[()] if not payload["shape"] else array
+
+
 @dataclass(frozen=True)
 class EagerMenu:
     """The eager scalar menu of ONE bridge for ONE timestep (the zero-round-trip half of the transfer strategy).
@@ -218,6 +247,10 @@ class EagerMenu:
     Every value is a full fold of the BARE registered array's chunk (the identity program), so the menu answers a
     reduction of the bare collection and nothing else: a reduction of a derived operand (``(c * 2).sum()``) must be
     dispatched, because its partials are folds of a different program.
+
+    The menu rides the topic event, whose bus is msgpack (``Client.log_event``), so a bridge ships
+    :meth:`as_payload` and the delivery rebuilds the menu with :meth:`from_payload`; the values a callback's reduction
+    merges are then the objects this bridge computed, not a lossy rendering of them.
 
     - ``:param array_name:`` Registered array the menu was computed for.
     - ``:param timestep:`` Timestep the bridge's chunk belonged to.
@@ -231,6 +264,30 @@ class EagerMenu:
     rank: int
     chunk_position: Tuple[int, ...]
     values: Mapping[str, Any]
+
+    def as_payload(self) -> Dict[str, Any]:
+        """This menu as a msgpack-safe mapping, i.e. the shape it travels in on the topic event."""
+        return {
+            "array_name": self.array_name,
+            "timestep": int(self.timestep),
+            "rank": int(self.rank),
+            "chunk_position": [int(value) for value in self.chunk_position],
+            "values": {str(op_name): _value_payload(value) for op_name, value in self.values.items()},
+        }
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> "EagerMenu":
+        """Rebuild the menu a bridge encoded with :meth:`as_payload`.
+
+        - ``:param payload:`` The decoded topic-event entry.
+        """
+        return cls(
+            array_name=str(payload["array_name"]),
+            timestep=int(payload["timestep"]),
+            rank=int(payload["rank"]),
+            chunk_position=tuple(int(value) for value in payload.get("chunk_position") or ()),
+            values={op_name: _value_from_payload(value) for op_name, value in payload["values"].items()},
+        )
 
 
 def _partial_shape_dtype(value: Any) -> Tuple[Tuple[int, ...], str]:

@@ -1141,14 +1141,15 @@ class Deisa(IDeisa):
 def _as_eager_menus(menus: Any) -> List[EagerMenu]:
     """Normalize the topic event's menu entries into :class:`EagerMenu` objects.
 
-    The bridges ship ``EagerMenu`` instances, but a transport is free to serialize them as plain mappings, so both
-    shapes are accepted here instead of at every call site.
+    The bridges ship ``EagerMenu`` instances encoded as msgpack-safe mappings (``EagerMenu.as_payload``), because the
+    topic event bus is ``Client.log_event``; a transport is free to hand over live objects instead, so both shapes are
+    accepted here instead of at every call site.
 
     - ``:param menus:`` The event's ``menu`` entry: ``None``, or a sequence of ``EagerMenu``/mapping entries.
     """
     normalized: List[EagerMenu] = []
     for entry in menus or ():
-        normalized.append(entry if isinstance(entry, EagerMenu) else EagerMenu(**dict(entry)))
+        normalized.append(entry if isinstance(entry, EagerMenu) else EagerMenu.from_payload(dict(entry)))
     return normalized
 
 

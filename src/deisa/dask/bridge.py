@@ -570,8 +570,10 @@ class Bridge(IBridge):
             }
             if menus:
                 # Every participating bridge's eager menu, carried with the timestep it was computed for. Absent from
-                # the payload on the legacy path, so that payload stays byte-identical there.
-                to_send["menu"] = menus
+                # the payload on the legacy path, so that payload stays byte-identical there. Encoded with
+                # ``EagerMenu.as_payload`` because the event bus (``Client.log_event``) carries msgpack primitives only:
+                # a live ``EagerMenu`` (and the numpy scalars/arrays its values hold) would be refused by the client.
+                to_send["menu"] = [menu.as_payload() for menu in menus]
             if menu_errors:
                 # A bridge could not build its menu for this timestep: the payload carries the cause so the analytics
                 # side fails the RUN at its cycle boundary instead of serving a silently menu-less delivery.
@@ -814,7 +816,7 @@ class Bridge(IBridge):
             "futures": futures_payload,
         }
         if menu is not None:
-            to_send["menu"] = [menu]
+            to_send["menu"] = [menu.as_payload()]
         if menu_error is not None:
             to_send["menu_error"] = menu_error
         self.client.log_event(array_name, to_send)
