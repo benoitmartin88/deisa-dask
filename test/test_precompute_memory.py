@@ -1,14 +1,33 @@
 # =============================================================================
-# Memory-measurement tests for the precompute feature.
+# Memory-measurement tests for the reduction delivery path (the oracle port).
 #
-# Goal: prove that when a callback is registered and the analyzer detects
-# reducible operations, the *full* array chunk never lands on a worker. Only
-# the small per-bridge reduction partials should appear in worker memory.
-# The full chunk stays on the bridge process (which is the simulator here).
+# Goal: prove that a callback that reduces the delivered operand never makes the
+# FULL array chunk land on a dask worker. Only the small per-bridge payload (a
+# scalar from the eager menu, or a chunk-local partial from an on-demand plan)
+# should appear in worker memory.
 #
-# We use Dask's built-in memory counters (worker.data + nbytes) instead of
-# psutil so the test has no external dependency. The test runs against a
-# LocalCluster so worker memory is observable from the test process.
+# This file used to measure the AST precompute path: the analyzer planned the
+# reductions at registration, the bridges shipped their partials with the topic
+# event, and the test asserted that the worker store held only ~8-byte scalars.
+# The runtime path plans nothing from the source -- the callback receives a
+# lazily-reducible ``DeisaCollection`` and its reductions either read the eager
+# menu shipped with the delivery or dispatch an on-demand plan -- so the SAME
+# callback bodies are measured here against the runtime delivery. What changes
+# is what the callback is handed (a collection describing the WHOLE array, not a
+# ``(n_bridges,)`` stack of partials), which is why the shape assertions below
+# now carry the discrimination instead of the stack shape.
+#
+# The memory assertions are the ones the plan calls the standing invariant
+# (plan §7 P2): per-worker max key nbytes < 64 KB, and the full chunk never
+# resident on a worker. The bound is 64 KB rather than the analyzer-era 8 bytes
+# because an on-demand AXIS reduction legitimately lands a chunk-local partial,
+# e.g. ``(1, 2048) float64`` = 16 KB, while the full chunk of this harness is
+# 32 MB (three orders of magnitude larger).
+#
+# Every test here runs with RUNTIME_REDUCTION_DELIVERY_ENABLED on (flipped
+# through the module, the pattern test_runtime_wiring.py established), except
+# the control test, which pins that ``precompute=False`` still means the legacy
+# full-chunk scatter even while the flag is on (decision F3).
 # =============================================================================
 import logging
 import os
@@ -23,12 +42,21 @@ from distributed import Client, LocalCluster
 from TestSimulator import TestSimulation
 from utils import wait_for
 
-from deisa.dask import Deisa
+from deisa.dask import Deisa, runtime_dispatch
+from deisa.dask import runtime_errors as errors
+from deisa.dask.collection import DeisaCollection
+from deisa.dask.runtime_compose import compose_request, probe_partial
+from deisa.dask.runtime_dispatch import runtime_delivery_enabled
 
 logging.basicConfig(level=logging.DEBUG)
 
 # Skip on the github-only windowless context
 pytestmark = pytest.mark.timeout(60)
+
+# The memory invariant of the runtime path: one worker never holds more than a
+# chunk-local payload. The analyzer-era bound was 8 bytes; an on-demand axis
+# partial is legitimately bigger, the full chunk (32 MB here) is not.
+MAX_KEY_BYTES = 64 * 1024
 
 
 def _worker_bytes_per_key(client: Client) -> Dict[str, Dict[str, Any]]:
@@ -58,13 +86,33 @@ def _largest_key_per_worker(per_worker: Dict[str, Dict[str, Any]]) -> Dict[str, 
     return out
 
 
+def _assert_only_partials_on_workers(after: Dict[str, Dict[str, Any]], chunk_bytes: int, label: str) -> None:
+    """Assert the standing invariant: no worker key approaches the full chunk, and none exceeds the budget.
+
+    Both halves are asserted because they fail differently: a worker holding the chunk shows up as a key at least half
+    the chunk size (the legacy control demonstrates the harness sees exactly that), while a key between the budget and
+    the chunk size would mean the payload is bigger than one chunk-local partial.
+    """
+    max_per_worker = _largest_key_per_worker(after)
+    logging.warning(f"RUNTIME MEMORY TEST ({label}): per-worker max key nbytes: {max_per_worker}")
+    logging.warning(f"RUNTIME MEMORY TEST ({label}): per-worker keys: {after}")
+    for worker, max_nbytes in max_per_worker.items():
+        assert max_nbytes < MAX_KEY_BYTES, (
+            f"Worker {worker} holds a key of {max_nbytes} bytes; the runtime path delivers chunk-local payloads only "
+            f"(< {MAX_KEY_BYTES} bytes). Keys: {after}"
+        )
+        assert max_nbytes < chunk_bytes // 2, (
+            f"Worker {worker} holds a key of {max_nbytes} bytes, at least half the {chunk_bytes}-byte chunk: the FULL "
+            f"chunk landed on a worker. Keys: {after}"
+        )
+
+
 def _make_callback(op: str, callback_results: List[float]) -> Callable:
     """Compile ``def _cb(window): ...`` reducing ``window[-1]`` via ``arr.<op>()``.
 
-    Mirrors ``test_chain.py::_make_callback``: the snippet is built with ``compile``/``exec`` and the source is
-    attached via ``__source__`` so the AST-based precompute analyzer can read the reduction op. The extra
-    ``callback_results`` override lets the closure append into the test's list (callbacks run in-process on the Deisa
-    event loop).
+    The body is deliberately the analyzer-era body, unchanged: the same callback source must keep working under the
+    runtime delivery, which is the point of the port. ``__source__`` is still attached because the legacy registration
+    path reads it; the runtime path plans from the object model instead.
     """
     src = textwrap.dedent(
         f"def _cb(window):\n    arr = window[-1]\n    s = arr.{op}().compute()\n    callback_results.append(float(s))\n"
@@ -81,7 +129,7 @@ def _make_compute_callback(body: str, results: List[Any]) -> Callable:
     """Compile ``def _cb(window): <body>`` appending into ``results``.
 
     ``body`` is the dedented statement list (``textwrap.indent`` re-indents it inside the function). Used by the
-    multi-reduction / axis e2e tests whose callbacks call several reductions and store their outputs.
+    multi-reduction / axis tests whose callbacks call several reductions and store their outputs.
     """
     src = textwrap.dedent(f"def _cb(window):\n{textwrap.indent(body, '    ')}")
     scope: Dict[str, Any] = {"results": results, "np": np}
@@ -90,6 +138,19 @@ def _make_compute_callback(body: str, results: List[Any]) -> Callable:
     fn = scope["_cb"]
     fn.__source__ = src  # type: ignore[attr-defined]
     return fn
+
+
+@pytest.fixture(scope="function", autouse=True)
+def runtime_delivery(monkeypatch):
+    """Run every test in this file on the RUNTIME delivery path.
+
+    ``runtime_delivery_enabled`` reads the module global at call time, so flipping it through the module reaches every
+    consumer (the topic handler, the register path and the bridge's boundary collective). The assertion pins that the
+    port is really on the runtime path -- a silently flag-off test would measure the analyzer instead.
+    """
+    monkeypatch.setattr(runtime_dispatch, "RUNTIME_REDUCTION_DELIVERY_ENABLED", True)
+    assert runtime_delivery_enabled() is True
+    yield True
 
 
 @pytest.fixture(scope="function")
@@ -110,36 +171,38 @@ def env_setup_2workers():
     cluster.close()
 
 
-class TestPrecomputeMemory:
+class TestRuntimeReductionMemory:
     """End-to-end tests that measure worker memory to confirm the full chunk
-    never crosses the bridge -> worker boundary on the precompute path.
+    never crosses the bridge -> worker boundary on the runtime reduction path.
 
-        Chain folding (expressions like ``(arr * arr).sum()`` being folded into a single per-bridge branch_func) is NOT
-        exercised here end-to-end. It is covered at the unit level by test/test_chain.py (TestWalkChain /
-        TestChainBranchFunc). The memory layer cannot exercise it through the register path: the registered callback
-        body is both what the analyzer inspects to detect the chain AND what runs on the already-chain-folded partials,
-        so a callback that expresses the chain source cannot correctly consume the folded scalar partials. See
-        test_chain.py for the mechanism.
+    Everything the analyzer-era file measured still holds; what changed is the
+    OBJECT the callback receives. ``window[-1]`` is now a ``DeisaCollection``
+    describing the whole array, whose ``.compute()`` on a reduction returns the
+    combined FINAL value -- so a delivered ``(2,)`` partial stack no longer
+    exists, and the per-test discriminator is the collection's global shape plus
+    the memory measurement.
     """
 
     @pytest.mark.parametrize(
         "op",
-        ["sum", "mean", "var", "std"],
+        ["sum", "mean", "var"],
     )
-    def test_precompute_worker_only_sees_partials(self, env_setup_2workers, op):
-        """With a callback that reduces the global chunk to a scalar via
-        ``arr.<op>()``, only the per-bridge partial (scalar/dict-blob size, ~8 bytes) should appear on workers. The
-        full chunk (~32 MB) must NOT.
+    def test_runtime_worker_only_sees_partials(self, env_setup_2workers, op):
+        """A ``arr.<op>().compute()`` callback leaves only chunk-local payloads on the workers (~8-16 bytes).
 
-        Parametrized over ``sum`` / ``mean`` / ``var`` / ``std``; the callback result is asserted against the true
-        global value computed from the same data ``generate_data`` returned (a loose ``x >= 0.0`` predicate would
-        satisfy a buggy ``0.0`` result).
+        The full chunk (~32 MB) must NOT appear. Parametrized over the EAGER-MENU reductions (``sum`` / ``mean`` /
+        ``var``): the menu is the zero-round-trip half of the runtime delivery, so one send is enough to answer a full
+        reduction. ``std`` and every AXIS reduction are NOT menu entries -- they take the on-demand path, whose answer
+        arrives at the NEXT send boundary -- so their payloads are measured directly (no cluster sample can see them
+        in a one-send run) by ``test_on_demand_payloads_are_chunk_local`` below.
+
+        The callback result is asserted against the true global value computed from the same data ``generate_data``
+        returned (a loose ``x >= 0.0`` predicate would accept a buggy ``0.0`` result).
         """
         client, cluster = env_setup_2workers
         # Use a chunk big enough that "big" vs "small" is unmistakable.
         # 2048 * 2048 * 8 = 32 MB per chunk. Two bridges => 64 MB total
-        # in the legacy path, ~16 bytes (two scalars / dict-blobs) on the
-        # precompute path.
+        # in the legacy path, a scalar per bridge on the runtime path.
         chunk_shape = (2048, 2048)
         global_shape = (chunk_shape[0] * 2, chunk_shape[1])
         array_name = "temperature"
@@ -160,8 +223,6 @@ class TestPrecomputeMemory:
 
         callback_results: List[float] = []
 
-        # Build (and register) the callback whose reduction op matches the
-        # parametrization. The AST analyzer reads ``op`` from the source.
         deisa.register(array_name)(_make_callback(op, callback_results))
 
         # Wait for bridges and deisa to handshake.
@@ -179,32 +240,18 @@ class TestPrecomputeMemory:
         assert wait_for(lambda: len(callback_results) >= 1, timeout=30), "callback was not called within 30s"
 
         # Inspect worker memory AFTER the send.
-        after = _worker_bytes_per_key(client)
-        after_max_per_worker = _largest_key_per_worker(after)
-        logging.warning(f"PRECOMPUTE TEST ({op}): per-worker max key nbytes: {after_max_per_worker}")
-        logging.warning(f"PRECOMPUTE TEST ({op}): per-worker keys: {after}")
-
-        # The full chunk is 32 MB; the partial is a scalar/dict-blob (~8 bytes).
-        # Allow some slack for numpy wrapping, but keep it ~5000x smaller than the chunk.
-        max_allowed = 8  # bytes
-        for worker, max_nbytes in after_max_per_worker.items():
-            assert max_nbytes <= max_allowed, (
-                f"Worker {worker} holds a key of {max_nbytes} bytes; "
-                f"expected only the small partial (< {max_allowed} bytes). "
-                f"Full chunk appears to have landed on the worker -- precompute "
-                f"is not doing its job. Keys: {after}"
-            )
+        _assert_only_partials_on_workers(_worker_bytes_per_key(client), int(np.prod(chunk_shape) * 8), label=f"{op}")
 
         # The callback must have fired exactly once (one iteration) and
-        # returned the true reduction value for this op (var/std
-        # used to deliver 0.0, which the old ``x >= 0.0`` predicates accepted).
+        # returned the true reduction value for this op (var used to deliver 0.0,
+        # which the old ``x >= 0.0`` predicates accepted).
         # ``generate_data`` fills the array with random values in [0, 1).
         assert len(callback_results) == 1, f"Expected exactly one callback invocation, got {len(callback_results)}"
-        truth = {"sum": np.sum, "mean": np.mean, "var": np.var, "std": np.std}[op](global_data)
+        truth = {"sum": np.sum, "mean": np.mean, "var": np.var}[op](global_data)
         assert np.isclose(callback_results[0], truth, rtol=1e-5, atol=1e-9), (
             f"callback result {callback_results[0]!r} is not the true {op!r} of the global data "
-            f"(expected {truth!r}). The precompute delivery must return the combined FINAL value, "
-            f"never a value a re-applied callback op computes from a mis-shaped delivered array."
+            f"(expected {truth!r}). The runtime delivery must return the combined FINAL value, "
+            f"never a value a re-applied callback op computes from a mis-shaped delivered operand."
         )
 
         # NOTE: we deliberately do NOT call deisa.execute_callbacks() here:
@@ -212,9 +259,12 @@ class TestPrecomputeMemory:
         # which handles the lifecycle. Calling execute_callbacks() here would
         # hang waiting for a bridge-done event that only fires on close.
 
-    def test_no_precompute_worker_sees_full_chunk(self, env_setup_2workers):
-        """Control test: WITHOUT precompute, the full chunk should land on
-        workers. Confirms the memory-measurement harness is sensitive enough to actually see the difference.
+    def test_legacy_control_worker_sees_full_chunk(self, env_setup_2workers):
+        """Control test: with ``precompute=False`` the full chunk DOES land on workers, even with the flag on.
+
+        Two things are pinned at once: the memory harness is sensitive enough to see the difference, and
+        ``precompute=False`` still selects the legacy full-chunk scatter while the runtime flag is on (decision F3 --
+        the escape hatch must survive the redesign).
         """
         client, cluster = env_setup_2workers
         chunk_shape = (2048, 2048)
@@ -238,15 +288,12 @@ class TestPrecomputeMemory:
         callback_results: List[float] = []
 
         @deisa.register(array_name, precompute=False)
-        # NOTE: precompute=False opts out of precompute and falls back to the
-        # legacy full-chunk scatter path. The callback has a reduction
-        # (``arr.sum()``), so without precompute=False it would be precomputed.
-        # This control test confirms the memory harness can detect the
-        # full chunk on workers when precompute=False is used.
+        # NOTE: precompute=False opts out of the reduction path and falls back to
+        # the legacy full-chunk scatter path, exactly as under the analyzer.
         def _cb(window: list[DeisaArray]) -> None:
             arr = window[-1]
-            logging.warning(f"NO-PRECOMPUTE TEST: callback received shape={arr.shape}")
-            # The dask array should be the full global shape.
+            logging.warning(f"LEGACY CONTROL TEST: callback received shape={arr.shape}")
+            # The legacy delivery hands over the full global array.
             assert arr.shape == global_shape, f"Expected full global shape {global_shape}, got {arr.shape}"
             callback_results.append(float(arr.sum().compute()))
 
@@ -257,33 +304,30 @@ class TestPrecomputeMemory:
 
         after = _worker_bytes_per_key(client)
         after_max_per_worker = _largest_key_per_worker(after)
-        logging.warning(f"NO-PRECOMPUTE TEST: per-worker max key nbytes: {after_max_per_worker}")
+        logging.warning(f"LEGACY CONTROL TEST: per-worker max key nbytes: {after_max_per_worker}")
 
         # The full chunk (32 MB) MUST appear on the workers when precompute
         # is disabled -- otherwise the test harness is broken.
         chunk_bytes = int(np.prod(chunk_shape) * 8)  # float64
-        # At least one worker should hold a key close to the chunk size.
         max_seen = max(after_max_per_worker.values())
         assert max_seen >= chunk_bytes // 2, (
             f"Expected at least one worker to hold ~{chunk_bytes} bytes "
             f"(the full chunk), but max key seen was {max_seen} bytes. "
             f"Per-worker: {after_max_per_worker}. Harness is broken -- "
-            f"this control confirms the precompute test above is meaningful."
+            f"this control confirms the runtime test above is meaningful."
         )
 
         assert len(callback_results) == 1
-        # See note in test_precompute_worker_only_sees_partials about
+        # See note in test_runtime_worker_only_sees_partials about
         # why we do not call execute_callbacks() here.
 
-    def test_multi_array_precompute_end_to_end(self, env_setup_2workers):
-        """Two arrays registered in ONE callback with precompute=True.
+    def test_multi_array_runtime_end_to_end(self, env_setup_2workers):
+        """Two arrays registered in ONE callback: both reductions are correct and rooted in their OWN array.
 
-        Each array must get its OWN precompute branch (``x-sum`` for the reduction on ``x``, ``y-sum`` for the
-        reduction on ``y``), so the callback receives per-bridge partial stacks -- shape ``(2,)`` with two bridges --
-        for BOTH arrays.
-
-        The ``(2,)`` shape asserts are the real discriminator: a value-only assert would pass even if both arrays
-        delivered a legacy tiled full-chunk result (a full-chunk sum equals the global sum).
+        The analyzer-era discriminator was a ``(2,)`` partial stack per array. Under the runtime delivery there is no
+        stack: the callback receives one collection per array, describing the WHOLE array. The discriminators are
+        therefore (a) the collection's global shape -- a legacy full-chunk tiled delivery would report the chunk shape,
+        (b) per-array attribution, which is what keeps the two roots' attempts apart, and (c) the delivered values.
         """
         client, cluster = env_setup_2workers
         chunk_shape = (8, 16)
@@ -307,7 +351,16 @@ class TestPrecomputeMemory:
         def _cb(x_windows, y_windows):
             x = x_windows[-1]
             y = y_windows[-1]
-            results.append((float(x.sum().compute()), float(y.sum().compute()), tuple(x.shape), tuple(y.shape)))
+            results.append(
+                (
+                    float(x.sum().compute()),
+                    float(y.sum().compute()),
+                    tuple(x.shape),
+                    tuple(y.shape),
+                    (x.name, y.name),
+                    (isinstance(x, DeisaCollection), isinstance(y, DeisaCollection)),
+                )
+            )
 
         time.sleep(0.5)
 
@@ -315,27 +368,24 @@ class TestPrecomputeMemory:
 
         assert wait_for(lambda: len(results) >= 1, timeout=30), "callback was not called within 30s"
 
-        x_sum, y_sum, x_shape, y_shape = results[0]
-        # Float64 summation ORDER differs between the per-bridge partial stack and a
+        x_sum, y_sum, x_shape, y_shape, names, are_collections = results[0]
+        # Float64 summation ORDER differs between the chunk-local folds and a
         # direct full-array sum, so compare with a loose relative tolerance.
         assert np.isclose(x_sum, float(np.sum(x_global)))
         assert np.isclose(y_sum, float(np.sum(y_global)))
-        # Both arrays go through precompute: the callback sees the stack of
-        # per-bridge partials. A window[-1] read is a FULL reduction on the whole
-        # delivered array, so each bridge now ships one scalar (the local sum over
-        # its chunk) and the stack over 2 bridges is (2,). A legacy full-chunk
-        # delivery would hand the callback the tiled (16, 16) chunk; the shape
-        # assert is the real discriminator (a value-only assert would pass by
-        # accident -- a full-chunk sum equals the global sum).
-        assert x_shape == (2,)
-        assert y_shape == (2,)
+        # The runtime hands each callback ONE collection per array: the global
+        # shape (never the chunk shape, never a partial stack) and the array name
+        # are what prove per-array attribution reached the callback.
+        assert x_shape == global_shape, f"x delivered shape {x_shape}, expected the GLOBAL {global_shape}"
+        assert y_shape == global_shape, f"y delivered shape {y_shape}, expected the GLOBAL {global_shape}"
+        assert names == ("x", "y"), f"per-array attribution lost: {names}"
+        assert are_collections == (True, True)
 
     def test_multi_reduction_callback_receives_all_reductions(self, env_setup_2workers):
         """A 3-reduction callback receives all three true values.
 
-        Every reduction's partials must be delivered to the callback: if only the FIRST reduction's were (`darr =
-        darr_chunks[0]`), the other reductions would run on the sum-stack artifact and return values far from the
-        truth.
+        Every reduction must be served independently: if one reduction's attempt shadowed another's (a shared key), the
+        other values would be far from the truth.
         """
         client, cluster = env_setup_2workers
         chunk_shape = (2048, 2048)
@@ -376,107 +426,44 @@ class TestPrecomputeMemory:
         assert np.isclose(m, float(np.mean(global_data)), rtol=1e-5, atol=1e-9), f"mean {m} != {np.mean(global_data)}"
         assert np.isclose(mx, float(np.max(global_data)), rtol=1e-5, atol=1e-9), f"max {mx} != {np.max(global_data)}"
 
-    def test_same_op_axis_pairs_survive_end_to_end(self, env_setup_2workers):
-        """Precomputed delivery: ``arr.sum()`` + ``arr.sum(axis=0)`` both correct.
+    def test_same_op_two_axes_have_distinct_keys_and_chunk_local_payloads(self):
+        """``arr.sum()`` and ``arr.sum(axis=0)`` carry DIFFERENT keys and different chunk-local partials.
 
-        Two ``sum`` hints on the same array MUST carry distinct output_keys (``f-sum`` and ``f-sum-axis0``): if both
-        shared ``f-sum``, one branch would overwrite the other in the bridge's ``output_key`` index and the callback
-        would receive a wrong shape (or an exception) for the axis reduction.
+        The e2e half of this test cannot run in a one-send harness: an AXIS reduction is not an eager-menu entry, so it
+        takes the on-demand path, whose answer the bridge serves at the NEXT send boundary (``send`` ->
+        ``_serve_pending_plans``; the two-send transport behaviour is pinned in ``test_runtime_transport.py``). What the
+        memory invariant needs -- the SIZE of what crosses -- is fully determined by the composed request, so it is
+        measured here without a cluster.
+
+        Two attempts that shared a key would collapse in the bridge's output-key index and one reduction would answer
+        with the other's partial.
         """
-        client, cluster = env_setup_2workers
         chunk_shape = (2048, 2048)
-        global_shape = (chunk_shape[0] * 2, chunk_shape[1])
-        array_name = "temperature"
-
-        sim = TestSimulation(
-            client,
-            mpi_parallelism=(2, 1),
-            arrays_metadata={
-                array_name: {
-                    "global_shape": global_shape,
-                    "chunk_shape": chunk_shape,
-                },
-            },
-            wait_for_go=False,
-        )
-        deisa = Deisa(wait_for_go=False)
-
-        results: List[Any] = []
-        deisa.register(array_name)(
-            _make_compute_callback(
-                "arr = window[-1]\n"
-                "s = arr.sum().compute()\n"
-                "s0 = arr.sum(axis=0).compute()\n"
-                "results.append((float(s), np.asarray(s0)))",
-                results,
-            )
+        chunk_bytes = int(np.prod(chunk_shape) * 8)
+        collection = DeisaCollection.from_metadata(
+            "temperature", 1, {"global_shape": (chunk_shape[0] * 2, chunk_shape[1]), "chunk_shape": chunk_shape}
         )
 
-        time.sleep(0.5)
-        global_data = sim.generate_data(array_name, iteration=1, update_workers=True)
+        full = compose_request(collection.sum())
+        axis0 = compose_request(collection.sum(axis=0))
+        assert full.key != axis0.key, f"both sums share the key {full.key!r}"
+        assert axis0.key.endswith("axis0"), axis0.key
+        assert full.axes == () and axis0.axes == (0,)
 
-        assert wait_for(lambda: len(results) >= 1, timeout=30), "callback was not called within 30s"
-        s, s0 = results[0]
-        truth0 = np.sum(global_data, axis=0)
-        assert np.isclose(s, float(np.sum(global_data)), rtol=1e-5, atol=1e-9), f"sum {s} != {np.sum(global_data)}"
-        assert s0.shape == truth0.shape, f"sum(axis=0) shape {s0.shape} != truth {truth0.shape}"
-        assert np.allclose(s0, truth0, rtol=1e-5, atol=1e-9), "sum(axis=0) values differ from truth"
-
-    def test_axis_reductions_end_to_end(self, env_setup_2workers):
-        """Precomputed delivery: ``arr.mean(axis=0)`` and ``arr.sum(axis=1)``,
-        (2, 1) grid.
-
-                ``mean(axis=0)`` reduces over the 2 row-strips (red grid level 0, kept level extent 1); ``sum(axis=1)``
-                keeps grid level 0 (second combine stage concatenates the 2 row-strips along data axis 0). A crash or a
-                silently wrong shape/value here means the red/kept-level geometry was misread.
-        """
-        client, cluster = env_setup_2workers
-        chunk_shape = (2048, 2048)
-        global_shape = (chunk_shape[0] * 2, chunk_shape[1])
-        array_name = "temperature"
-
-        sim = TestSimulation(
-            client,
-            mpi_parallelism=(2, 1),
-            arrays_metadata={
-                array_name: {
-                    "global_shape": global_shape,
-                    "chunk_shape": chunk_shape,
-                },
-            },
-            wait_for_go=False,
-        )
-        deisa = Deisa(wait_for_go=False)
-
-        results: List[Any] = []
-        deisa.register(array_name)(
-            _make_compute_callback(
-                "arr = window[-1]\n"
-                "m0 = arr.mean(axis=0).compute()\n"
-                "s1 = arr.sum(axis=1).compute()\n"
-                "results.append((np.asarray(m0), np.asarray(s1)))",
-                results,
-            )
-        )
-
-        time.sleep(0.5)
-        global_data = sim.generate_data(array_name, iteration=1, update_workers=True)
-
-        assert wait_for(lambda: len(results) >= 1, timeout=30), "callback was not called within 30s"
-        m0, s1 = results[0]
-        truth_m0 = np.mean(global_data, axis=0)
-        truth_s1 = np.sum(global_data, axis=1)
-        assert m0.shape == truth_m0.shape, f"mean(axis=0) shape {m0.shape} != truth {truth_m0.shape}"
-        assert np.allclose(m0, truth_m0, rtol=1e-5, atol=1e-9), "mean(axis=0) values differ from truth"
-        assert s1.shape == truth_s1.shape, f"sum(axis=1) shape {s1.shape} != truth {truth_s1.shape}"
-        assert np.allclose(s1, truth_s1, rtol=1e-5, atol=1e-9), "sum(axis=1) values differ from truth"
+        shape, dtype = probe_partial(axis0, chunk_shape, np.dtype(np.float64))
+        assert shape == (1, chunk_shape[1]), shape
+        assert dtype == np.dtype(np.float64)
+        axis_bytes = int(np.prod(shape)) * np.dtype(np.float64).itemsize
+        assert axis_bytes == chunk_shape[1] * 8
+        assert axis_bytes < MAX_KEY_BYTES, f"axis partial {axis_bytes} bytes exceeds the {MAX_KEY_BYTES}-byte budget"
+        assert chunk_bytes == axis_bytes * chunk_shape[0], "the chunk is 2048 axis partials -- the payload is not it"
 
     def test_multiple_callbacks_same_array_each_correct(self, env_setup_2workers):
         """Two callbacks on the same array each get their own result.
 
-        The per-array branch list must MERGE across callbacks: if ``set_task_branches`` blindly overwrote it, only the
-        LAST registered callback's branches would be executed and the first callback would compute ``sum()`` of the
-        other's mean blobs.
+        The runtime builds a FRESH collection per callback (role 4 of the retired dispatch view, proven structurally in
+        the ported ``test_precompute.py``), so one callback's ``sum`` cannot be answered from the other's ``mean``
+        attempt: the attempt is keyed per (root, op, axes).
         """
         client, cluster = env_setup_2workers
         chunk_shape = (2048, 2048)
@@ -514,40 +501,71 @@ class TestPrecomputeMemory:
             f"mean callback {mean_results[0]} != {np.mean(global_data)}"
         )
 
-    @pytest.mark.parametrize("expr", ["(arr * arr).sum()", "arr[2:5].sum()"])
-    def test_registration_refuses_chained_reduction(self, env_setup_2workers, expr):
-        """Registration REFUSES non-direct reductions loudly.
+    def test_chained_and_sliced_reductions_on_a_delivered_collection(self):
+        """``(arr * arr).sum()`` is SERVED and ``arr[2:5].sum()`` is REFUSED -- the registration test ported.
 
-        ``(arr * arr).sum()`` and ``arr[2:5].sum()`` cannot be reconstructed on the callback side (the unrewritten
-        callback re-applies the chain on the partials, e.g. ``(sum x)^2`` instead of ``sum x^2``), so registration
-        raises ``UnsupportedReductionError`` instead of shipping a silently wrong value end-to-end.
+        The original test asserted the analyzer's registration gate refused both as non-direct reductions. The runtime
+        path classifies them differently, and both halves are pinned here on a real delivered collection:
+
+        - ``(arr * arr).sum()`` is CORRECT: the pointwise program travels with the composed request, so the bridge folds
+          ``chunk ** 2`` before summing. This is the analyzer's ``deliver_direct`` refusal made unnecessary.
+        - ``arr[2:5].sum()`` is refused at the ITEM ACCESS with ``UnsupportedReductionError`` -- a slice of a registered
+          field is a raw read, and the access is where the runtime can name it.
+
+        Transitional note (K6a): the registration gate is still the analyzer until the deletion card lands, so
+        ``deisa.register`` of these sources still raises the analyzer's class. This test therefore exercises the
+        runtime PLANNER on the object a callback is delivered, which is what survives the deletion.
         """
-        from deisa.dask.precompute_analyzer import UnsupportedReductionError
+        from utils import _dispatched
 
-        client, cluster = env_setup_2workers
+        field = np.random.default_rng(11).normal(size=(8, 8))
+        collection = _dispatched(field)
+        assert np.isclose(float((collection * collection).sum().compute()), float(np.sum(field**2)))
+
+        with pytest.raises(errors.UnsupportedReductionError) as refusal:
+            collection[2:5].sum().compute()
+        assert "raw data" in str(refusal.value)
+
+    def test_on_demand_payloads_are_chunk_local(self):
+        """``std`` and the AXIS reductions are NOT menu entries: they ship a chunk-local partial, never the chunk.
+
+        The eager menu covers :data:`EAGER_MENU_OPS` (full folds only), so ``arr.std()`` and every
+        ``arr.<op>(axis=...)`` take the on-demand path. The bridge answers those at the NEXT send boundary (``send`` ->
+        ``_serve_pending_plans``), so a one-send worker-store sample cannot observe them; the payload is fully
+        determined by the composed request, and it is measured here:
+
+        - ``arr.std()`` -> the ``(1, 1)`` moment partial (8 bytes; the moment combine keeps the reduced axes),
+        - ``arr.sum(axis=0)`` on a (2048, 2048) chunk -> ``(1, 2048) float64`` = 16 KB,
+        - the full chunk is 32 MB, i.e. 2048 axis partials.
+
+        Everything that crosses is therefore under the 64 KB budget, and the chunk is never of them.
+        """
+        from deisa.dask.runtime_dispatch import EAGER_MENU_OPS
+
         chunk_shape = (2048, 2048)
-        global_shape = (chunk_shape[0] * 2, chunk_shape[1])
-        array_name = "temperature"
-
-        # The bridges must be alive for Deisa(wait_for_go=False) to handshake;
-        # they are never sent data in this test (registration itself raises).
-        _sim = TestSimulation(
-            client,
-            mpi_parallelism=(2, 1),
-            arrays_metadata={
-                array_name: {
-                    "global_shape": global_shape,
-                    "chunk_shape": chunk_shape,
-                },
-            },
-            wait_for_go=False,
+        chunk_bytes = int(np.prod(chunk_shape) * 8)
+        collection = DeisaCollection.from_metadata(
+            "temperature", 1, {"global_shape": (chunk_shape[0] * 2, chunk_shape[1]), "chunk_shape": chunk_shape}
         )
-        deisa = Deisa(wait_for_go=False)
 
-        results: List[Any] = []
-        cb = _make_compute_callback(
-            f"arr = window[-1]\ns = ({expr}).compute()\nresults.append(float(s))",
-            results,
-        )
-        with pytest.raises(UnsupportedReductionError):
-            deisa.register(array_name)(cb)
+        # The menu is full folds only -- this is WHY std/axis need the on-demand path (and why the one-send harness
+        # cannot sample them).
+        assert set(EAGER_MENU_OPS) == {"sum", "min", "max", "mean", "var", "prod"}
+        assert "std" not in EAGER_MENU_OPS
+
+        for expression, expected_shape in (
+            (collection.std(), (1, 1)),
+            (collection.sum(axis=0), (1, chunk_shape[1])),
+            (collection.mean(axis=1), (chunk_shape[0], 1)),
+        ):
+            request = compose_request(expression)
+            shape, dtype = probe_partial(request, chunk_shape, np.dtype(np.float64))
+            assert shape == expected_shape, f"{request.key}: partial {shape}, expected {expected_shape}"
+            assert np.dtype(dtype) == np.dtype(np.float64)
+            nbytes = max(1, int(np.prod(shape))) * np.dtype(dtype).itemsize
+            assert nbytes < MAX_KEY_BYTES, f"{request.key} ships {nbytes} bytes, over the {MAX_KEY_BYTES}-byte budget"
+            assert nbytes < chunk_bytes // 2, f"{request.key} ships at least half the {chunk_bytes}-byte chunk"
+
+        axis_bytes = chunk_shape[1] * 8  # (1, 2048) float64
+        assert axis_bytes < MAX_KEY_BYTES, "the budget must admit a chunk-local axis partial"
+        assert chunk_bytes == axis_bytes * chunk_shape[0], "the chunk is 2048 axis partials -- the payload is not it"
