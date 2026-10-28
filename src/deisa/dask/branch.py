@@ -57,10 +57,12 @@ from dask import delayed
 from dask.array.reductions import mean_agg, moment_agg
 from deisa.dask.mergeable_pca import PCASummary, _build_pca_branch_func
 from deisa.dask.precompute_analyzer import (
-    PrecomputeRuntimeError,
-    UnsupportedReductionError,
     _match_source_arrays,
     analyze_callback_full,
+)
+from deisa.dask.precompute_errors import (
+    PrecomputeRuntimeError,
+    UnsupportedReductionError,
 )
 from deisa.dask.task_branches import (
     _aggregate_output_feeds_other_reduction,

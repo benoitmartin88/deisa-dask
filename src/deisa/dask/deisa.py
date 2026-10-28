@@ -86,7 +86,7 @@ from deisa.dask.constants import (
     WAIT_FOR_EXECUTE_CB_EVENT,
 )
 from deisa.dask.handshake import Handshake
-from deisa.dask.precompute_analyzer import (
+from deisa.dask.precompute_errors import (
     MaterializationError,
     NoPrecomputableReductionError,
     PrecomputeRuntimeError,

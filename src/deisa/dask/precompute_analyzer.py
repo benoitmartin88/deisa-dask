@@ -41,6 +41,16 @@ import numpy as np
 
 import dask.array as da
 from deisa.dask.mergeable_pca import MergeablePCA as _PCAConstructor
+from deisa.dask.precompute_errors import (  # noqa: F401 -- re-exported for the analyzer's raise sites and importers
+    IncompatibleCallbackError,
+    MaterializationError,
+    NoComputeBoundaryError,
+    NoPrecomputableReductionError,
+    PrecomputeError,
+    PrecomputeRuntimeError,
+    RawFieldReadError,
+    UnsupportedReductionError,
+)
 from deisa.dask.task_branches import extract_reduction_hints
 
 logger = logging.getLogger(__name__)
@@ -48,66 +58,9 @@ logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------- Exception hierarchy
 # ---------------------------------------------------------------------------
-class PrecomputeError(Exception):
-    """Base class for precompute analysis errors."""
-
-
-class UnsupportedReductionError(PrecomputeError):
-    """A reduction is present but its input expression cannot be traced back to a dask array.
-
-    Covers opaque operands (``da.sum(opaque_object)``), wrapped reductions (a custom function around a dask call), and
-    untraceable parameters (``da.sum(f * v2)`` where ``v2`` is derived from a config object).
-    """
-
-
-class NoPrecomputableReductionError(PrecomputeError):
-    """The callback contains no reductions we can precompute.
-
-    Example: callback only does ``da.fft.fft2(arr)`` - FFTs don't reduce.
-    """
-
-
-class PrecomputeRuntimeError(PrecomputeError):
-    """A runtime (post-registration) precompute invariant was violated.
-
-    Raised on the Deisa side (topic handler, callback dispatch view) and the bridge side (executing a branch on the
-    local chunk) when a precompute contract breaks -- e.g. a failed branch dropped a partial, a reduction's partials do
-    not cover the full chunk grid, or a callback calls a reduction that the analyzer did not record. Always prefer
-    raising this over silently delivering a wrong number.
-    """
-
-
-class MaterializationError(PrecomputeError):
-    """A full data materialization was detected in the callback.
-
-    Example: ``np.array(dask_array)`` - forces gathering the whole array, defeating the purpose.
-    """
-
-
-class RawFieldReadError(PrecomputeError):
-    """The callback reads the registered array's raw data, which precompute does not deliver.
-
-    The precompute path only ships per-bridge reduction partials -- never the full chunk. Any callback that consumes
-    the raw data (binds it as a value, indexes it, plots it, or computes something that is not a recorded
-    chunk-local reduction) breaks the precompute contract: the data it needs is not on the network. Raised at
-    REGISTRATION time -- never mid-iteration. Remedy: register the callback with ``precompute=False``, which
-    switches it to the legacy full-chunk scatter path.
-    """
-
-
-class IncompatibleCallbackError(PrecomputeError):
-    """The callback pattern is not supported by the precompute system.
-
-    Example: dynamic dispatch (``getattr``), closures, ``exec``/``eval``, etc.
-    """
-
-
-class NoComputeBoundaryError(PrecomputeError):
-    """The callback contains dask operations but no compute boundaries.
-
-    We can't tell what the user wants computed. Without a ``.compute()``, ``client.compute(...)``, or similar, the
-    analyzer has no way to know which dask arrays to extract hints for.
-    """
+# The refusal taxonomy lives in :mod:`deisa.dask.precompute_errors`, where the runtime taxonomy derives from it (plan
+# P4 removes this analyzer, not the ``PrecomputeError`` hierarchy callers catch). Imported at the top and re-exported
+# there, so the analyzer's own raise sites and its importers keep the same names.
 
 
 # --------------------------------------------------------------------------- Source-array attribution

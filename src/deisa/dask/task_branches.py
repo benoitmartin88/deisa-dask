@@ -679,7 +679,7 @@ def extract_reduction_hints(
         other_aggregates = reachable - {layer_name}
         if other_aggregates:
             other_ops = sorted({_base_for_aggregate(a) for a in other_aggregates})
-            from deisa.dask.precompute_analyzer import UnsupportedReductionError
+            from deisa.dask.precompute_errors import UnsupportedReductionError
 
             raise UnsupportedReductionError(
                 f"Reduction '{_base_for_aggregate(layer_name)}' depends on the output of "

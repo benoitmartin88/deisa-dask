@@ -64,7 +64,7 @@ from deisa.dask.branch import BranchSpec
 from deisa.dask.collection import DeisaCollection
 from deisa.dask.constants import CLIENT_KEY, FEEDBACK_QUEUE_PREFIX, KEY_PREFIX, WAIT_FOR_EXECUTE_CB_EVENT
 from deisa.dask.handshake import Handshake
-from deisa.dask.precompute_analyzer import PrecomputeRuntimeError
+from deisa.dask.precompute_errors import PrecomputeRuntimeError
 from deisa.dask.runtime_dispatch import (
     EagerMenu,
     PlanRequestBacklog,

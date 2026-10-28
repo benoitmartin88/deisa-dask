@@ -958,9 +958,9 @@ class MergeablePCA:
     def _is_runtime_collection(X) -> bool:
         """Whether ``X`` is a DEISA runtime collection, i.e. a data-free operand the delivery path handed a callback.
 
-        The import is deferred because :mod:`deisa.dask.collection` is downstream of this module's import chain
-        (``collection`` pulls ``runtime_errors``, which pulls ``precompute_analyzer``, which imports this module), so a
-        module-level import would close the cycle. The check is an ``isinstance`` against that class rather than a duck
+        The import is deferred so this module's import chain does not pull the delivery stack back in: the collection
+        module pulls ``runtime_errors`` and the runtime compose/dispatch modules, and this module sits at the bottom of
+        that chain. The check is an ``isinstance`` against that class rather than a duck
         check on attributes: ``DeisaCollection`` is the only operand the delivery produces, and a false positive here
         would dispatch a PCA branch for something a bridge never described.
 

@@ -35,7 +35,7 @@ from deisa.core import DeisaArray, ICommunicator
 from distributed import Client, Lock, Variable
 
 import dask.array as da
-from deisa.dask.precompute_analyzer import PrecomputeRuntimeError, UnsupportedReductionError
+from deisa.dask.precompute_errors import PrecomputeRuntimeError, UnsupportedReductionError
 from deisa.dask.task_branches import _normalize_reduction_axis
 
 logger = logging.getLogger(__name__)
