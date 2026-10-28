@@ -44,19 +44,23 @@ import threading
 import time
 
 import dask.array as da
+import msgpack
 import numpy as np
 import pytest
 from deisa.core.types import DeisaArray
 from utils import FakeComm
 
+from deisa.dask import bridge as bridge_module
 from deisa.dask import deisa as deisa_module
 from deisa.dask import precompute_analyzer as analyzer_module
 from deisa.dask import runtime_errors as errors
+from deisa.dask.bridge import Bridge
 from deisa.dask.collection import DeisaCollection
 from deisa.dask.deisa import Deisa
 from deisa.dask.mergeable_pca import MergeablePCA, PCASummary
 from deisa.dask.runtime_compose import PCARequest
 from deisa.dask.runtime_dispatch import (
+    EAGER_MENU_OPS,
     EagerMenu,
     PlanResponder,
     build_eager_menu,
@@ -706,3 +710,175 @@ def test_harness_ships_one_eager_menu_per_bridge(fleets):
         assert menu.timestep == 0
         assert menu.array_name == ARRAY_NAME
         assert "sum" in menu.values
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# The wire: the menu the bridge publishes on the topic event (the ``Client.log_event`` msgpack hop)
+# ---------------------------------------------------------------------------------------------------------------------
+# ``Bridge.send`` ships the eager menu encoded with ``EagerMenu.as_payload`` because the event bus carries msgpack
+# primitives only. Before ``1fbb650`` the live objects went on the wire and the FIRST ``send`` of a runtime-mode run
+# raised ``TypeError: Message must be msgpack serializable``: the delivery mode was unusable in production. Every test
+# above hands a live ``EagerMenu`` straight to the topic handler, so none of them crosses this hop. These two do.
+WIRE_METADATA = {
+    ARRAY_NAME: {
+        "global_shape": GLOBAL_SHAPE,
+        "chunk_shape": CHUNK_SHAPE,
+        "chunk_position": (0, 0),
+        # float32 on purpose: a menu value's dtype is part of the contract (the merge reports it), so a payload that
+        # widened it to float64 would be invisible to every value assertion.
+        "dtype": np.float32,
+    }
+}
+
+
+class _WireClient:
+    """The bridge-side client surface ``Bridge.send`` touches, recording the topic event instead of publishing it."""
+
+    def __init__(self):
+        self.scheduler = self
+        self.updates = []
+        self.desired_keys = []
+        self.events = []
+
+    def update_data(self, who_has=None, nbytes=None):
+        """- ``:param who_has:`` Worker -> keys map the bridge publishes.
+        - ``:param nbytes:`` Key -> size map the bridge publishes.
+        """
+        self.updates.append((who_has, nbytes))
+
+    def sync(self, fn, *args, **kwargs):
+        """- ``:param fn:`` The callable the bridge would hand to ``Client.sync``."""
+        return fn(*args, **kwargs)
+
+    def _send_to_scheduler(self, payload):
+        """- ``:param payload:`` The ``client-desires-keys`` message."""
+        self.desired_keys.append(payload)
+
+    def log_event(self, name, payload):
+        """- ``:param name:`` Topic of the event, i.e. the registered array name.
+        - ``:param payload:`` The topic payload; this is the msgpack-hop boundary the tests below are about.
+        """
+        self.events.append((name, payload))
+
+
+def send_one_chunk(monkeypatch, chunk):
+    """Run the REAL ``Bridge.send`` for a single-bridge array and return the topic payload it published.
+
+    The subject is the encode step (``to_send["menu"] = [menu.as_payload() ...]``) and the eager menu that feeds it, so
+    both run for real: only the scatter and the per-branch chunk stage are stubbed -- they are ``test_bridge.py``'s
+    subject and need a scheduler.
+    """
+    monkeypatch.setattr(bridge_module, "runtime_delivery_enabled", lambda: True)
+    bridge = Bridge.__new__(Bridge)
+    wire_client = _WireClient()
+    bridge.id = 0
+    bridge.comm = FakeComm(FakeComm.State(1), 0)
+    bridge.client = wire_client
+    bridge.workers = {"worker-0": {}}
+    bridge.arrays_metadata = WIRE_METADATA
+    bridge._array_comms = {ARRAY_NAME: FakeComm(FakeComm.State(1), 0)}
+    # The menu is gated on a FILED branch, so file one; its chunk stage is not this test's subject.
+    bridge._task_branches = {ARRAY_NAME: [object()]}
+    bridge._branch_by_key = {}
+    bridge._runtime_plan_backlog = {}
+    bridge._runtime_last_chunk = {}
+    bridge._scatter_full = lambda *args, **kwargs: {
+        "future": "key-0",
+        "who_has": {"worker-0": ["key-0"]},
+        "nbytes": {"key-0": int(np.prod(CHUNK_SHAPE))},
+    }
+    bridge._execute_operations_on_chunk = lambda *args, **kwargs: {}
+    bridge.send(ARRAY_NAME, chunk, 0)
+    # The stub has no peers and no client to close: mark it closed so its finalizer stays quiet.
+    bridge._has_close_been_called = True
+
+    assert wire_client.events, "the bridge must publish one topic event per send"
+    name, payload = wire_client.events[0]
+    assert name == ARRAY_NAME
+    return payload
+
+
+def test_topic_event_from_the_bridge_is_msgpack_serializable(monkeypatch):
+    """Every entry the bridge puts on the wire must survive ``msgpack.packb``; a live ``EagerMenu`` does not.
+
+    Fail-before (the ``1fbb650`` bug, reproduced in ``evidence/probe_msgpack_roundtrip.log`` line 2): with the menu
+    shipped as ``EagerMenu`` objects, ``msgpack.packb`` raises ``TypeError: can not serialize 'EagerMenu' object`` --
+    which is exactly what ``Client.log_event`` does to the first ``send`` of a runtime-mode run. The line that fails is
+    the ``msgpack.packb(entry)`` inside the loop below.
+    """
+    chunk = np.random.default_rng(0).normal(size=CHUNK_SHAPE).astype(np.float32)
+    payload = send_one_chunk(monkeypatch, chunk)
+
+    # The whole event travels, not just its ``menu`` entry: ``Client.log_event`` packs the payload.
+    entries = payload["menu"]
+    assert len(entries) == 1, "a single-bridge array publishes its one menu"
+    for entry in entries:
+        msgpack.packb(entry)
+        assert set(entry["values"]) == set(EAGER_MENU_OPS)
+        assert entry["values"]["sum"]["dtype"] == "float32", "the wire must carry the fold's dtype, not widen it"
+        assert entry["array_name"] == ARRAY_NAME and entry["timestep"] == 0
+    msgpack.packb(payload)
+
+
+def _assert_same_menu_value(original, rebuilt):
+    """Assert one menu value survived the msgpack round trip: same structure, dtype, shape and numbers.
+
+    - ``:param original:`` The value the bridge computed (a numpy scalar/array, or a mapping of them).
+    - ``:param rebuilt:`` The value decoded from the payload.
+    """
+    if isinstance(original, dict):
+        assert isinstance(rebuilt, dict), f"a dict partial came back as a {type(rebuilt).__name__}"
+        assert set(rebuilt) == set(original)
+        for key, item in original.items():
+            _assert_same_menu_value(item, rebuilt[key])
+        return
+    assert not isinstance(rebuilt, (list, tuple)), "a partial must not come back as a flattened sequence"
+    original_array, rebuilt_array = np.asarray(original), np.asarray(rebuilt)
+    assert rebuilt_array.dtype == original_array.dtype, f"{original_array.dtype} widened to {rebuilt_array.dtype}"
+    assert rebuilt_array.shape == original_array.shape
+    assert np.array_equal(rebuilt_array, original_array)
+
+
+def test_menu_round_trip_preserves_keys_values_dtypes_and_stamps(fleets, client, monkeypatch):
+    """``from_payload(unpackb(packb(as_payload())))`` rebuilds the menu EXACTLY, and the delivery serves from it.
+
+    What a lossy encoding would break, in order of subtlety: the dict partial of ``mean``/``var`` (a flattened list
+    would make the aggregation algebra concatenate instead of add), a float32 partial widened to float64 (the merge
+    reports the dtype), and the ``timestep``/``rank``/``chunk_position`` stamps (which decide WHICH bridge's chunk a
+    value belongs to, and whether a stale menu may answer). The delivery half then hands the DECODED entries to the
+    real topic handler, so ``_as_eager_menus`` and the merge really consume the rebuilt values.
+    """
+    chunks = [chunk.astype(np.float32) for chunk in fleets.fleets[0].chunks]
+    received = []
+    for rank, chunk in enumerate(chunks):
+        collection = DeisaCollection.from_metadata(ARRAY_NAME, 0, WIRE_METADATA[ARRAY_NAME])
+        menu = build_eager_menu(collection, chunk, rank=rank, chunk_position=chunk_position(rank))
+
+        # The Client.log_event hop: encode, pack, unpack -- and keep the DECODED entry, i.e. what the host receives.
+        entry = msgpack.unpackb(msgpack.packb(menu.as_payload()), raw=False)
+        assert isinstance(entry["values"]["mean"], dict) and "dict" in entry["values"]["mean"], (
+            "a dict partial must travel as a mapping, never as a flattened list the mean/moment algebra "
+            "would concatenate"
+        )
+        received.append(entry)
+
+        rebuilt = EagerMenu.from_payload(entry)
+        assert rebuilt.array_name == ARRAY_NAME
+        assert set(rebuilt.values) == set(menu.values)
+        for op_name, value in menu.values.items():
+            _assert_same_menu_value(value, rebuilt.values[op_name])
+        assert np.asarray(rebuilt.values["sum"]).dtype == np.float32, "a float32 scalar must stay float32"
+        assert (rebuilt.timestep, rebuilt.rank, rebuilt.chunk_position) == (0, rank, chunk_position(rank))
+
+    deisa = make_deisa(fleets, client, monkeypatch)
+    seen = []
+
+    def callback(window):
+        seen.append(window[-1].sum().compute())
+
+    register(deisa, callback)
+    deliver(deisa, 0, received)
+
+    assert len(seen) == 1
+    assert seen[0] == pytest.approx(fleets.fields[0].sum(), rel=1e-5, abs=1e-4)
+    assert fleets.rounds(0) == [], "a menu-served fold must not dispatch an on-demand request"
