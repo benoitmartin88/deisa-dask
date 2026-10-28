@@ -24,6 +24,16 @@ import numpy as np
 
 from _oracle.branch_spec import BranchSpec
 from _oracle.precompute_analyzer import _match_source_arrays, analyze_callback_full
+from _oracle.task_branches import (
+    _aggregate_output_feeds_other_reduction,
+    _chunk_func_and_kwargs,
+    _chunk_layer_for_aggregate,
+    _classify_chain,
+    _find_single_upstream,
+    _is_aggregate_layer,
+    _normalize_reduction_axis,
+    _op_for_aggregate_layer,
+)
 from deisa.dask.branch import (
     _BRANCH_KIND_MEAN,
     _BRANCH_KIND_MOMENT,
@@ -33,19 +43,9 @@ from deisa.dask.branch import (
     _apply_full_local_fold,
     _chain_branch_func,
     _discover_partial_metadata,
-    _find_single_upstream,
 )
 from deisa.dask.mergeable_pca import _build_pca_branch_func
 from deisa.dask.precompute_errors import UnsupportedReductionError
-from deisa.dask.task_branches import (
-    _aggregate_output_feeds_other_reduction,
-    _chunk_func_and_kwargs,
-    _chunk_layer_for_aggregate,
-    _classify_chain,
-    _is_aggregate_layer,
-    _normalize_reduction_axis,
-    _op_for_aggregate_layer,
-)
 from deisa.dask.utils import build_deisa_array
 
 logger = logging.getLogger(__name__)
@@ -281,7 +281,7 @@ def _candidate_chain_classify(branch: Dict[str, Any], aggregate_candidates: Dict
     ``window_read`` is True when every candidate is a window read (the callback's runtime reduction runs on the WHOLE
     delivered array, so its ``reduction_axes`` is the FULL reduction (``()``) regardless of the stub-side chunk axis).
     Delegates the per-chain classification to the shared walker
-    :func:`deisa.dask.task_branches._classify_chain`.
+    :func:`_oracle.task_branches._classify_chain`.
     """
     op_name = branch.get("op_name")
     array_name = branch.get("array_name")
@@ -298,7 +298,7 @@ def _candidate_chain_classify(branch: Dict[str, Any], aggregate_candidates: Dict
             # An aggregate without a resolvable chunk layer can't be classified: treat as not-direct.
             direct = False
             continue
-        d, w = _classify_chain(graph, chunk_layer, _find_single_upstream)
+        d, w = _classify_chain(graph, chunk_layer)
         if not d:
             direct = False
         if not w:
@@ -325,7 +325,7 @@ def _try_chain_branch(
     chain = _walk_chain(graph, agg_name)
     if chain is None:
         return None
-    # MINIMAL-SCALAR-PARTIAL (see :func:`deisa.dask.task_branches.extract_reduction_hints`): a scalar-op reduction
+    # MINIMAL-SCALAR-PARTIAL (see :func:`_oracle.task_branches.extract_reduction_hints`): a scalar-op reduction
     # computed as a FULL fold over the bridge's whole chunk ships ONE scalar (``tier -> finalizer`` chain layer).
     # Dask's tier kwargs are never rebound; ``max``/``min`` come along for free via the finalizer table. Mean/moment
     # are excluded by ``full_local_fold``'s kind gate (their dict partials must stay tier-shaped).
@@ -372,7 +372,7 @@ def _try_length1_branch(
     ``deliver_direct`` defaults to False because the length-1 path is reached exactly when the chain walker could not
     PROVE the reduction reads the registered root directly (no/ambiguous candidates, unwalkable chain); the caller
     computes the conservative value via :func:`_candidate_chain_classify`. ``window_read`` marks a whole-row-plane
-    ``root[-1]`` read (see :mod:`deisa.dask.task_branches`): the callback's runtime reduction runs on the WHOLE
+    ``root[-1]`` read (see :mod:`_oracle.task_branches`): the callback's runtime reduction runs on the WHOLE
     delivered array, so the branch's ``reduction_axes`` is the full reduction (``()``) even though the stub-side
     chunk axis is partial.
     """
@@ -532,5 +532,3 @@ def _build_chain_branch_func(chain: List[Tuple[Callable, dict, int]]) -> Callabl
     """
     chain_tuple = tuple(chain)
     return functools.partial(_chain_branch_func, _chain=chain_tuple)
-
-

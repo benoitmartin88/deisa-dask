@@ -40,6 +40,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import dask.array as da
 import numpy as np
 
+from _oracle.task_branches import extract_reduction_hints
 from deisa.dask.mergeable_pca import MergeablePCA as _PCAConstructor
 from deisa.dask.precompute_errors import (  # noqa: F401 -- re-exported for the analyzer's raise sites and importers
     IncompatibleCallbackError,
@@ -51,7 +52,6 @@ from deisa.dask.precompute_errors import (  # noqa: F401 -- re-exported for the 
     RawFieldReadError,
     UnsupportedReductionError,
 )
-from deisa.dask.task_branches import extract_reduction_hints
 
 logger = logging.getLogger(__name__)
 

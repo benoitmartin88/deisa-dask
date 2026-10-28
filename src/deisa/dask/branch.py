@@ -52,14 +52,6 @@ from deisa.dask.mergeable_pca import PCASummary
 from deisa.dask.precompute_errors import (
     PrecomputeRuntimeError,
 )
-from deisa.dask.task_branches import (
-    _blockwise_indices_inputs,
-)
-from deisa.dask.task_branches import (
-    # Re-exported for the test suite (test_chain.py imports it from here); the ``as`` alias marks the re-export for ruff
-    # (F401).
-    _find_chunk_layer as _find_chunk_layer,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +70,7 @@ _BRANCH_KIND_PCA = "pca"
 
 # The op name recorded for a PCA branch. It is NOT a dask reduction op: it names the decomposition the bridge runs, so
 # it takes the same path through ``output_key`` (``{array}-pca``), ``op_name`` and the dispatch signatures as every
-# other op without pretending to be one of ``SUPPORTED_OPS`` in :mod:`deisa.dask.task_branches`.
+# other op without pretending to be one of the analyzer's ``SUPPORTED_OPS`` (now in ``test/_oracle/task_branches.py``).
 _PCA_OP_NAME = "pca"
 
 
@@ -494,46 +486,6 @@ def _discover_partial_metadata(
             partial_shape = tuple(arr.shape)
             partial_dtype = str(arr.dtype)
     return partial_shape, partial_dtype
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-def _find_single_upstream(layer) -> Optional[Tuple[str, int]]:
-    """Return ``(upstream_layer_name, array_input_count)`` if the layer reads from a single upstream Blockwise
-    (one or more times. e.g. ``arr * arr`` reads from ``arr`` twice and is still chunk-local). Returns ``None`` if the
-    layer reads from multiple distinct array upstreams (cross-array, can't fold) or contains scalar constants (deferred
-    to a later commit).
-
-    Uses the shared Blockwise index-walking primitive :func:`deisa.dask.task_branches._blockwise_indices_inputs` so the
-    ``layer.indices`` parsing lives in one place.
-    """
-    parsed = _blockwise_indices_inputs(layer)
-    if parsed is None:
-        # Not a new-style Blockwise (no indices) / empty indices.
-        return None
-    names, array_input_count, has_non_array_input = parsed
-    upstream_names = set(names)
-    if not upstream_names or len(upstream_names) > 1:
-        return None
-    if has_non_array_input:
-        # Refuse to fold chains with constants. The constant would need to be embedded into the branch_func call (e.g.
-        # ``add(chunk, 1)``) which requires extracting the constant value from the Blockwise task's args.
-        return None
-    return next(iter(upstream_names)), array_input_count
-
-
 
 
 def _chain_branch_func(chunk, _chain=None):

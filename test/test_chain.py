@@ -16,12 +16,11 @@ import dask.array as da
 import numpy as np
 import pytest
 from _oracle.branch_specs import _build_chain_branch_func, _walk_chain
+from _oracle.task_branches import _find_chunk_layer, _find_single_upstream
 from utils import _make_callback
 
 from deisa.dask.branch import (
     _apply_full_local_fold,
-    _find_chunk_layer,
-    _find_single_upstream,
 )
 
 

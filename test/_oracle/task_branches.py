@@ -54,9 +54,8 @@ import logging
 import pickle
 from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
-
 import dask.array as da
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -221,7 +220,31 @@ def _is_stub_layer_name(layer_name: str) -> bool:
     return layer_name.startswith(_STUB_LAYER_PREFIX)
 
 
-def _classify_chain(graph, chunk_layer_name: str, _find_single_upstream) -> Tuple[bool, bool]:
+def _find_single_upstream(layer) -> Optional[Tuple[str, int]]:
+    """Return ``(upstream_layer_name, array_input_count)`` if the layer reads from a single upstream Blockwise
+    (one or more times. e.g. ``arr * arr`` reads from ``arr`` twice and is still chunk-local). Returns ``None`` if the
+    layer reads from multiple distinct array upstreams (cross-array, can't fold) or contains scalar constants (deferred
+    to a later commit).
+
+    Uses the shared Blockwise index-walking primitive :func:`_blockwise_indices_inputs` so the ``layer.indices``
+    parsing lives in one place.
+    """
+    parsed = _blockwise_indices_inputs(layer)
+    if parsed is None:
+        # Not a new-style Blockwise (no indices) / empty indices.
+        return None
+    names, array_input_count, has_non_array_input = parsed
+    upstream_names = set(names)
+    if not upstream_names or len(upstream_names) > 1:
+        return None
+    if has_non_array_input:
+        # Refuse to fold chains with constants. The constant would need to be embedded into the branch_func call (e.g.
+        # ``add(chunk, 1)``) which requires extracting the constant value from the Blockwise task's args.
+        return None
+    return next(iter(upstream_names)), array_input_count
+
+
+def _classify_chain(graph, chunk_layer_name: str) -> Tuple[bool, bool]:
     """Classify ONE chain from the reduction's chunk stage toward the registered root.
 
     Returns ``(direct, window_read)``:
@@ -234,8 +257,6 @@ def _classify_chain(graph, chunk_layer_name: str, _find_single_upstream) -> Tupl
     The single shared walk behind
     :func:`deisa.dask.branch._candidate_chain_classify` (the length-1 fallback's conservative gate) and
     :func:`extract_reduction_hints` (the window-read flag); one loop, so the two call sites can never disagree.
-    ``_find_single_upstream`` is injected (it lives in :mod:`deisa.dask.branch`, which imports this module --
-    parameter passing avoids the circular import at load time).
     """
     current = chunk_layer_name
     seen: set = set()
@@ -360,8 +381,8 @@ def _blockwise_indices_inputs(layer) -> Optional[Tuple[List[str], int, bool]]:
     ``has_non_array_input`` is True when a scalar constant (non-string-first-element index key) is present.
 
     This is the shared primitive behind both :func:`_blockwise_upstream_layer_names` (names only) and
-    :func:`deisa.dask.branch._find_single_upstream` (single distinct upstream + array-input count + constant
-    rejection), so the Blockwise index-walking logic lives in one place.
+    :func:`_find_single_upstream` (single distinct upstream + array-input count + constant rejection), so the
+    Blockwise index-walking logic lives in one place.
     """
     if not (hasattr(layer, "indices") and layer.indices):
         return None
@@ -730,11 +751,8 @@ def extract_reduction_hints(
 
         # The window-read flag (``root[-1]``): the callback's reduction runs on the WHOLE delivered array, so the
         # branch's runtime dispatch signature is the FULL reduction even though the stub-side chunk layer carries a
-        # partial axis (the getitem removed the other axes). The shared classifier is imported lazily (it needs
-        # ``_find_single_upstream``, defined in deisa.dask.branch which imports this module).
-        from deisa.dask.branch import _find_single_upstream
-
-        _direct, window_read = _classify_chain(graph, chunk_layer_name, _find_single_upstream)
+        # partial axis (the getitem removed the other axes).
+        _direct, window_read = _classify_chain(graph, chunk_layer_name)
         # MINIMAL-SCALAR-PARTIAL rule (operator-generic): dask's chunk stage tiers the partial one axis at a time
         # (``axis=(0,) keepdims`` on a 2-D chunk ships a ``(1, kept)`` row), which forces the Deisa-side stack into a
         # ``(bridges, 1, kept)`` artifact. When the recorded reduction is a FULL fold over the whole local chunk, the
