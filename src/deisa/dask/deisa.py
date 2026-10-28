@@ -93,7 +93,14 @@ from deisa.dask.precompute_analyzer import (
     RawFieldReadError,
     UnsupportedReductionError,
 )
-from deisa.dask.runtime_dispatch import EagerMenu, PlanDispatcher, runtime_delivery_enabled
+from deisa.dask.runtime_dispatch import (
+    EagerMenu,
+    PlanDispatcher,
+    QueuePlanExchange,
+    plan_report_queue_name,
+    plan_request_queue_name,
+    runtime_delivery_enabled,
+)
 from deisa.dask.runtime_errors import RuntimeRefusal
 from deisa.dask.utils import _PrecomputedDeisaArray, build_deisa_array, get_client, make_precomputed_view  # noqa: F401
 
@@ -185,6 +192,34 @@ class Deisa(IDeisa):
         # First runtime refusal a callback raised; ``execute_callbacks`` re-raises it so the run fails instead of
         # logging once per timestep. None while the run is healthy.
         self._run_failure: Optional[BaseException] = None
+        # Populate the per-array transports now, once: a delivery may ask for an on-demand reduction as soon as the
+        # first event arrives, and attaching is a scheduler round trip per array.
+        self._attach_runtime_transports()
+
+    def _attach_runtime_transports(self) -> None:
+        """Attach the production transport of every registered array: the array's pair of dask queues.
+
+        This is the writer of ``_runtime_transports``. The queues are named by convention and per array, the same way
+        the feedback queues are, so the bridges attach to them without the host sending them anything: the host puts a
+        request on ``plan_request_queue_name``, the array's root bridge picks it up and answers on
+        ``plan_report_queue_name``, and what comes back is merged exactly as a test-injected exchange's reports are.
+
+        Nothing is attached while the runtime delivery flag is off -- the topic handler never builds a runtime
+        collection then, so a transport would be dead weight on the default path. An array whose bridge count the
+        metadata does not describe is skipped: without a count the host cannot know when a round is complete.
+        """
+        if not runtime_delivery_enabled():
+            return
+        for array_name, metadata in self.arrays_metadata.items():
+            bridge_count = _grid_size_from_metadata(metadata)
+            if not bridge_count:
+                continue
+            self._runtime_transports[array_name] = QueuePlanExchange(
+                Queue(plan_request_queue_name(array_name), client=self.client),
+                Queue(plan_report_queue_name(array_name), client=self.client),
+                bridge_count,
+            )
+            logger.debug(f"runtime transport attached for array {array_name!r} over {bridge_count} bridge(s)")
 
     def __del__(self):
         try:

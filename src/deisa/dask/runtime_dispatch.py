@@ -50,6 +50,14 @@ Both the request id and the timestep are matched on the way back. That is the st
 for an earlier request, or for an earlier timestep of the same array, never satisfies a newer request -- it is refused,
 because merging it would silently mix two timesteps of one field.
 
+**How the two messages travel in production.** Over a pair of dask queues per array, named by convention
+(:func:`plan_request_queue_name` / :func:`plan_report_queue_name`), which is the reverse channel the run already has:
+the bridge side is a daemon thread per array's root bridge (:func:`serve_plan_queue`) that moves requests into a
+:class:`PlanRequestBacklog`, and the array's next ``send`` boundary -- the one place where every rank of the array is
+inside the same sub-comm collective -- folds the retained chunk of the requested timestep and posts the reports back
+(:class:`QueuePlanExchange` is the host's half). Nothing is exchanged to agree on the names, and no bridge folds a
+chunk from a thread: a second thread inside an MPI communicator is not a safe place to be.
+
 :class:`EagerMenu` is the eager half of the transfer strategy: the six tiny scalar full folds a bridge computes once for
 its chunk, so the common scalar reduction costs no round trip. A menu value IS the payload an on-demand request for the
 same operation would return (same composed callable, same chunk) -- **for a reduction of the bare registered array**,
@@ -66,6 +74,7 @@ the reduction algebra, which is why it has its own request type and its own merg
 from __future__ import annotations
 
 import os
+import threading
 import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
@@ -74,6 +83,7 @@ import numpy as np
 
 from deisa.dask import runtime_errors as errors
 from deisa.dask.branch import _BRANCH_KIND_PCA, _SCALAR_FOLDS, _combine_two_phase
+from deisa.dask.constants import RUNTIME_PLAN_QUEUE_PREFIX, RUNTIME_REPORT_QUEUE_PREFIX
 from deisa.dask.mergeable_pca import PCASummary, merge_tree
 from deisa.dask.runtime_compose import PCARequest, RuntimeRequest, compose_request
 from deisa.dask.runtime_expr import _CHUNK_PROGRAM, KIND_BOOLEAN, KIND_COUNT, KIND_SCALAR
@@ -84,13 +94,18 @@ __all__ = [
     "PartialReport",
     "PlanDispatcher",
     "PlanRequest",
+    "PlanRequestBacklog",
     "PlanResponder",
+    "QueuePlanExchange",
     "RUNTIME_REDUCTION_DELIVERY_ENABLED",
     "build_eager_menu",
     "dispatch_plan_over_comm",
     "eager_menu_requests",
     "merge_partials",
+    "plan_report_queue_name",
+    "plan_request_queue_name",
     "runtime_delivery_enabled",
+    "serve_plan_queue",
     "serve_plan_requests",
 ]
 
@@ -381,6 +396,139 @@ def serve_plan_requests(comm: Any, responder: PlanResponder) -> None:
         if plan is None:
             return
         comm.gather(responder.respond(plan), root=0)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Production transport: the run's dask queues
+# ---------------------------------------------------------------------------------------------------------------------
+def plan_request_queue_name(array_name: str) -> str:
+    """Name of the queue carrying the analytics host's plan requests for one array.
+
+    Named per array, like the feedback queues: the host and every bridge of the array derive the same name without
+    exchanging it, so no configuration crosses the run.
+
+    - ``:param array_name:`` Registered array the queue serves.
+    """
+    return f"{RUNTIME_PLAN_QUEUE_PREFIX}{array_name}"
+
+
+def plan_report_queue_name(array_name: str) -> str:
+    """Name of the queue carrying the bridges' per-bridge reports for one array.
+
+    - ``:param array_name:`` Registered array the queue serves.
+    """
+    return f"{RUNTIME_REPORT_QUEUE_PREFIX}{array_name}"
+
+
+# How long a bridge waits for another plan request before re-checking its stop flag, and how long the host waits for
+# the reports of one request. The bridge bound is a poll interval (it costs one scheduler round trip); the host bound
+# is the one that must tolerate the simulation taking a timestep to reach its next send boundary.
+_PLAN_QUEUE_POLL_SECONDS: float = 0.5
+_PLAN_REPORT_TIMEOUT_SECONDS: float = 300.0
+
+
+class PlanRequestBacklog:
+    """The hand-off between a bridge's plan-queue thread and its per-timestep ``send`` boundary.
+
+    The queue thread appends, the send boundary drains, and the two never hold the lock at the same time as they touch
+    a chunk. Plans are accumulated rather than answered on the spot because answering needs the array's other bridges:
+    only the send boundary is a place where every rank of the array is parked in the same collective.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._plans: List[PlanRequest] = []
+
+    def put(self, plan: PlanRequest) -> None:
+        """Append one request for the next send boundary.
+
+        - ``:param plan:`` The request the host's queue delivered.
+        """
+        with self._lock:
+            self._plans.append(plan)
+
+    def drain(self) -> List[PlanRequest]:
+        """Take every request received so far, oldest first (an empty list when none arrived)."""
+        with self._lock:
+            plans, self._plans = self._plans, []
+        return plans
+
+
+class QueuePlanExchange:
+    """The analytics host's transport: one request/reports round trip over the run's two dask queues.
+
+    This is the production transport: the host puts the same request once per bridge (a dask queue hands every item
+    to exactly ONE consumer, so a broadcast is one item per bridge), then blocks until every bridge answered. It is a
+    plain callable, the shape :class:`PlanDispatcher` takes, so nothing on the host side knows about queues.
+
+    The reports come back in whatever order the bridges answered; :func:`_validate_reports` and the merge both match
+    on the request id and sort by chunk position, so the order is not part of the contract.
+
+    - ``:param request_queue:`` The array's request queue (``put``-capable; in production a ``distributed.Queue``).
+    - ``:param report_queue:`` The array's report queue (``get(timeout=...)``-capable).
+    - ``:param bridge_count:`` Number of bridges that own a chunk of the array: one report is expected from each.
+    - ``:param timeout:`` Seconds to wait for the full set of reports before refusing.
+    """
+
+    def __init__(
+        self,
+        request_queue: Any,
+        report_queue: Any,
+        bridge_count: int,
+        timeout: float = _PLAN_REPORT_TIMEOUT_SECONDS,
+    ) -> None:
+        self._request_queue = request_queue
+        self._report_queue = report_queue
+        self._bridge_count = int(bridge_count)
+        self._timeout = float(timeout)
+
+    def __call__(self, plan: PlanRequest) -> List[PartialReport]:
+        """Broadcast ``plan`` to every bridge and collect one report from each.
+
+        - ``:param plan:`` The request to dispatch.
+        """
+        for _ in range(self._bridge_count):
+            self._request_queue.put(plan)
+        reports: List[PartialReport] = []
+        try:
+            while len(reports) < self._bridge_count:
+                reports.append(self._report_queue.get(timeout=self._timeout))
+        except TimeoutError as exc:
+            raise errors.precompute_runtime_invariant(
+                "QueuePlanExchange",
+                f"request {plan.request_id!r} for array {plan.array_name!r} at timestep {plan.timestep} collected "
+                f"{len(reports)} of {self._bridge_count} report(s) in {self._timeout}s; no bridge is serving plan "
+                f"requests for that array. Refusing to merge a partial set with a hole in it",
+            ) from exc
+        return reports
+
+
+def serve_plan_queue(
+    request_queue: Any,
+    backlog: PlanRequestBacklog,
+    stop: Optional[threading.Event] = None,
+    poll_seconds: float = _PLAN_QUEUE_POLL_SECONDS,
+) -> None:
+    """The bridge half of the transport: move plan requests off the host's queue into ``backlog``.
+
+    Runs in a daemon thread on the array's root bridge and touches nothing but the queue and the backlog: no
+    communicator call and no chunk. That is deliberate -- the chunk is folded by the bridge's MAIN thread at the next
+    ``send`` boundary, because that is the only point where every rank of the array is inside the same collective, and
+    because a second thread inside an MPI communicator is not a safe place to be.
+
+    - ``:param request_queue:`` The array's request queue (``get(timeout=...)``-capable).
+    - ``:param backlog:`` Where the requests are parked until the next send boundary.
+    - ``:param stop:`` Set to end the loop; a ``None`` request on the queue also ends it.
+    - ``:param poll_seconds:`` How long one ``get`` waits before the stop flag is re-checked.
+    """
+    while stop is None or not stop.is_set():
+        try:
+            plan = request_queue.get(timeout=poll_seconds)
+        except TimeoutError:
+            continue
+        if plan is None:  # stop sentinel
+            return
+        backlog.put(plan)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
