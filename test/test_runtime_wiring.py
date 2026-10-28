@@ -56,10 +56,12 @@ from deisa.dask.bridge import Bridge
 from deisa.dask.collection import DeisaCollection
 from deisa.dask.deisa import Deisa
 from deisa.dask.mergeable_pca import MergeablePCA, PCASummary
-from deisa.dask.runtime_compose import PCARequest
+from deisa.dask.runtime_compose import PCARequest, compose_request
 from deisa.dask.runtime_dispatch import (
     EAGER_MENU_OPS,
     EagerMenu,
+    PlanRequest,
+    PlanRequestBacklog,
     PlanResponder,
     build_eager_menu,
     dispatch_plan_over_comm,
@@ -764,12 +766,12 @@ class _WireClient:
         self.events.append((name, payload))
 
 
-def send_one_chunk(monkeypatch, chunk):
-    """Run the REAL ``Bridge.send`` for a single-bridge array and return the topic payload it published.
+def _make_send_bridge():
+    """Build the ``Bridge.__new__`` stub the tests below drive: one bridge, one array, no scheduler.
 
-    The subject is the encode step (``to_send["menu"] = [menu.as_payload() ...]``) and the eager menu that feeds it, so
-    both run for real: only the scatter and the per-branch chunk stage are stubbed -- they are ``test_bridge.py``'s
-    subject and need a scheduler.
+    Only the scatter and the per-branch chunk stage are stubbed -- they are ``test_bridge.py``'s subject and need a
+    scheduler. Everything else (``send``'s runtime-delivery boundary, the eager menu, the plan backlog seam) is the real
+    code.
     """
     bridge = Bridge.__new__(Bridge)
     wire_client = _WireClient()
@@ -785,6 +787,7 @@ def send_one_chunk(monkeypatch, chunk):
     bridge._task_branches = {ARRAY_NAME: []}
     bridge._branch_by_key = {}
     bridge._runtime_plan_backlog = {}
+    bridge._runtime_plan_report_queues = {}
     bridge._runtime_last_chunk = {}
     bridge._scatter_full = lambda *args, **kwargs: {
         "future": "key-0",
@@ -792,6 +795,16 @@ def send_one_chunk(monkeypatch, chunk):
         "nbytes": {"key-0": int(np.prod(CHUNK_SHAPE))},
     }
     bridge._execute_operations_on_chunk = lambda *args, **kwargs: {}
+    return bridge, wire_client
+
+
+def send_one_chunk(monkeypatch, chunk):
+    """Run the REAL ``Bridge.send`` for a single-bridge array and return the topic payload it published.
+
+    The subject is the encode step (``to_send["menu"] = [menu.as_payload() ...]``) and the eager menu that feeds it, so
+    both run for real.
+    """
+    bridge, wire_client = _make_send_bridge()
     bridge.send(ARRAY_NAME, chunk, 0)
     # The stub has no peers and no client to close: mark it closed so its finalizer stays quiet.
     bridge._has_close_been_called = True
@@ -886,3 +899,83 @@ def test_menu_round_trip_preserves_keys_values_dtypes_and_stamps(fleets, client,
     assert len(seen) == 1
     assert seen[0] == pytest.approx(fleets.fields[0].sum(), rel=1e-5, abs=1e-4)
     assert fleets.rounds(0) == [], "a menu-served fold must not dispatch an on-demand request"
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# ``Bridge.send`` <-> the on-demand transport (K5F-18). Two lines inside one ``if`` in ``send()`` are the ONLY link
+# between the plan transport and the simulation loop: the ``_serve_pending_plans`` boundary call and the
+# ``_runtime_last_chunk`` retention. Before this pin, deleting either one left this file at 21 passed -- ``std``, every
+# axis reduction and every menu miss could be disconnected from the run with a green suite.
+# ---------------------------------------------------------------------------------------------------------------------
+class _RecordingReportQueue:
+    """The array's plan report queue, recording what the bridge posts instead of handing it to the host."""
+
+    def __init__(self):
+        self.reports = []
+
+    def put(self, report):
+        """- ``:param report:`` One ``PartialReport`` posted by the rank that roots the array."""
+        self.reports.append(report)
+
+
+def test_send_serves_pending_plans_then_retains_the_chunk_by_reference():
+    """``send`` enters the plan boundary on every send and retains the chunk it was handed -- the same object.
+
+    Three properties, all on the real ``send``:
+
+    - the boundary is entered on every send, even with an EMPTY backlog: it is a sub-comm collective, so skipping it on
+      the rank that happens to have nothing queued is a one-sided collective (a hang), not a saved round trip;
+    - a request is served from the PREVIOUS chunk: the boundary runs before the retention line replaces it, so a
+      request naming timestep N is still answered with timestep N's chunk while ``send`` is already at N+1;
+    - the retained chunk is the object passed in, not a copy: ``_serve_pending_plans`` only reads it, so a copy would
+      double the bridge's per-array footprint for nothing.
+    """
+    first = np.random.default_rng(0).normal(size=CHUNK_SHAPE).astype(np.float32)
+    second = np.random.default_rng(1).normal(size=CHUNK_SHAPE).astype(np.float32)
+    bridge, _ = _make_send_bridge()
+    # The production shape of a participating bridge: a real backlog (its presence is what makes ``send`` enter the
+    # boundary) and the array's report queue.
+    bridge._runtime_plan_backlog = {ARRAY_NAME: PlanRequestBacklog()}
+    reports = _RecordingReportQueue()
+    bridge._runtime_plan_report_queues = {ARRAY_NAME: reports}
+
+    boundary_calls = []
+    serve_pending_plans = bridge._serve_pending_plans
+
+    def recording_boundary(array_name, sub_comm):
+        """Record the boundary call, then run the REAL boundary.
+
+        - ``:param array_name:`` Array the send is for.
+        - ``:param sub_comm:`` The array's sub-communicator.
+        """
+        boundary_calls.append((array_name, sub_comm))
+        return serve_pending_plans(array_name, sub_comm)
+
+    bridge._serve_pending_plans = recording_boundary
+
+    # Send 1: nothing on demand yet. The boundary still runs (an empty drain) and the chunk is retained.
+    bridge.send(ARRAY_NAME, first, 0)
+    assert len(boundary_calls) == 1, "send() must enter the plan boundary on every send, empty backlog or not"
+    assert boundary_calls[0] == (ARRAY_NAME, bridge._array_comms[ARRAY_NAME])
+    retained_timestep, retained_chunk = bridge._runtime_last_chunk[ARRAY_NAME]
+    assert retained_timestep == 0
+    assert retained_chunk is first, "the retained chunk must be the object passed in, not a copy"
+
+    # A request for timestep 0 lands between the two sends: the host asks for the chunk the bridges last delivered.
+    request = compose_request(DeisaCollection.from_metadata(ARRAY_NAME, 0, WIRE_METADATA[ARRAY_NAME]).sum())
+    bridge._runtime_plan_backlog[ARRAY_NAME].put(
+        PlanRequest(request_id="req-0", array_name=ARRAY_NAME, timestep=0, request=request)
+    )
+
+    # Send 2: the boundary answers from the PREVIOUS chunk, then the retention takes this one.
+    bridge.send(ARRAY_NAME, second, 1)
+    bridge._has_close_been_called = True
+
+    assert len(boundary_calls) == 2, "the boundary runs once per send"
+    assert boundary_calls[1] == (ARRAY_NAME, bridge._array_comms[ARRAY_NAME])
+    retained_timestep, retained_chunk = bridge._runtime_last_chunk[ARRAY_NAME]
+    assert retained_timestep == 1
+    assert retained_chunk is second, "the retention must follow the boundary, keeping THIS timestep's chunk"
+    # The answer belongs to timestep 0: ``first`` was still the retained chunk when the plan was served.
+    assert [report.timestep for report in reports.reports] == [0]
+    assert float(reports.reports[0].partial) == pytest.approx(float(np.sum(first)), rel=1e-5)
