@@ -61,7 +61,7 @@ EXPECTED_KIND = {
 }
 
 # How each reduction's partials fold across bridges. The first four are the surviving ``_SCALAR_FOLDS``; the last three
-# are the F4 additions the combine step gains in P2 (boolean OR/AND, additive count).
+# are the F4 additions (boolean OR/AND, additive count) the combine step gained with the new kinds.
 SCALAR_FOLD = {
     "sum": np.sum,
     "prod": np.prod,
@@ -358,11 +358,18 @@ class TestOffSurfaceMatrix:
         assert "associative" in str(excinfo.value)
         assert "median" in str(excinfo.value)
 
-    def test_reduction_compute_points_at_the_dispatch_card(self):
-        """P1 composes the request but does not dispatch it: ``.compute()`` says so and names the next step."""
-        with pytest.raises(NotImplementedError) as excinfo:
+    def test_reduction_compute_without_a_transport_is_refused(self):
+        """A collection built by hand carries no bridge transport, so ``.compute()`` refuses instead of gathering.
+
+        The dispatch boundary itself (request -> bridges -> partials -> combine) is proven over a fake communicator in
+        ``test_runtime_dispatch.py``; here the point is that a collection OUTSIDE the delivery path fails loudly and
+        names the same remedy every other refusal names.
+        """
+        with pytest.raises(errors.PrecomputeRuntimeError) as excinfo:
             make_collection().sum().compute()
-        assert "P2" in str(excinfo.value)
+        message = str(excinfo.value)
+        assert "no bridge transport" in message
+        assert "precompute=False" in message
 
 
 class TestRootRules:
