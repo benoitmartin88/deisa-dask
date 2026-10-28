@@ -19,10 +19,16 @@ Types of changes:
 ### Added
 
 - CI: continuous benchmark using Bencher.
-- Bridge-local precompute: callbacks whose compute operations are chunk-local reductions (`sum`, `mean`, `var`, `std`, 
-  `min`, `max`, `prod`) are planned at registration time and shipped to Dask workers as small per-bridge partials 
-  instead of the full array chunk. Branches are registered per array, so a multi-array callback gets one branch set per 
-  array. Expressions whose reduction depends on another reduction's output are refused with`UnsupportedReductionError`.
+- Runtime reduction delivery: a callback registered with `precompute=True` (the default) receives one `DeisaCollection`
+  per array and timestep, and its chunk-local reductions (`sum`, `mean`, `var`, `std`, `min`, `max`, `prod`) are
+  evaluated by the bridge on the numpy chunk it already holds. Two transports carry the answer back, and the array's
+  data crosses neither of them: the bridge publishes an eager scalar menu on the topic event, which answers the common
+  folds with no round trip, and serves the expressions the menu cannot answer on demand, when the worker asks for the
+  reduction of a chunk the bridge retains. When no callback on an array reads the chunk itself, `Bridge.send()` ships
+  no data at all -- no scatter and an empty `futures` list -- so a whole-array `sum()` costs a few scalars per bridge
+  per timestep instead of the chunk. `precompute=False` keeps the legacy full-chunk scatter, and an array that has at
+  least one such reader keeps it even when a `precompute=True` callback is registered on the same array. Expressions
+  whose reduction depends on another reduction's output are refused with `UnsupportedReductionError`.
 - `deisa.dask.mergeable_pca`: exact mergeable PCA primitives. A local summary of one data block (`n_samples`, `mean`,
   `components`, `singular_values`) merges with another summary into the exact summary of their
   union, without either source sample ever reaching a merge node, so only a compact summary has to cross a process or
@@ -51,6 +57,10 @@ Types of changes:
   source: the reductions are planned from the Dask graph the callback itself builds, so the registration-time refusals
   for unplannable expressions become run-time refusals raised at the operator that cannot be planned
   (`UnsupportedReductionError`, `RawFieldReadError`, ...).
+- A `precompute=True` callback's operand now answers only the closed operator surface. `len(field)` and any attribute
+  outside it raise `UnsupportedReductionError` instead of being served from metadata: a length or a foreign attribute
+  invites reading a shape or a value that is never delivered to the worker. The surface itself is unchanged and
+  complete -- `field.shape`, `field.dtype`, `field.ndim`, the pointwise operators and the reductions all still work.
 
 ### Removed
 

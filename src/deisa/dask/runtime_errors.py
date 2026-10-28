@@ -77,6 +77,8 @@ __all__ = [
     "off_surface",
     "precompute_runtime_invariant",
     "raw_field_read",
+    "rewrap",
+    "stale_timestep",
 ]
 
 # The remedy that must remain reachable from EVERY refusal: the legacy delivery mode ships the chunk itself, so it can

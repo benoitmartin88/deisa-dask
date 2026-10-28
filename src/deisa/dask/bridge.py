@@ -31,15 +31,17 @@
 Two delivery modes coexist on this side, and only the analytics host decides which one a callback gets:
 
 - the runtime reduction path (the delivery mode of ``precompute=True``): ``send`` ships an eager scalar menu per
-  timestep and answers on-demand plan requests at its ``send`` boundary;
+  timestep and answers on-demand plan requests at its ``send`` boundary. When no callback on the array reads the
+  chunk itself, ``send`` ships NO data at all -- the menu is the whole payload and the chunk is only retained for
+  on-demand plans;
 - the LEGACY full-chunk scatter path (``precompute=False``): ``send`` ships the chunk itself, and any branch funcs the
   host still files are executed on the local chunk first.
 
-**The P3 -> P4 coexistence cost, stated once.** While both modes exist, the eager menu's
-``sum``/``min``/``max``/``prod`` entries recompute what ``_execute_operations_on_chunk`` just computed on the SAME
-chunk. That double work is intentional and priced in: P4 deletes the analyzer path and makes the menu the only fold
-site, which removes it. Until then, ``_build_runtime_menu`` is the only place it happens, and it sits after the reduce
-step and before the first scatter so the chunk never travels to convey a menu value.
+**The eager menu is the only fold site.** ``_build_runtime_menu`` is where a bridge computes a reduction, and it sits
+after the reduce step and before the first scatter so the chunk never travels to convey a menu value. The branch
+machinery it used to duplicate (``_execute_operations_on_chunk``) is still called on the delivery path, but nothing
+files branches any more, so it returns no partials: the menu's ``sum``/``min``/``max``/``prod`` entries are the only
+folds performed on the chunk.
 """
 
 import asyncio

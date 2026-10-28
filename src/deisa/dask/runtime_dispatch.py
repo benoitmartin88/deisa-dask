@@ -481,9 +481,10 @@ def plan_report_queue_name(array_name: str) -> str:
 # is the one that must tolerate the simulation taking a timestep to reach its next send boundary -- and it is also the
 # bound a request that can never be served pays in full (see "The one timing bound of that design", above: a reduction
 # of the final delivered timestep has no further send to be answered at). That is why it is cycle-tolerable rather than
-# a five-minute stall, and why it is overridable: a simulation whose timestep is longer than the default sets
-# ``DEISA_RUNTIME_PLAN_TIMEOUT`` (seconds) for its whole run, host and bridges alike, since every process builds its
-# exchange from this same value.
+# a five-minute stall, and why it is overridable. ``DEISA_RUNTIME_PLAN_TIMEOUT`` is read by the HOST only: it bounds
+# ``QueuePlanExchange.reports``' wait, and no bridge waits on it. The bridge half is a blocking ``get`` with a
+# ``_PLAN_QUEUE_POLL_SECONDS`` re-check of the stop flag, so a simulation whose timestep is longer than the host
+# default needs the variable set in the analytics host's environment alone.
 _PLAN_QUEUE_POLL_SECONDS: float = 0.5
 _PLAN_REPORT_TIMEOUT_SECONDS: float = 60.0
 _PLAN_REPORT_TIMEOUT_ENV: str = "DEISA_RUNTIME_PLAN_TIMEOUT"
