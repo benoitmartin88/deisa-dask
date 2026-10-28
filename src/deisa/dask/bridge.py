@@ -44,9 +44,11 @@ from tlz import valmap
 
 from dask.tokenize import tokenize
 from deisa.dask.branch import BranchSpec
+from deisa.dask.collection import DeisaCollection
 from deisa.dask.constants import CLIENT_KEY, FEEDBACK_QUEUE_PREFIX, KEY_PREFIX, WAIT_FOR_EXECUTE_CB_EVENT
 from deisa.dask.handshake import Handshake
 from deisa.dask.precompute_analyzer import PrecomputeRuntimeError
+from deisa.dask.runtime_dispatch import EagerMenu, build_eager_menu, runtime_delivery_enabled
 from deisa.dask.utils import called_from_event_loop, get_client, run_coro_on_private_loop
 
 logger = logging.getLogger(__name__)
@@ -396,6 +398,11 @@ class Bridge(IBridge):
         branches = self._get_task_branches(array_name)
         partials = self._execute_operations_on_chunk(chunk, branches)
 
+        # Eager scalar menu (the zero-round-trip half of the transfer strategy): computed HERE, on the local numpy
+        # chunk and before ANY scatter, so the menu values are chunk-local reductions and the chunk itself is never
+        # shipped to convey them. Nothing below may run before this line without breaking the ordering invariant.
+        menu = self._build_runtime_menu(array_name, chunk, timestep)
+
         # With partials: scatter them only. Without: full-chunk scatter (backwards compatibility for non-reduction
         # callbacks).
         precomputed_meta: Dict[str, Dict[str, Any]] = {}
@@ -419,6 +426,7 @@ class Bridge(IBridge):
                 chunk,
                 timestep,
                 precomputed_meta=precomputed_meta,
+                menu=menu,
             )
             return
 
@@ -426,6 +434,7 @@ class Bridge(IBridge):
             "future-info": res,
             "chunk_position": self.arrays_metadata[array_name]["chunk_position"],
             "precomputed": precomputed_meta,
+            "menu": menu,
         }
         logger.debug(f"[{self.id}] send() gather: to_send={to_send}")
 
@@ -443,6 +452,7 @@ class Bridge(IBridge):
             # misalign when a bridge shipped no partials, letting one bridge's partial inherit another bridge's
             # coordinates (or under-count the grid) and corrupt the combine.
             all_partials_meta: List[Dict[str, Any]] = []
+            menus: List[EagerMenu] = []
             for d in gathered_data:
                 who_has.update(d["future-info"]["who_has"])
                 nbytes.update(d["future-info"]["nbytes"])
@@ -453,6 +463,8 @@ class Bridge(IBridge):
                     keys.append(future_field)
                 if d.get("precomputed"):
                     all_partials_meta.append({"precomputed": d["precomputed"], "chunk_position": d["chunk_position"]})
+                if d.get("menu") is not None:
+                    menus.append(d["menu"])
 
             # only update the scheduler with who has what and register the futures once
             self.client.sync(self.client.scheduler.update_data, who_has=who_has, nbytes=nbytes)
@@ -496,6 +508,10 @@ class Bridge(IBridge):
                 "precomputed": True if all_partials_meta else None,
                 "futures": futures_payload,
             }
+            if menus:
+                # Every participating bridge's eager menu, carried with the timestep it was computed for. Absent from
+                # the payload on the legacy path, so that payload stays byte-identical there.
+                to_send["menu"] = menus
             logger.debug(
                 f"[{self.id}] send() log_event: array={array_name}, "
                 f"timestep={timestep}, n_futures={len(futures_payload)}"
@@ -504,6 +520,31 @@ class Bridge(IBridge):
 
         # TODO: what to do if error ?
 
+    def _build_runtime_menu(self, array_name: str, chunk: np.ndarray, timestep: int) -> Optional[EagerMenu]:
+        """Build this bridge's eager scalar menu for one timestep, or ``None`` when the runtime path is off.
+
+        The menu is computed on the bridge's OWN numpy chunk, so it obeys the standing invariant: what leaves this
+        method is a handful of chunk-local scalars and the two small ``{n, total[, M]}`` dict partials, never the chunk.
+        It is called from ``send()`` after the per-branch local reductions and before the first scatter.
+
+        - ``:param array_name:`` Registered array the chunk belongs to.
+        - ``:param chunk:`` The bridge's own numpy chunk, already available at ``send()``.
+        - ``:param timestep:`` Timestep the chunk belongs to; every menu value is stamped with it, which is what lets
+          the analytics side refuse a menu value of an earlier timestep.
+        """
+        if not runtime_delivery_enabled():
+            return None
+        metadata = self.arrays_metadata[array_name]
+        collection = DeisaCollection.from_metadata(array_name, timestep, metadata)
+        sub_comm = self._array_comms.get(array_name)
+        rank = 0 if sub_comm is None or sub_comm is _COMM_NULL else sub_comm.Get_rank()
+        return build_eager_menu(
+            collection,
+            chunk,
+            rank=rank,
+            chunk_position=metadata.get("chunk_position", ()),
+        )
+
     def _direct_send(
         self,
         array_name: str,
@@ -511,7 +552,8 @@ class Bridge(IBridge):
         chunk: np.ndarray,
         timestep: int,
         precomputed_meta: Optional[Dict[str, Dict]] = None,
-    ):
+        menu: Optional[EagerMenu] = None,
+    ) -> None:
         """
         Handle single-bridge array send without collective.
 
@@ -526,6 +568,8 @@ class Bridge(IBridge):
             (``{output_key: {"future", "shape", "dtype"}}``); only set on the
             precompute path. When provided, the topic event's ``futures`` list
             carries the partials' reduced shapes instead of the full-chunk shape.
+        - ``:param menu:`` This bridge's eager scalar menu for ``timestep``, or ``None`` when the runtime path is off.
+            A single-bridge array is its own whole grid, so the one menu is also the complete menu of the array.
         """
         assert self.client is not None, "client cannot be None for single-bridge send."
 
@@ -561,6 +605,8 @@ class Bridge(IBridge):
             "precomputed": True if precomputed_meta else None,
             "futures": futures_payload,
         }
+        if menu is not None:
+            to_send["menu"] = [menu]
         self.client.log_event(array_name, to_send)
 
     def get(self, key: str, timestep: Optional[int] = None, default: Any = None) -> Optional[Union[Deque, Any]]:

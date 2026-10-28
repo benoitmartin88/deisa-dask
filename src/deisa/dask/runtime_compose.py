@@ -64,17 +64,18 @@ from __future__ import annotations
 import functools
 import warnings
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Sequence, Tuple
+from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
 from dask.array.reductions import mean_chunk, moment_chunk
 from deisa.dask import runtime_errors as errors
+from deisa.dask.branch import _BRANCH_KIND_PCA, _PCA_OP_NAME, _chain_branch_func, _full_fold_layer
 from deisa.dask.branch import _FULL_FOLD_FINALIZERS as _LEGACY_FULL_FOLD_FINALIZERS
-from deisa.dask.branch import _chain_branch_func, _full_fold_layer
+from deisa.dask.mergeable_pca import _build_pca_branch_func
 from deisa.dask.runtime_expr import _CHUNK_PROGRAM, ReductionExpr, eval_pointwise
 
-__all__ = ["RuntimeRequest", "compose_request", "probe_partial"]
+__all__ = ["PCARequest", "RuntimeRequest", "compose_pca_request", "compose_request", "probe_partial"]
 
 
 # -- Bridge-side callables (module level, because the request is pickled) ---------------------------------------------
@@ -230,6 +231,62 @@ def compose_request(reduction: ReductionExpr) -> RuntimeRequest:
         branch_func=functools.partial(_chain_branch_func, _chain=_build_chain(reduction)),
         axes=reduction.axes,
         finalize=reduction.finalize,
+    )
+
+
+@dataclass(frozen=True)
+class PCARequest:
+    """One dispatchable PCA branch request -- the estimator-side hook's own request type.
+
+    A PCA branch is not a reduction: its partial is a mergeable
+    :class:`~deisa.dask.mergeable_pca.PCASummary`, not a scalar/tier array, and its root-side combine is the summary
+    merge tree rather than the reduction algebra. That is why it carries its own request type instead of posing as a
+    sixth-kind ``RuntimeRequest``: the two payloads cannot be merged by the same code, so they must not be
+    indistinguishable on the wire.
+
+    - ``:param key:`` Dedup/namespace key of the payload, ``{array}-pca`` -- the same name the analyzer-driven branch
+      used, so the wire naming does not fork.
+    - ``:param input_name:`` Registered array the branch is rooted in.
+    - ``:param timestep:`` Timestep the collection was delivered for; a bridge holding another timestep refuses.
+    - ``:param kind:`` Payload kind, always the PCA branch kind.
+    - ``:param branch_func:`` ``functools.partial`` over module-level functions: ``branch_func(chunk)`` returns the
+      bridge's own mergeable ``PCASummary``.
+    - ``:param policy:`` The bridge-side axis policy the leaf must summarize under (``local_rank``, ``axis_names``,
+      ``feature_axes``, ``sample_axes``). ``n_components``/``whiten`` are deliberately absent: they are root-only and
+      the estimator that dispatched the request IS the root, so applying them here would truncate before the merge.
+    """
+
+    key: str
+    input_name: str
+    timestep: int
+    branch_func: Callable[[Any], Any]
+    policy: Mapping[str, Any]
+    kind: str = _BRANCH_KIND_PCA
+
+
+def compose_pca_request(collection: Any, policy: Optional[Mapping[str, Any]] = None) -> PCARequest:
+    """Compose the PCA branch request for one delivered collection.
+
+    The composed callable is a ``functools.partial`` over module-level functions, exactly like a reduction's: the
+    request is pickled to the bridge process, where a closure has no name to resolve.
+
+    - ``:param collection:`` The :class:`~deisa.dask.collection.DeisaCollection` (or any operand carrying ``name`` and
+      ``timestep``) the estimator was fitted on.
+    - ``:param policy:`` The estimator's bridge-side axis policy; see :class:`PCARequest`.
+    """
+    resolved = dict(policy or {})
+    return PCARequest(
+        key=f"{collection.name}-{_PCA_OP_NAME}",
+        input_name=str(collection.name),
+        timestep=int(collection.timestep),
+        branch_func=_build_pca_branch_func(
+            resolved.get("local_rank"),
+            resolved.get("axis_names"),
+            resolved.get("feature_axes"),
+            resolved.get("sample_axes"),
+        ),
+        policy=resolved,
+        kind=_BRANCH_KIND_PCA,
     )
 
 

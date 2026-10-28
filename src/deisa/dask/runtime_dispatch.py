@@ -53,19 +53,26 @@ because merging it would silently mix two timesteps of one field.
 :class:`EagerMenu` is the eager half of the transfer strategy: the six tiny scalar full folds a bridge computes once for
 its chunk, so the common scalar reduction costs no round trip. A menu value IS the payload an on-demand request for the
 same operation would return (same composed callable, same chunk), so the merge path consumes it unchanged.
+
+The same exchange carries the estimator-side PCA branch: :meth:`PlanDispatcher.compute_pca` dispatches a
+:class:`~deisa.dask.runtime_compose.PCARequest`, whose per-bridge partial is a mergeable
+:class:`~deisa.dask.mergeable_pca.PCASummary`, and merges those summaries at the root. A PCA payload cannot go through
+the reduction algebra, which is why it has its own request type and its own merge entry point.
 """
 
 from __future__ import annotations
 
+import os
 import uuid
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
 from deisa.dask import runtime_errors as errors
-from deisa.dask.branch import _SCALAR_FOLDS, _combine_two_phase
-from deisa.dask.runtime_compose import RuntimeRequest, compose_request
+from deisa.dask.branch import _BRANCH_KIND_PCA, _SCALAR_FOLDS, _combine_two_phase
+from deisa.dask.mergeable_pca import PCASummary, merge_tree
+from deisa.dask.runtime_compose import PCARequest, RuntimeRequest, compose_request
 from deisa.dask.runtime_expr import KIND_BOOLEAN, KIND_COUNT, KIND_SCALAR
 
 __all__ = [
@@ -75,12 +82,30 @@ __all__ = [
     "PlanDispatcher",
     "PlanRequest",
     "PlanResponder",
+    "RUNTIME_REDUCTION_DELIVERY_ENABLED",
     "build_eager_menu",
     "dispatch_plan_over_comm",
     "eager_menu_requests",
     "merge_partials",
+    "runtime_delivery_enabled",
     "serve_plan_requests",
 ]
+
+# Internal delivery flag of the runtime reduction path: an environment variable read ONCE at import, deliberately not a
+# user parameter. It selects the experimental delivery mode while the analyzer-driven one is still present; the default
+# is off, so nothing changes until a deployment sets it.
+RUNTIME_REDUCTION_DELIVERY_ENABLED: bool = os.environ.get("DEISA_DASK_RUNTIME_REDUCTION", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+
+def runtime_delivery_enabled() -> bool:
+    """Whether the runtime reduction delivery path is selected, read through the module so a test can flip it."""
+    return RUNTIME_REDUCTION_DELIVERY_ENABLED
+
 
 # The combine algebra ``_combine_two_phase`` is a ``dask.delayed`` function: a merge must not build a task graph, so the
 # module calls the undecorated callable the decorator preserves on ``__wrapped__`` (the ``functools`` convention dask's
@@ -110,19 +135,20 @@ EAGER_MENU_OPS: Tuple[str, ...] = ("sum", "min", "max", "mean", "var", "prod")
 # ---------------------------------------------------------------------------------------------------------------------
 @dataclass(frozen=True)
 class PlanRequest:
-    """One on-demand reduction request, addressed to every bridge that owns a chunk of ``array_name``.
+    """One on-demand branch request, addressed to every bridge that owns a chunk of ``array_name``.
 
     - ``:param request_id:`` Unique id of THIS dispatch. Every report is matched against it, so a late answer to an
       older request cannot satisfy this one.
     - ``:param array_name:`` Registered array the request is rooted in.
     - ``:param timestep:`` Timestep the bridge's chunk must belong to; a bridge holding another timestep refuses.
-    - ``:param request:`` The slim wire request (``key``, ``kind``, composed ``branch_func``, ``axes``, ``finalize``).
+    - ``:param request:`` The slim wire request (a reduction's ``RuntimeRequest`` or a ``PCARequest``: ``key``,
+      ``kind``, composed ``branch_func``, and the reduction's ``axes``/``finalize``).
     """
 
     request_id: str
     array_name: str
     timestep: int
-    request: RuntimeRequest
+    request: Union[RuntimeRequest, PCARequest]
 
 
 @dataclass(frozen=True)
@@ -173,11 +199,14 @@ def _partial_shape_dtype(value: Any) -> Tuple[Tuple[int, ...], str]:
     """Shape and dtype of the representative array inside one partial.
 
     Dict partials (``mean``/``moment``) are described by ``total`` (it always carries the reduction's output shape) or
-    by ``M`` when ``total`` is absent. Reading the shape off the value the bridge ACTUALLY produced is what keeps the
-    payload metadata from drifting away from the payload.
+    by ``M`` when ``total`` is absent. A PCA partial is described by its ``components`` array, the largest array a
+    summary carries. Reading the shape off the value the bridge ACTUALLY produced is what keeps the payload metadata
+    from drifting away from the payload.
 
     - ``:param value:`` The partial a bridge returned.
     """
+    if isinstance(value, PCASummary):
+        return _partial_shape_dtype(value.components)
     if isinstance(value, Mapping):
         for key in ("total", "M"):
             if key in value:
@@ -506,9 +535,12 @@ class PlanDispatcher:
 
     ``exchange`` is the only transport knob: it takes one :class:`PlanRequest` and returns the reports every bridge
     produced for it. Keeping it a callable means this class owns no communicator dialect -- the same dispatcher is
-    driven over the array's sub-comm in production and over a test communicator in the suite.
+    driven over the array's sub-comm in production and over a test communicator in the suite. It may be ``None``: a
+    delivery that attaches the eager menu but no transport still serves every menu operation, and refuses the rest
+    with the no-transport refusal instead of gathering anything.
 
-    - ``:param exchange:`` Callable performing one request/reports round trip.
+    - ``:param exchange:`` Callable performing one request/reports round trip, or ``None`` when the delivery has no
+      bridge transport.
     - ``:param bridge_count:`` Number of bridges that own a chunk of the array, when known. A round that returns another
       number of reports is refused: a missing partial would silently shrink the merged value.
     - ``:param menu:`` Optional eager menus already computed for the current timestep. A full fold of a menu operation
@@ -517,7 +549,7 @@ class PlanDispatcher:
 
     def __init__(
         self,
-        exchange: Callable[[PlanRequest], Sequence[PartialReport]],
+        exchange: Optional[Callable[[PlanRequest], Sequence[PartialReport]]] = None,
         bridge_count: Optional[int] = None,
         menu: Optional[Sequence[EagerMenu]] = None,
     ) -> None:
@@ -550,7 +582,7 @@ class PlanDispatcher:
                 timestep=reduction.root.timestep,
                 request=request,
             )
-            reports = _validate_reports(plan, self._exchange(plan), expected=self._bridge_count)
+            reports = self._reports_for(plan)
         return _finish(
             merge_partials(
                 reports,
@@ -561,6 +593,49 @@ class PlanDispatcher:
                 finalize=request.finalize,
             )
         )
+
+    def compute_pca(self, request: PCARequest) -> PCASummary:
+        """Dispatch one PCA branch request and merge the per-bridge summaries into the root summary.
+
+        The bridge side runs the same module-level leaf a filed PCA branch runs, so each report carries a mergeable
+        ``PCASummary`` -- ``(rank, d)`` components and ``(d,)`` mean, never a chunk. The root merge is the balanced
+        pairwise tree the standalone estimator uses (``merge_pca`` is associative), so this path and a single-machine
+        fit agree by construction rather than by reimplementation. ``n_components``/``whiten`` are NOT applied here:
+        the estimator that dispatched the request is the root and applies them when it adopts the summary.
+
+        - ``:param request:`` The composed :class:`~deisa.dask.runtime_compose.PCARequest`.
+        """
+        if getattr(request, "kind", None) != _BRANCH_KIND_PCA:
+            raise errors.precompute_runtime_invariant(
+                "PlanDispatcher",
+                f"a PCA dispatch needs a PCA request, got kind {getattr(request, 'kind', None)!r}",
+            )
+        plan = PlanRequest(
+            request_id=uuid.uuid4().hex,
+            array_name=request.input_name,
+            timestep=int(request.timestep),
+            request=request,
+        )
+        reports = self._reports_for(plan)
+        for report in reports:
+            if not isinstance(report.partial, PCASummary):
+                raise errors.precompute_runtime_invariant(
+                    "PlanDispatcher",
+                    f"bridge {report.rank} answered the PCA branch {request.key!r} with a "
+                    f"{type(report.partial).__name__}; only a mergeable summary can be merged",
+                )
+        return merge_tree([report.partial for report in reports])
+
+    def _reports_for(self, plan: PlanRequest) -> List[PartialReport]:
+        """One exchange round for ``plan``, or the no-transport refusal when this delivery carries no way to ask.
+
+        - ``:param plan:`` The request to send to the bridges.
+        """
+        if self._exchange is None:
+            raise errors.no_dispatch_transport(
+                f"the on-demand request {plan.request.key!r} for array {plan.array_name!r} at timestep {plan.timestep}"
+            )
+        return _validate_reports(plan, self._exchange(plan), expected=self._bridge_count)
 
     def _menu_reports(self, menus: Sequence[EagerMenu], op_name: str) -> List[PartialReport]:
         """Turn every bridge's ``op_name`` menu value into the report the on-demand path would have produced.

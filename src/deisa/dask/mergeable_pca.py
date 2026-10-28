@@ -909,6 +909,9 @@ class MergeablePCA:
         - A **delivered** array (one carrying ``_deisa_pca_summary``, i.e. the per-bridge dispatch view deisa-dask
           hands a callback when the local PCA ran on the MPI bridge) takes :meth:`_fit_delivered`. The merge tree
           over the per-bridge summaries has already run; this only adopts the root summary.
+        - A **runtime collection** (a DEISA callback's window entry, which carries no data) takes
+          :meth:`_fit_runtime_collection`: it dispatches a PCA branch request to the bridges, merges their summaries
+          at the root and adopts the result through the same :meth:`_fit_delivered`.
         - A **dask array** is fitted through :meth:`_fit_dask_delayed` / :meth:`_fit_dask`.
         - A **numpy array** takes the in-memory path, the single-leaf base case of the same tree.
 
@@ -923,6 +926,8 @@ class MergeablePCA:
         delivered = getattr(X, "_deisa_pca_summary", None)
         if delivered is not None:
             return self._fit_delivered(delivered, X)
+        if self._is_runtime_collection(X):
+            return self._fit_runtime_collection(X)
 
         array = X if isinstance(X, da.Array) else da.asarray(X)
         flat = self._as_2d(array)
@@ -948,6 +953,61 @@ class MergeablePCA:
             summary = local_pca(np.asarray(flat), rank=self.local_rank)
 
         return self._adopt_summary(summary, n_features)
+
+    @staticmethod
+    def _is_runtime_collection(X) -> bool:
+        """Whether ``X`` is a DEISA runtime collection, i.e. a data-free operand the delivery path handed a callback.
+
+        The import is deferred because :mod:`deisa.dask.collection` is downstream of this module's import chain
+        (``collection`` pulls ``runtime_errors``, which pulls ``precompute_analyzer``, which imports this module), so a
+        module-level import would close the cycle. The check is an ``isinstance`` against that class rather than a duck
+        check on attributes: ``DeisaCollection`` is the only operand the delivery produces, and a false positive here
+        would dispatch a PCA branch for something a bridge never described.
+
+        - ``:param X:`` The object a callback passed to :meth:`fit`.
+        """
+        from deisa.dask.collection import DeisaCollection
+
+        return isinstance(X, DeisaCollection)
+
+    def _bridge_policy(self) -> dict:
+        """The bridge-side axis policy this estimator summarizes under.
+
+        Only the fields that change the LEAF result belong here. ``n_components`` and ``whiten`` are deliberately
+        absent: they are root-only, and the estimator that dispatches the request is the root, so shipping them would
+        truncate or whiten before the merge and destroy mergeability.
+        """
+        return {
+            "local_rank": self.local_rank,
+            "axis_names": self.axis_names,
+            "feature_axes": self.feature_axes,
+            "sample_axes": self.sample_axes,
+        }
+
+    def _fit_runtime_collection(self, collection) -> MergeablePCA:
+        """Fit on a delivered collection: dispatch the PCA branch, merge the summaries at the root, adopt the result.
+
+        This is the in-situ placement for the runtime reduction path, and it is the only complete route through
+        :meth:`fit` for a collection -- a collection carries no data, so there is no local fallback. Without a bridge
+        transport the fit refuses with the no-transport refusal (the remedy is the legacy ``precompute=False``
+        delivery) instead of gathering anything.
+
+        End to end: the request travels as a module-level ``functools.partial`` (a closure would not survive the
+        bridge process boundary), each bridge summarizes its OWN chunk with the same leaf the standalone estimator
+        uses, and :meth:`PlanDispatcher.compute_pca` merges those summaries with the balanced pairwise tree. Nothing
+        chunk-shaped crosses the boundary.
+
+        - ``:param collection:`` The :class:`~deisa.dask.collection.DeisaCollection` a callback received.
+        """
+        from deisa.dask import runtime_errors as errors
+        from deisa.dask.runtime_compose import compose_pca_request
+
+        dispatcher = collection.dispatcher
+        if dispatcher is None:
+            raise errors.no_dispatch_transport(f"the PCA fit on {collection.name!r} at timestep {collection.timestep}")
+        request = compose_pca_request(collection, self._bridge_policy())
+        summary = dispatcher.compute_pca(request)
+        return self._fit_delivered(summary, collection)
 
     def _adopt_summary(self, summary: PCASummary, n_features: int) -> MergeablePCA:
         """Install a merged root summary as this estimator's state, after the two guards, and return ``self``.

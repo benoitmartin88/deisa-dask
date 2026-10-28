@@ -27,13 +27,40 @@
 # POSSIBILITY OF SUCH DAMAGE.
 # =============================================================================
 
+"""
+The analytics-host side of deisa-dask: callback registration, the per-array topic handlers that deliver data to the
+callbacks, and the cycle boundary (``execute_callbacks``).
+
+Two delivery modes exist and the internal runtime flag selects between them for ``precompute=True`` callbacks:
+
+- **runtime reduction delivery** (the internal ``DEISA_DASK_RUNTIME_REDUCTION`` flag on, read once at import by
+  :func:`deisa.dask.runtime_dispatch.runtime_delivery_enabled`): the callback receives one
+  :class:`~deisa.dask.collection.DeisaCollection` per (registered array, timestep) instead of an array. The collection
+  is not a dask collection and carries no data -- it exposes the closed reduction surface and dispatches each
+  ``.compute()`` to the bridges, which reduce their OWN chunk. The bridges' eager scalar menu and the on-demand plan
+  round both arrive through the topic event and the array transport attached to the delivery.
+- **legacy delivery** (flag off, and every ``precompute=False`` callback): unchanged. ``precompute=False`` keeps
+  meaning the legacy full-chunk scatter -- the chunk itself reaches the workers, which is the remedy every refusal
+  message points at.
+
+Window semantics under runtime delivery: the callback's argument is an ordinary Python list with one entry per array,
+so ``window[-1]`` is list indexing and delivers the current timestep's collection and ``window[-2]`` the previous
+one. A callback written against the old stub model that indexed the ARGUMENT as if it were the array (``def cb(a):
+return a[-1].sum()``) therefore keeps working and now reads ``a[-1]`` as "the latest timestep" -- the runtime reading,
+which is what the stub model was approximating. Anyone who needs the old array reading uses ``precompute=False``.
+
+Every refusal raised from a callback's ``.compute()`` fails the RUN (see ``_handle_callback_exception``) instead of
+degrading into a logged error: a callback that reads raw data must stop the simulation once, not silently read the
+wrong thing on every later timestep.
+"""
+
 import asyncio
 import collections
 import logging
 import threading
 import time
 import weakref
-from typing import Any, Callable, Collection, Dict, List, Literal, Optional, Set, Tuple
+from typing import Any, Callable, Collection, Dict, List, Literal, Mapping, Optional, Set, Tuple
 
 import numpy as np
 from deisa.core import CallbackArgs, DeisaArray, Window
@@ -48,6 +75,7 @@ from deisa.dask.branch import (
     _combine_pca_summaries,
     merge_branches,
 )
+from deisa.dask.collection import DeisaCollection
 from deisa.dask.constants import (
     CALLBACK_PREFIX,
     CLIENT_KEY,
@@ -62,9 +90,23 @@ from deisa.dask.precompute_analyzer import (
     PrecomputeRuntimeError,
     UnsupportedReductionError,
 )
+from deisa.dask.runtime_dispatch import EagerMenu, PlanDispatcher, runtime_delivery_enabled
+from deisa.dask.runtime_errors import RuntimeRefusal
 from deisa.dask.utils import _PrecomputedDeisaArray, build_deisa_array, get_client, make_precomputed_view  # noqa: F401
 
 logger = logging.getLogger(__name__)
+
+
+def _is_run_aborting(ex: BaseException) -> bool:
+    """Whether ``ex`` is a runtime refusal, i.e. a callback failure that must FAIL THE RUN rather than be logged.
+
+    Every refusal in :mod:`deisa.dask.runtime_errors` means the delivery path cannot serve what the callback asked for
+    (a raw read, a numpy materialization, an off-surface or non-associative reduction, a bridge-side invariant
+    violation). Continuing would deliver a wrong value on every later timestep, so the run stops once instead. The
+    check lives in this module-level predicate -- and not inline -- so a test can disable it and prove the abort test
+    can fail.
+    """
+    return isinstance(ex, RuntimeRefusal)
 
 
 class Deisa(IDeisa):
@@ -112,6 +154,13 @@ class Deisa(IDeisa):
         # callback_id -> array_name -> ordered [(output_key, op_name, axis_sig, kind)] recorded at registration; the
         # topic handler builds the per-callback dispatch view from these descriptors.
         self._callback_reductions: Dict[Deisa.Callback_id, Dict[str, List[Tuple[str, str, Tuple[int, ...], str]]]] = {}
+        # array_name -> exchange callable of the runtime reduction path (one request/reports round trip over the
+        # array's sub-comm). Internal, never a user parameter: the delivery attaches the collection's compute boundary
+        # from here, and an array without an entry still serves its eager menu and refuses the rest.
+        self._runtime_transports: Dict[str, Callable[[Any], Any]] = {}
+        # First runtime refusal a callback raised; ``execute_callbacks`` re-raises it so the run fails instead of
+        # logging once per timestep. None while the run is healthy.
+        self._run_failure: Optional[BaseException] = None
 
     def __del__(self):
         try:
@@ -488,6 +537,14 @@ class Deisa(IDeisa):
 
         logger.info("execute_callbacks() done")
 
+        # A refused callback failed the run: raise it here, at the cycle boundary the caller already blocks on, instead
+        # of letting the simulation continue with a callback that can never deliver a correct value. Cleared first so a
+        # caller that catches it can drive a fresh cycle (the offending callback is already unregistered).
+        failure = getattr(self, "_run_failure", None)
+        if failure is not None:
+            self._run_failure = None
+            raise failure
+
     def _make_topic_handler(self, array_name):
         # use a weak reference to avoid circular references.
         weak_self = weakref.ref(self)
@@ -509,7 +566,13 @@ class Deisa(IDeisa):
                 _weak_self.__update_futures_ownership(futures)
 
                 precomputed = payload.get("precomputed")
-                if precomputed:
+                if precomputed and runtime_delivery_enabled():
+                    # Runtime reduction delivery: the callback gets one lazily-reducible collection per array and
+                    # timestep. Nothing is combined and nothing is persisted here -- the collection carries no data,
+                    # so there is no combined array to keep alive; its reductions either read the eager menu the
+                    # bridges shipped with this event or dispatch an on-demand plan.
+                    views = _weak_self._runtime_views(array_name, iteration, payload)
+                elif precomputed:
                     # Precompute path: one ``futures`` entry per (bridge, reduction); group by ``output_key`` and
                     # dispatch on kind:
                     # - scalar FULL: ``da.stack`` partials; the callback's reduction combines them via dask's graph.
@@ -743,6 +806,39 @@ class Deisa(IDeisa):
         shape = (1,) * ndim
         return da.zeros(shape, chunks=shape, dtype=np.float64, name=f"deisa-pca-carrier-{array_name}")
 
+    def _runtime_views(self, array_name: str, iteration: int, payload: Mapping[str, Any]) -> Dict[Any, Any]:
+        """Build the runtime delivery view of one array for one timestep: the same collection for every callback.
+
+        One collection per (array, timestep) is safe to share because it is immutable metadata: what a callback does
+        with it builds its own reduction objects, and every one of them dispatches through the compute boundary
+        attached here.
+
+        - ``:param array_name:`` Registered array the topic event is for.
+        - ``:param iteration:`` Timestep the event delivered.
+        - ``:param payload:`` The topic event, read for the bridges' eager menus.
+        """
+        collection = self._runtime_collection(array_name, iteration, payload.get("menu"))
+        return {callback_id: collection for callback_id in list(self._callbacks_by_array.get(array_name, ()))}
+
+    def _runtime_collection(self, array_name: str, iteration: int, menus: Any = None) -> DeisaCollection:
+        """Build the collection a callback receives for ``array_name`` at ``iteration``.
+
+        The compute boundary is attached here and nowhere else. It carries the bridges' eager menu, so a scalar full
+        fold costs no round trip, and the array's transport, so anything else can dispatch on demand. Without a
+        transport the menu still serves, and a menu miss refuses with the no-transport refusal -- never a gather.
+
+        - ``:param array_name:`` Registered array the collection describes.
+        - ``:param iteration:`` Timestep the collection is delivered for.
+        - ``:param menus:`` The eager menu entries the bridges shipped with this event (one per bridge), if any.
+        """
+        metadata = self.arrays_metadata.get(array_name, {})
+        dispatcher = PlanDispatcher(
+            self._runtime_transports.get(array_name),
+            bridge_count=_grid_size_from_metadata(metadata),
+            menu=_as_eager_menus(menus),
+        )
+        return DeisaCollection.from_metadata(array_name, iteration, metadata, dispatcher=dispatcher)
+
     def _process_callback(self, callback_id, cb_data, array_name: str, darr: da.Array | DeisaArray, iteration: int):
         state = cb_data["state"]
 
@@ -754,7 +850,9 @@ class Deisa(IDeisa):
                 f"{iteration} which is before last seen iteration "
                 f"{entry['last_iteration']}. Iterations must be monotonically increasing."
             )
-        entry["window"].append(darr if isinstance(darr, DeisaArray) else build_deisa_array(darr, iteration))
+        entry["window"].append(
+            darr if isinstance(darr, (DeisaArray, DeisaCollection)) else build_deisa_array(darr, iteration)
+        )
         entry["changed"] = True
         entry["last_iteration"] = iteration
 
@@ -805,6 +903,21 @@ class Deisa(IDeisa):
                     state[name]["changed"] = False
 
     def _handle_callback_exception(self, callback_id, cb_data, ex):
+        """Route a callback failure: a runtime refusal FAILS THE RUN, anything else goes to the user's handler.
+
+        The refusal branch is first and is not negotiable by an exception handler. A refusal means the callback asked
+        for something the reduction path cannot serve -- a raw read, a numpy materialization, an off-surface or
+        non-associative reduction, a bridge/merge invariant violation -- and the old behaviour (log it and keep the
+        callback registered) turned one loud refusal into a wrong value per timestep. So the callback is unregistered
+        (never retried) and the failure is recorded for ``execute_callbacks`` to raise.
+
+        - ``:param callback_id:`` The callback that raised.
+        - ``:param cb_data:`` Its registration payload, read for the user's exception handler.
+        - ``:param ex:`` The exception the callback raised.
+        """
+        if _is_run_aborting(ex):
+            self._abort_run(callback_id, ex)
+            return
         try:
             handler = cb_data["exception_handler"]
             if handler:
@@ -812,6 +925,19 @@ class Deisa(IDeisa):
         except BaseException:
             logger.info(f"Exception in exception handler. Unregistering callback_id={callback_id}")
             self.unregister_callback(callback_id)
+
+    def _abort_run(self, callback_id, ex: BaseException) -> None:
+        """Record ``ex`` as the run failure and detach the offending callback, so the run ends at the cycle boundary.
+
+        The first refusal wins: a later one is almost always the same callback failing again on a later timestep.
+
+        - ``:param callback_id:`` The callback that was refused.
+        - ``:param ex:`` The refusal.
+        """
+        if getattr(self, "_run_failure", None) is None:
+            self._run_failure = ex
+        logger.error(f"callback_id={callback_id} was refused, failing the run: {ex}")
+        self.unregister_callback(callback_id)
 
     def __update_futures_ownership(self, futures: Collection[Any]):
         keys = [p["future"].key for p in futures]
@@ -916,6 +1042,20 @@ class Deisa(IDeisa):
     @staticmethod
     def make_topic(arrays, when) -> str:
         return f"{when}|" + "|".join(sorted(arrays))
+
+
+def _as_eager_menus(menus: Any) -> List[EagerMenu]:
+    """Normalize the topic event's menu entries into :class:`EagerMenu` objects.
+
+    The bridges ship ``EagerMenu`` instances, but a transport is free to serialize them as plain mappings, so both
+    shapes are accepted here instead of at every call site.
+
+    - ``:param menus:`` The event's ``menu`` entry: ``None``, or a sequence of ``EagerMenu``/mapping entries.
+    """
+    normalized: List[EagerMenu] = []
+    for entry in menus or ():
+        normalized.append(entry if isinstance(entry, EagerMenu) else EagerMenu(**dict(entry)))
+    return normalized
 
 
 def _grid_extent_from_metadata(metadata: Dict[str, Any]) -> Optional[Tuple[int, ...]]:
