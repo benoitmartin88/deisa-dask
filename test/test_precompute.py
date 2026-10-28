@@ -42,6 +42,11 @@ is the SAME spec -- same op name, same reduction axes, same payload kind, same f
 the oracle for that comparison until it is deleted; the literal expectations asserted next to it are what survives the
 deletion.
 
+The suite keeps the dimensionality the analyzer served, including the 5-D gysela workload that motivated the design
+(``test_gysela_density_helper_plans_the_5d_axis_tuple_and_delivers_the_value`` and
+``test_gysela_measure_helper_loop_reduces_five_expressions_per_species``): those are the only fixtures that reduce an
+array with ``ndim > 2``, which is why they cannot be dropped as redundant with the 2-D axis fixtures.
+
 Refusals are pinned against the RUNTIME taxonomy (``deisa.dask.runtime_errors``), which is the one a callback now
 meets. One classification is deliberately DIFFERENT from the analyzer's and is pinned as such: a non-associative
 reduction (``argmax``/``argmin``/``median``/``quantile``/``percentile``) is refused as
@@ -81,8 +86,10 @@ from utils import (
 )
 
 from deisa.dask import runtime_errors as errors
+from deisa.dask.collection import DeisaCollection
 from deisa.dask.deisa import Deisa
 from deisa.dask.runtime_compose import RuntimeRequest
+from deisa.dask.runtime_dispatch import PlanDispatcher, PlanResponder
 
 # The chunk every branch callable is exercised on: mixed signs, so max/min/mean/var distinguish the ops.
 CHUNK = np.arange(16.0).reshape(4, 4) - 8.0
@@ -679,6 +686,168 @@ def test_derived_reduction_delivers_the_value_the_analyzer_refused() -> None:
     collection = _dispatched(FIELD)
     assert np.isclose(float((collection * collection).sum().compute()), float(np.sum(FIELD**2)))
     assert np.isclose(float((collection * 2).mean().compute()), float(np.mean(FIELD * 2)))
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# The gysela 5-D surface: the workload the redesign was motivated by, restored on the runtime spelling
+# ---------------------------------------------------------------------------------------------------------------------
+# The analyzer-era suite had two fixtures on the gysela shapes (``fdistribu`` is a 5-D distribution function, and
+# ``density()``/``measure()`` reduce velocity and space axes out of it). The port dropped both, which left the suite
+# with no reduction of an array whose ``ndim > 2`` at all -- the axis fixtures it kept are 2-D. These two restore it on
+# the RUNTIME closed surface: no ``da.sum``, no ``client.compute``, and the grid constants (``dvx * dvy``, the velocity
+# weights, ``dV_4D``) scale the DELIVERED value instead of being folded into the branch -- the same rewrite
+# ``test_scaled_reduction_is_refused_and_the_delivered_value_scales_instead`` pins as the migration rule for these very
+# helpers.
+GYSELA_META = {"f": {"global_shape": (4, 5, 10, 10, 10), "chunk_shape": (1, 5, 5, 5, 5)}}
+GYSELA_CHUNK_SHAPE = (1, 5, 5, 5, 5)
+# One chunk per tile: ``global // chunk`` per data axis, i.e. 32 bridges -- the workload's real grid, not a shortcut.
+GYSELA_GRID = (4, 1, 2, 2, 2)
+
+
+def _gysela_tiles(field, chunk_shape=GYSELA_CHUNK_SHAPE):
+    """``(chunk_position, tile)`` for every chunk of the tiled 5-D field."""
+    grid = tuple(size // chunk for size, chunk in zip(field.shape, chunk_shape))
+    assert grid == GYSELA_GRID, f"the fixture's grid is {grid}, not {GYSELA_GRID}"
+    tiles = []
+    for position in np.ndindex(*grid):
+        slices = tuple(slice(index * chunk, (index + 1) * chunk) for index, chunk in zip(position, chunk_shape))
+        tiles.append((position, field[slices]))
+    return tiles
+
+
+class _RecordingPlanDispatcher:
+    """The production dispatcher, recording every reduction a helper computes.
+
+    A multi-reduction helper reduces to plain values before it returns, so the reductions are only enumerable at the
+    compute boundary; this records them while delegating the delivery itself (value, merge, refusals) to the real
+    :class:`~deisa.dask.runtime_dispatch.PlanDispatcher`.
+    """
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+        self.reductions = []
+
+    def compute(self, reduction):
+        """- ``:param reduction:`` The reduction the callback computed."""
+        self.reductions.append(reduction)
+        return self._inner.compute(reduction)
+
+
+def _gysela_delivery(field, name="f"):
+    """A 5-D collection delivered from ``field``: every tile answered by the production responder and merge.
+
+    The returned boundary is the recording wrapper, so a caller can enumerate what a multi-reduction helper computed.
+    """
+    tiles = _gysela_tiles(field)
+    meta = {name: {"global_shape": field.shape, "chunk_shape": GYSELA_CHUNK_SHAPE}}
+
+    def exchange(plan):
+        return [
+            PlanResponder(name, 0, tile, rank=rank, chunk_position=position).respond(plan)
+            for rank, (position, tile) in enumerate(tiles)
+        ]
+
+    dispatcher = _RecordingPlanDispatcher(PlanDispatcher(exchange, bridge_count=len(tiles)))
+    return DeisaCollection.from_metadata(name, 0, meta[name], dispatcher=dispatcher), dispatcher
+
+
+def test_gysela_density_helper_plans_the_5d_axis_tuple_and_delivers_the_value() -> None:
+    """``density(f, grid) = sum(f, axis=(0, 3, 4)) * dvx * dvy`` on the 5-D gysela grid.
+
+    The analyzer-era ``test_gysela_density_helper`` asserted the hint key. The runtime is strictly better on this body:
+    the analyzer REFUSED it (``axes=()`` with ``deliver_direct=False``, so its callable would have folded the raw chunk
+    and dropped the axis tuple), while the runtime plans ``(0, 3, 4)`` exactly -- which is why the partial is 200 B
+    where the chunk is 5000 B. The literals are therefore the contract here instead of an ``_assert_spec_equivalent``
+    comparison: that harness skips the behavior half for a fixture the analyzer refused, and the axis tuple it would
+    compare against does not exist in the oracle.
+    """
+    from deisa.dask.runtime_compose import probe_partial
+
+    body = "s = arr.sum(axis=(0, 3, 4))\ns.compute()"
+    oracle = _analyze(body, meta=GYSELA_META)
+    assert [(spec.reduction_axes, spec.deliver_direct) for spec in oracle] == [((), False)], (
+        "the analyzer refused the 5-D axis tuple; these literals are what the runtime must keep serving"
+    )
+
+    _, requests, _ = _run_callback(body, meta=GYSELA_META)
+    assert len(requests) == 1
+    request = requests[0]
+    assert request.key == "f-sum-axis0x3x4"
+    assert request.axes == (0, 3, 4)
+    assert request.kind == "scalar"
+    assert request.finalize is None
+
+    chunk = np.random.default_rng(11).normal(size=GYSELA_CHUNK_SHAPE)
+    assert probe_partial(request, chunk.shape, chunk.dtype) == ((1, 5, 5, 1, 1), "float64")
+    # The partial keeps the two velocity/space axes the tuple does NOT reduce: 25 numbers instead of the chunk's 125.
+    assert int(np.prod((1, 5, 5, 1, 1))) * np.dtype(np.float64).itemsize == 200
+    assert chunk.nbytes == 5000
+    assert np.allclose(np.asarray(request.branch_func(chunk)), np.sum(chunk, axis=(0, 3, 4), keepdims=True))
+
+    field = np.random.default_rng(13).normal(size=GYSELA_META["f"]["global_shape"])
+    collection, _ = _gysela_delivery(field)
+    delivered = collection.sum(axis=(0, 3, 4)).compute()
+    truth = np.sum(field, axis=(0, 3, 4))
+    assert np.shape(delivered) == truth.shape, f"delivered {np.shape(delivered)}, truth {truth.shape}"
+    assert np.allclose(np.asarray(delivered), truth, rtol=1e-12, atol=1e-12)
+
+
+def test_gysela_measure_helper_loop_reduces_five_expressions_per_species() -> None:
+    """``measure()`` in the runtime spelling: five full reductions per species, on the same 5-D grid.
+
+    The analyzer-era fixture only asserted "at least five ``sum`` hints". This one asserts the VALUE of each quantity,
+    so a program attached to the wrong reduction cannot hide behind a count: ``f``, ``f**2``, ``f*vx``, ``f*vy`` and
+    ``f*v2`` are five separate requests, each folding its own program on every bridge's chunk. The grid constants
+    (``vx``/``vy``/``v2`` here, ``dvx``/``dvy``/``dV_4D`` in gysela) are applied to the DELIVERED value, which is the
+    closed-surface rewrite of ``da.sum(f * vx) * dV``.
+
+    The wire keys do NOT distinguish the five: a key names the array, the operator and the reduced axes, never the
+    pointwise program (``ReductionExpr.key``), so the four derived folds share ``-axisall`` and one pass has TWO
+    distinct keys. What is five-fold is the number of requests and of programs -- the value assertions below prove none
+    of them was collapsed into another (``f*v2`` alone is 13x the identity's value).
+
+    The constants are 0-d on purpose: a pointwise constant is validated against the GLOBAL shape but evaluated on each
+    bridge's CHUNK, so a per-axis velocity grid cannot be broadcast on a distributed axis (a global ``(10,)`` does not
+    fit a five-wide chunk). 0-d weights are the chunk-safe spelling of the same rewrite.
+    """
+    vx, vy = 2.0, 3.0
+    v2 = vx**2 + vy**2
+    dvx, dvy = 0.5, 0.5
+    dV = dvx * dvy
+
+    def measure(collection, vx, vy, v2, dV):
+        """The gysela ``measure()`` helper, closed-surface spelling: one full fold per quantity."""
+        return {
+            "ms": collection.sum().compute() * dV,
+            "l2": (collection**2).sum().compute() * dV,
+            "mx": (collection * vx).sum().compute() * dV,
+            "my": (collection * vy).sum().compute() * dV,
+            "ek": 0.5 * (collection * v2).sum().compute() * dV,
+        }
+
+    for species, seed in (("f1", 21), ("f2", 22)):
+        field = np.random.default_rng(seed).normal(size=GYSELA_META["f"]["global_shape"])
+        collection, dispatcher = _gysela_delivery(field, name=species)
+        values = measure(collection, vx, vy, v2, dV)
+
+        assert len(dispatcher.reductions) == 5, "one request per quantity, five quantities per species"
+        assert [reduction.op_name for reduction in dispatcher.reductions] == ["sum"] * 5
+        assert [reduction.key for reduction in dispatcher.reductions] == [f"{species}-sum"] + [
+            f"{species}-sum-axisall"
+        ] * 4
+        assert len({reduction.key for reduction in dispatcher.reductions}) == 2
+
+        truth = {
+            "ms": np.sum(field) * dV,
+            "l2": np.sum(field**2) * dV,
+            "mx": np.sum(field * vx) * dV,
+            "my": np.sum(field * vy) * dV,
+            "ek": 0.5 * np.sum(field * v2) * dV,
+        }
+        for quantity, expected in truth.items():
+            assert np.isclose(float(values[quantity]), float(expected), rtol=1e-12, atol=1e-12), (
+                f"species {species}: {quantity} = {values[quantity]}, expected {expected}"
+            )
 
 
 # ---------------------------------------------------------------------------------------------------------------------
