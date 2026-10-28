@@ -55,6 +55,7 @@ from deisa.dask import runtime_errors as errors
 from deisa.dask.bridge import Bridge
 from deisa.dask.collection import DeisaCollection
 from deisa.dask.deisa import Deisa
+from deisa.dask.handshake import Handshake
 from deisa.dask.mergeable_pca import MergeablePCA, PCASummary
 from deisa.dask.runtime_compose import PCARequest, compose_request
 from deisa.dask.runtime_dispatch import (
@@ -184,6 +185,29 @@ def fleets():
 # ---------------------------------------------------------------------------------------------------------------------
 # Harness: the analytics host without a cluster
 # ---------------------------------------------------------------------------------------------------------------------
+class _LoopShim:
+    """The slice of the Tornado loop surface ``distributed.Future`` touches when it is released.
+
+    ``Future.release`` calls ``client.loop.add_callback(client._dec_ref, key)``. The test loop is a plain asyncio loop
+    with no ``add_callback``, so every future a delivered event created raised ``AttributeError`` out of ``__del__`` at
+    teardown -- an unraisable exception warning in the two tests that now carry a full-chunk payload.
+    """
+
+    def __init__(self, loop):
+        self._loop = loop
+
+    def add_callback(self, fn, *args, **kwargs):
+        """- ``:param fn:`` The callback the client wanted scheduled."""
+        fn(*args, **kwargs)
+
+    def run_until_complete(self, awaitable):
+        """- ``:param awaitable:`` The coroutine ``Client.sync`` would run."""
+        return self._loop.run_until_complete(awaitable)
+
+    def close(self):
+        self._loop.close()
+
+
 class _LoopClient:
     """The host-side client calls the topic handler and ``execute_callbacks`` make, on one persistent loop.
 
@@ -192,10 +216,21 @@ class _LoopClient:
     """
 
     def __init__(self):
-        self.loop = asyncio.new_event_loop()
+        self.loop = _LoopShim(asyncio.new_event_loop())
         self.desired_keys = []
         self.persisted = []
+        self.subscribed = []
+        self.futures = {}
+        self.generation = 0
         self.id = "fake-analytics-host"
+
+    def _inc_ref(self, key):  # noqa: D102
+        # ``distributed.Future`` registers its key through the client; this one never tracks state.
+        pass
+
+    def _dec_ref(self, key):  # noqa: D102
+        # Symmetric with ``_inc_ref``: releasing a future of this client is a no-op.
+        pass
 
     def _send_to_scheduler(self, payload):  # noqa: D102
         self.desired_keys.append(payload)
@@ -213,6 +248,9 @@ class _LoopClient:
             return self.loop.run_until_complete(result)
         return result
 
+    def subscribe_topic(self, name, handler):  # noqa: D102
+        self.subscribed.append((name, handler))
+
     def close(self):  # noqa: D102
         self.loop.close()
 
@@ -223,6 +261,7 @@ class _FakeHandshake:
     def __init__(self):
         self.branches = {}
         self.runtime_arrays = set()
+        self.legacy_arrays = set()
         self.finished = 0
 
     def set_task_branches(self, array_name, hints):  # noqa: D102
@@ -230,6 +269,9 @@ class _FakeHandshake:
 
     def set_runtime_arrays(self, array_names):  # noqa: D102
         self.runtime_arrays = set(array_names)
+
+    def set_legacy_arrays(self, array_names):  # noqa: D102
+        self.legacy_arrays = set(array_names)
 
     def wait_for_bridges_to_finish(self):  # noqa: D102
         self.finished += 1
@@ -276,6 +318,7 @@ def make_deisa(fleets, client, monkeypatch):
     deisa._callback_seq = 0
     deisa._branch_groups = {}
     deisa._runtime_arrays = set()
+    deisa._legacy_arrays = set()
     deisa._tasks = set()
     deisa._execute_callbacks_called = False
     deisa._runtime_transports = {ARRAY_NAME: fleets.exchange}
@@ -301,6 +344,8 @@ def register(deisa, callback, window_size=2, when="OR", exception_handler=None, 
     deisa._callbacks_by_array.setdefault(ARRAY_NAME, set()).add(callback_id)
     if precompute:
         deisa._runtime_arrays.add(ARRAY_NAME)
+    else:
+        deisa._legacy_arrays.add(ARRAY_NAME)
     return callback_id
 
 
@@ -312,11 +357,15 @@ async def _drain(tasks, timeout=20.0):
     assert not tasks, "a callback task never finished"
 
 
-def deliver(deisa, timestep, menus, menu_error=None):
-    """Hand the topic event for ``timestep`` to the real handler, then drain the callback tasks it spawned."""
+def deliver(deisa, timestep, menus, menu_error=None, futures=()):
+    """Hand the topic event for ``timestep`` to the real handler, then drain the callback tasks it spawned.
+
+    ``futures`` is the event's data payload: empty for a runtime delivery (the menu is the payload), one full-chunk
+    entry per bridge for a legacy scatter.
+    """
     payload = {
         "iteration": timestep,
-        "futures": [],
+        "futures": list(futures),
         "menu": menus,
     }
     if menu_error is not None:
@@ -324,6 +373,17 @@ def deliver(deisa, timestep, menus, menu_error=None):
     handler = deisa._topic_handlers[ARRAY_NAME]
     deisa.client.sync(lambda: handler((None, payload)))
     deisa.client.sync(lambda: _drain(deisa._tasks))
+
+
+def full_chunk_futures(shape=CHUNK_SHAPE):
+    """The data payload a legacy full-chunk scatter produces: one future per bridge, with that bridge's chunk shape.
+
+    - ``:param shape:`` The per-bridge chunk shape the bridge shipped.
+    """
+    return [
+        {"future": f"full-chunk-{rank}", "shape": shape, "dtype": "float64", "chunk_position": chunk_position(rank)}
+        for rank in range(2)
+    ]
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -652,7 +712,7 @@ def test_precompute_false_still_receives_the_full_chunk(fleets, client, monkeypa
 
     register(deisa, callback, precompute=False)
     assert deisa._runtime_arrays == set(), "a full-chunk callback declares no runtime-delivery array"
-    deliver(deisa, 0, fleets.menus(0))
+    deliver(deisa, 0, fleets.menus(0), futures=full_chunk_futures())
 
     assert len(received) == 1
     assert isinstance(received[0], DeisaArray)
@@ -679,11 +739,135 @@ def test_one_event_serves_both_delivery_modes(fleets, client, monkeypatch):
 
     register(deisa, runtime_callback)
     register(deisa, full_chunk_callback, precompute=False)
-    deliver(deisa, 0, fleets.menus(0))
+    deliver(deisa, 0, fleets.menus(0), futures=full_chunk_futures())
 
     assert len(collections_seen) == 1 and isinstance(collections_seen[0], DeisaCollection)
     assert len(arrays_seen) == 1 and isinstance(arrays_seen[0], DeisaArray)
     assert not isinstance(arrays_seen[0], DeisaCollection)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# K7F-01: what the bridge ships depends on BOTH per-array facts -- a runtime target ships its menu, and it ships the
+# chunk only while something on it reads the chunk. The two facts travel in one handshake read (the file's docstring
+# explains why a second collective is forbidden).
+# ---------------------------------------------------------------------------------------------------------------------
+def test_mixed_array_still_gets_the_full_chunk(fleets, client, monkeypatch):
+    """One array with a runtime callback AND a legacy one keeps the full-chunk scatter (decision F3's escape hatch).
+
+    This is the case that forces the second handshake fact. The runtime callback alone makes the array a data-free
+    delivery -- the bridge would ship the menu and nothing else -- but the ``precompute=False`` callback on the SAME
+    array reads the chunk, so skipping the scatter would hand it an event with ``futures: []``. Host, handshake actor
+    and bridge are driven end to end here (no cluster): the host files both facts, the actor returns them in ONE dict,
+    and the bridge's send must still scatter.
+    """
+    deisa = make_deisa(fleets, client, monkeypatch)
+    register(deisa, lambda window: None)
+    register(deisa, lambda window: None, precompute=False)
+    deisa._flush_delivery_state_to_handshake()
+
+    assert deisa.handshake.runtime_arrays == {ARRAY_NAME}
+    assert deisa.handshake.legacy_arrays == {ARRAY_NAME}, "the legacy reader must be filed next to the runtime flag"
+
+    # The actor's read: the shape the bridge consumes, with both facts in one dict.
+    actor = Handshake.HandshakeActor.__new__(Handshake.HandshakeActor)
+    actor.task_branches = deisa.handshake.branches
+    actor.runtime_arrays = deisa.handshake.runtime_arrays
+    actor.legacy_arrays = deisa.handshake.legacy_arrays
+    state = actor.get_task_state(ARRAY_NAME)
+    assert state == {"branches": [], "runtime": True, "legacy": True}, state
+
+    bridge, wire_client = _make_send_bridge()
+    # Start from an empty cache, like a bridge taking its state from the handshake read.
+    bridge._runtime_delivery_arrays = set()
+    bridge._legacy_delivery_arrays = set()
+    bridge._cache_task_state(ARRAY_NAME, state)
+    assert bridge._needs_chunk_delivery(ARRAY_NAME), "a legacy reader on the array keeps the chunk delivery"
+
+    scattered = []
+
+    def recording_scatter(data, **kwargs):
+        """- ``:param data:`` The chunk the bridge decided to ship."""
+        scattered.append(data.shape)
+        return {
+            "future": "key-0",
+            "who_has": {"worker-0": ["key-0"]},
+            "nbytes": {"key-0": int(np.prod(CHUNK_SHAPE))},
+        }
+
+    bridge._scatter_full = recording_scatter
+    bridge.send(ARRAY_NAME, np.zeros(CHUNK_SHAPE, dtype=np.float32), 0)
+    bridge._has_close_been_called = True
+
+    assert scattered == [CHUNK_SHAPE], "the legacy reader's chunk must still cross the boundary"
+    assert len(wire_client.events[0][1]["futures"]) == 1, "the event must still name the full chunk for that reader"
+
+
+def test_runtime_only_array_ships_its_menu_and_no_data(monkeypatch):
+    """Runtime target with NO legacy reader: no scatter, no branch stage, ``futures: []`` -- the menu is the payload.
+
+    This is the regression the memory suite measures (``test_runtime_worker_only_sees_partials``): at HEAD every
+    ``precompute=True`` callback cost a 32 MB scatter per bridge per timestep for data nothing read. Three things must
+    hold here -- nothing is computed or scattered, the menu is still folded (it is the ENTIRE payload), and no key
+    reaches the scheduler (an empty ``update_data`` + an empty desire list would be pure round trips).
+    """
+    bridge, wire_client = _make_send_bridge()
+    bridge._legacy_delivery_arrays = set()
+    branch_stage = []
+    scattered = []
+
+    def recording_branch_stage(*args, **kwargs):
+        """- ``:param args:`` The chunk and branch set the bridge would reduce on."""
+        branch_stage.append(args)
+        return {}
+
+    def recording_scatter(*args, **kwargs):
+        """- ``:param args:`` The chunk the bridge would ship.
+
+        Returns a plausible scatter result so a mutation that keeps the scatter on fails on the assertion below (with
+        the reason in it) instead of on an ``IndexError`` from a ``None`` payload.
+        """
+        scattered.append(args)
+        return {"future": "key-0", "who_has": {"worker-0": ["key-0"]}, "nbytes": {"key-0": int(np.prod(CHUNK_SHAPE))}}
+
+    bridge._execute_operations_on_chunk = recording_branch_stage
+    bridge._scatter_full = recording_scatter
+
+    bridge.send(ARRAY_NAME, np.zeros(CHUNK_SHAPE, dtype=np.float32), 0)
+    bridge._has_close_been_called = True
+
+    assert scattered == [], "no scatter may happen for an array no callback reads"
+    assert branch_stage == [], "no branch may run on the chunk either"
+    _, payload = wire_client.events[0]
+    assert payload["futures"] == [], "the event must not name data that was never shipped"
+    assert len(payload["menu"]) == 1, "the menu IS the payload on the data-free path"
+    assert payload["menu"][0]["values"]["sum"]["data"], "the menu must still be folded, not dropped"
+    assert wire_client.updates == [], "an empty key set needs no update_data"
+    assert wire_client.desired_keys == [], "an empty key set needs no client-desires-keys"
+
+
+def test_no_data_event_handed_to_a_legacy_reader_fails_the_run(fleets, client, monkeypatch, go_event):
+    """A ``precompute=False`` callback on an event with no futures FAILS THE RUN, naming the array (K7F-05).
+
+    Reaching the full-chunk path with ``futures: []`` means the host and the bridges disagree about the array's
+    delivery state. Without the guard the failure surfaces as ``ValueError: No blocks provided`` (or an IndexError)
+    from dask internals, with neither the array nor the timestep in it; the guard names both and aborts the run at the
+    cycle boundary instead of logging a handler error per timestep.
+    """
+    from deisa.dask.precompute_errors import PrecomputeRuntimeError
+
+    deisa = make_deisa(fleets, client, monkeypatch)
+    received = []
+    register(deisa, lambda window: received.append(window[-1]), precompute=False)
+
+    # ``deliver`` publishes an event with ``futures: []``: the shape the data-free path produces.
+    deliver(deisa, 0, None)
+
+    assert received == [], "a callback must not run on data it did not receive"
+    assert isinstance(deisa._run_failure, PrecomputeRuntimeError), deisa._run_failure
+    detail = str(deisa._run_failure)
+    assert repr(ARRAY_NAME) in detail and "timestep 0" in detail, f"the refusal must name the delivery: {detail}"
+    with pytest.raises(PrecomputeRuntimeError):
+        deisa.execute_callbacks()
 
 
 def test_departed_runtime_callback_flips_the_array_off(fleets, client, monkeypatch, go_event):
@@ -784,6 +968,9 @@ def _make_send_bridge():
     # The menu is gated on the array being a runtime-delivery target, so declare it; its chunk stage is not this
     # test's subject.
     bridge._runtime_delivery_arrays = {ARRAY_NAME}
+    # ... and declare it a legacy (chunk-reading) array too, so these tests keep measuring the full-chunk payload.
+    # The data-free path (runtime target and no legacy reader) has its own test below.
+    bridge._legacy_delivery_arrays = {ARRAY_NAME}
     bridge._task_branches = {ARRAY_NAME: []}
     bridge._branch_by_key = {}
     bridge._runtime_plan_backlog = {}

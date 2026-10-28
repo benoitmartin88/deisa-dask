@@ -184,6 +184,11 @@ class Deisa(IDeisa):
         # (``_flush_delivery_state_to_handshake``), because an eager scalar menu for an array no callback subscribes to
         # is six chunk folds per bridge per timestep of pure critical-path cost.
         self._runtime_arrays: Set[str] = set()
+        # Arrays that at least one ``precompute=False`` callback reads, i.e. that still need the LEGACY full-chunk
+        # scatter. Filed in the same handshake read as the two facts above: a runtime-delivery array WITHOUT a legacy
+        # reader needs no data shipped at all (its menu and its on-demand plans answer every callback), while one WITH
+        # a legacy reader must keep the chunk -- that is decision F3's escape hatch.
+        self._legacy_arrays: Set[str] = set()
         # array_name -> newest timestep the delivery handed to the callbacks. Read by every live dispatcher, including
         # the ones held by OLDER collections in a callback's window: the bridges retain one chunk per array, so an
         # on-demand reduction of an older window element is refused at compose time instead of aborting the run.
@@ -385,12 +390,17 @@ class Deisa(IDeisa):
                 f"_register_callback_impl: callback {callback.__name__!r} registered "
                 f"with precompute=False -- the bridge will use the legacy full-chunk scatter path."
             )
+            # A legacy reader means this array's chunk really is read: the bridges must keep scattering it even when a
+            # ``precompute=True`` callback on the same array needs no data at all.
+            self._legacy_arrays.update(array_names)
         else:
             # These arrays are runtime-delivery targets: the bridges need to know, because an eager scalar menu for an
             # array no callback reads is six chunk folds per bridge per timestep of pure critical-path cost. Filed
             # with the handshake actor here and at the per-cycle boundary, like the rest of the delivery state.
             self._runtime_arrays.update(array_names)
-            self._flush_delivery_state_to_handshake()
+
+        # Both per-array facts travel in ONE handshake read, so they are filed together whatever the mode.
+        self._flush_delivery_state_to_handshake()
 
         # create the topic handler and subscribe for EVERY array in a callback (both precompute=True and
         # precompute=False paths. With precompute=False the bridge still needs the topic subscription to receive data
@@ -436,23 +446,27 @@ class Deisa(IDeisa):
         remaining = [b for b in self._branch_groups.get(array_name, []) if b.output_key in wanted_keys]
         self._branch_groups[array_name] = remaining
 
-    def _prune_runtime_array(self, array_name: str) -> None:
-        """Recompute whether ``array_name`` is still a runtime-delivery target from the surviving callbacks.
+    def _prune_delivery_flags(self, array_name: str) -> None:
+        """Recompute both per-array delivery facts from the surviving callbacks.
 
-        An array stays a target while at least one callback registered on it delivered with ``precompute=True``. Like
-        the branch prune this only touches memory: the changed set reaches the bridges at the next flush point
+        - ``runtime``: at least one callback registered on the array delivers with ``precompute=True``;
+        - ``legacy``: at least one callback registered on the array delivers with ``precompute=False``, i.e. reads the
+          chunk itself, so the bridges must keep scattering it.
+
+        Like the branch prune this only touches memory: the changed sets reach the bridges at the next flush point
         (``execute_callbacks``), never from inside the async topic handler where the unregistration may run.
 
         - ``:param array_name:`` Registered array the removed callback was registered on.
         """
-        still_runtime = any(
-            self._callbacks.get(cid, {}).get("precompute", True)
-            for cid in self._callbacks_by_array.get(array_name, ())
-        )
-        if still_runtime:
+        surviving = [self._callbacks.get(cid, {}) for cid in self._callbacks_by_array.get(array_name, ())]
+        if any(payload.get("precompute", True) for payload in surviving):
             self._runtime_arrays.add(array_name)
         else:
             self._runtime_arrays.discard(array_name)
+        if any(not payload.get("precompute", True) for payload in surviving):
+            self._legacy_arrays.add(array_name)
+        else:
+            self._legacy_arrays.discard(array_name)
 
     def unregister_callback(self, callback_id: Callback_id) -> None:
         # also accept a decorated callback function, which stores its id in .callback_id
@@ -472,7 +486,7 @@ class Deisa(IDeisa):
             # Prune unconditionally for every array the callback touched: the dead callback's branch and its
             # runtime-delivery claim must leave the set even if other callbacks remain registered.
             self._prune_branches(array_name)
-            self._prune_runtime_array(array_name)
+            self._prune_delivery_flags(array_name)
 
     def set(self, key: str, value: Any, timestep: int) -> None:
         """
@@ -496,13 +510,15 @@ class Deisa(IDeisa):
     def _flush_delivery_state_to_handshake(self) -> None:
         """File every array's current delivery state with the handshake actor.
 
-        Two per-array facts travel to the bridges, over the ONE broadcast each of them already enters per array (see
+        Three per-array facts travel to the bridges, over the ONE broadcast each of them already enters per array (see
         :meth:`deisa.dask.handshake.Handshake.get_task_state`):
 
         - the branch set of the array (empty by construction now that nothing files branches; kept until the legacy
-          branch machinery is deleted), and
+          branch machinery is deleted),
         - whether the array is a runtime-delivery target, i.e. whether the eager scalar menu it computes has any
-          reader at all.
+          reader at all, and
+        - whether the array still has a legacy (``precompute=False``) reader, i.e. whether its chunk must be scattered
+          even though a runtime callback on it needs no data.
 
         Called by ``register_callback`` (a bridge on the wait_for_go=False path fetches lazily on first send(),
         possibly before the next cycle) and by ``execute_callbacks`` (before the bridges are unblocked).
@@ -512,6 +528,7 @@ class Deisa(IDeisa):
         for arr_name, branches in self._branch_groups.items():
             self.handshake.set_task_branches(arr_name, branches)
         self.handshake.set_runtime_arrays(sorted(self._runtime_arrays))
+        self.handshake.set_legacy_arrays(sorted(self._legacy_arrays))
 
     def execute_callbacks(self) -> None:
         """
@@ -620,8 +637,21 @@ class Deisa(IDeisa):
 
                     Built lazily on purpose: an event whose callbacks are ALL served by runtime delivery must not pay
                     for a dask graph over a chunk nobody reads.
+
+                    An EMPTY ``futures`` is a delivery-state bug, not a data condition: the bridges skip the scatter
+                    only for an array they were told has no legacy reader, so a ``precompute=False`` callback reaching
+                    this point is being handed an event the host should never have routed to it. Refuse loudly, naming
+                    the array and the timestep; the alternative is ``ValueError: No blocks provided`` from
+                    ``__tile_dask_blocks``, which names neither.
                     """
                     if not full_chunk_darr:
+                        if not futures:
+                            raise PrecomputeRuntimeError(
+                                f"array {array_name!r} was delivered at timestep {iteration} with no data futures, "
+                                f"but a precompute=False callback reads it: the bridges skipped the full-chunk "
+                                f"scatter for an array they were told has no legacy reader. The delivery state is "
+                                f"inconsistent, not the data."
+                            )
                         parts = sorted(futures, key=lambda p: p["chunk_position"])
                         blocks = [da.from_delayed(p["future"], shape=p["shape"], dtype=p["dtype"]) for p in parts]
                         darr = _weak_self.__tile_dask_blocks(
@@ -641,15 +671,17 @@ class Deisa(IDeisa):
                     if array_name not in cb_data["state"]:
                         continue
 
-                    if cb_data.get("precompute", True):
-                        cb_darr = runtime_views.get(callback_id)
-                        if cb_darr is None:
-                            # The callback was unregistered while this event was in flight: nothing to deliver.
-                            continue
-                    else:
-                        cb_darr = _get_full_chunk_darr()
-
                     try:
+                        # Resolving the operand is inside the try: a delivery that cannot produce one is a refusal of
+                        # THIS callback (run-aborting, named after the array), never a logged handler error.
+                        if cb_data.get("precompute", True):
+                            cb_darr = runtime_views.get(callback_id)
+                            if cb_darr is None:
+                                # The callback was unregistered while this event was in flight: nothing to deliver.
+                                continue
+                        else:
+                            cb_darr = _get_full_chunk_darr()
+
                         _weak_self._process_callback(callback_id, cb_data, array_name, cb_darr, iteration)
                     except Exception as e:
                         _weak_self._handle_callback_exception(callback_id, cb_data, e)
@@ -687,8 +719,7 @@ class Deisa(IDeisa):
         - ``:param array_name:`` Registered array the topic event is for.
         """
         return any(
-            self._callbacks.get(cid, {}).get("precompute", True)
-            for cid in self._callbacks_by_array.get(array_name, ())
+            self._callbacks.get(cid, {}).get("precompute", True) for cid in self._callbacks_by_array.get(array_name, ())
         )
 
     def _runtime_views(self, array_name: str, iteration: int, payload: Mapping[str, Any]) -> Dict[Any, Any]:

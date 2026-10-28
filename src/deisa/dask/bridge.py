@@ -137,6 +137,10 @@ class Bridge(IBridge):
         # array). An array outside this set has no callback that can read an eager menu, so ``send`` folds nothing for
         # it -- the menu of an array nobody subscribes to is pure critical-path cost.
         self._runtime_delivery_arrays: set[str] = set()
+        # Arrays that still have a LEGACY (``precompute=False``) reader, i.e. a callback that reads the chunk itself.
+        # Fetched in the SAME handshake read as the set above: a runtime-delivery array with no legacy reader needs no
+        # data shipped at all -- its menu and its on-demand plans answer every callback it has.
+        self._legacy_delivery_arrays: set[str] = set()
         # array_name -> output_key -> branch (BranchSpec)
         self._branch_by_key: Dict[str, Dict[str, Any]] = {}
         # Runtime reduction transport: the array's plan queues live only on the rank that owns its dask client, the
@@ -448,22 +452,33 @@ class Bridge(IBridge):
             self._serve_pending_plans(array_name, sub_comm)
             self._runtime_last_chunk[array_name] = (int(timestep), chunk)
 
+        # Whether the chunk has to be shipped at all: a runtime-delivery array with no legacy reader is answered
+        # entirely by the menu below and by the on-demand plans served above, so nothing on the workers ever reads its
+        # data. Everything else keeps the previous behaviour.
+        data_free_delivery = not self._needs_chunk_delivery(array_name)
+
         # Execute branch funcs locally on the numpy chunk (running on participating ranks only -- the ``_COMM_NULL``
         # early return above exits first), then ship ONLY the tiny partials; the full chunk never enters worker memory.
         branches = self._get_task_branches(array_name)
-        partials = self._execute_operations_on_chunk(chunk, branches)
+        partials = {} if data_free_delivery else self._execute_operations_on_chunk(chunk, branches)
 
         # Eager scalar menu (the zero-round-trip half of the transfer strategy): computed HERE, on the local numpy
         # chunk and before ANY scatter, so the menu values are chunk-local reductions and the chunk itself is never
         # shipped to convey them. Nothing below may run before this line without breaking the ordering invariant.
         # Gated on the array being a runtime-delivery target: with no callback reading it, the folds would be pure
-        # critical-path cost.
+        # critical-path cost. On the data-free path the menu is the ENTIRE payload, so it must still be built.
         menu, menu_error = self._build_runtime_menu(array_name, chunk, timestep)
 
         # With partials: scatter them only. Without: full-chunk scatter (backwards compatibility for non-reduction
-        # callbacks).
+        # callbacks). On the data-free path: nothing at all.
         precomputed_meta: Dict[str, Dict[str, Any]] = {}
-        if partials:
+        if data_free_delivery:
+            logger.debug(
+                f"[{self.id}] send() runtime-only delivery: no data shipped for array={array_name}, "
+                f"chunk shape={chunk.shape} stays on the bridge"
+            )
+            res = {"future": [], "who_has": {}, "nbytes": {}}
+        elif partials:
             logger.debug(
                 f"[{self.id}] send() precompute-active: scattering {len(partials)} partials "
                 f"instead of full chunk shape={chunk.shape}"
@@ -485,6 +500,7 @@ class Bridge(IBridge):
                 precomputed_meta=precomputed_meta,
                 menu=menu,
                 menu_error=menu_error,
+                data_free=data_free_delivery,
             )
             return
 
@@ -529,17 +545,23 @@ class Bridge(IBridge):
                 if d.get("menu") is not None:
                     menus.append(d["menu"])
 
-            # only update the scheduler with who has what and register the futures once
-            self.client.sync(self.client.scheduler.update_data, who_has=who_has, nbytes=nbytes)
+            # only update the scheduler with who has what and register the futures once. Skipped on the data-free
+            # path: an empty update + an empty desire list are pure scheduler round trips.
+            if not data_free_delivery:
+                self.client.sync(self.client.scheduler.update_data, who_has=who_has, nbytes=nbytes)
 
-            # mimic mechanism from Queue. Keep a reference on keys until reception in topic handler. TODO: id=0 can use
-            # a queue
-            self.client._send_to_scheduler({"op": "client-desires-keys", "keys": keys, "client": CLIENT_KEY})
+                # mimic mechanism from Queue. Keep a reference on keys until reception in topic handler. TODO: id=0 can
+                # use a queue
+                self.client._send_to_scheduler({"op": "client-desires-keys", "keys": keys, "client": CLIENT_KEY})
 
             # Topic event: with precompute, ``futures`` lists one entry per (bridge, reduction) pair with the partial's
             # reduced shape/dtype; the Deisa side rebuilds the graph from these small partials.
             futures_payload: List[Dict[str, Any]]
-            if all_partials_meta:
+            if data_free_delivery:
+                # No key crossed the boundary, so there is nothing to register, nothing to desire and no future to
+                # name: the menus ARE the payload (an ``update_data({})`` would be an empty scheduler round trip).
+                futures_payload = []
+            elif all_partials_meta:
                 # One entry per (bridge, reduction). ``chunk_position`` is the contributing bridge's MPI coords
                 # (matching the chunk-grid layout ``mean_agg``/``moment_agg`` expect); ``chunk_axis`` is the reduction
                 # axis tuple used to compute the combine output shape.
@@ -757,6 +779,7 @@ class Bridge(IBridge):
         precomputed_meta: Optional[Dict[str, Dict]] = None,
         menu: Optional[EagerMenu] = None,
         menu_error: Optional[str] = None,
+        data_free: bool = False,
     ) -> None:
         """
         Handle single-bridge array send without collective.
@@ -774,21 +797,28 @@ class Bridge(IBridge):
             carries the partials' reduced shapes instead of the full-chunk shape.
         - ``:param menu:`` This bridge's eager scalar menu for ``timestep``, or ``None`` when the runtime path is off.
             A single-bridge array is its own whole grid, so the one menu is also the complete menu of the array.
+        - ``:param menu_error:`` The cause of a failed menu build, carried so the host fails the run at its boundary.
+        - ``:param data_free:`` True when nothing was scattered because no callback reads this array's data: the event
+            then carries ``futures: []``, the menu being the entire payload.
         """
         assert self.client is not None, "client cannot be None for single-bridge send."
 
-        # On the precompute path, ``res["future"]`` is a list of partial keys (one per reduction). On the non-precompute
-        # path, it's a single future key.
-        future_keys = res["future"] if isinstance(res["future"], list) else [res["future"]]
-        who_has = res["who_has"]
-        nbytes = res["nbytes"]
-
-        self.client.sync(self.client.scheduler.update_data, who_has=who_has, nbytes=nbytes)
-        self.client._send_to_scheduler({"op": "client-desires-keys", "keys": future_keys, "client": CLIENT_KEY})
+        if data_free:
+            # Nothing crossed the boundary: no key to register, none to desire, and no future to name (``future`` is
+            # an empty list on this path, so indexing it below would raise IndexError).
+            future_keys: List[str] = []
+        else:
+            # On the precompute path, ``res["future"]`` is a list of partial keys (one per reduction). On the
+            # non-precompute path, it's a single future key.
+            future_keys = res["future"] if isinstance(res["future"], list) else [res["future"]]
+            self.client.sync(self.client.scheduler.update_data, who_has=res["who_has"], nbytes=res["nbytes"])
+            self.client._send_to_scheduler({"op": "client-desires-keys", "keys": future_keys, "client": CLIENT_KEY})
 
         # Build the topic event. On the precompute path, emit one entry per partial (with its reduced shape). On the
         # non-precompute path, emit one entry pointing at the full chunk.
-        if precomputed_meta:
+        if data_free:
+            futures_payload: List[Dict[str, Any]] = []
+        elif precomputed_meta:
             futures_payload = _build_futures_payload(
                 precomputed_meta,
                 self.arrays_metadata[array_name]["chunk_position"],
@@ -943,10 +973,10 @@ class Bridge(IBridge):
     def _fetch_task_state_bcast(self, array_name: str) -> Optional[dict]:
         """Mirror of the per-array bcast protocol for an array's scheduling state.
 
-        Sub-comm rank 0 reads ``{"branches", "runtime"}`` from the handshake actor and broadcasts it; every other
-        participating rank receives via ``bcast(None)``. Both facts travel in ONE collective on purpose: a second
-        broadcast would have to be entered in the same order on every rank of the sub-comm, i.e. one more way to hang
-        the array for one dict entry. Returns None when this bridge does not participate in the array's sub-comm.
+        Sub-comm rank 0 reads ``{"branches", "runtime", "legacy"}`` from the handshake actor and broadcasts it; every
+        other participating rank receives via ``bcast(None)``. Every fact travels in ONE collective on purpose: a
+        second broadcast would have to be entered in the same order on every rank of the sub-comm, i.e. one more way to
+        hang the array for one dict entry. Returns None when this bridge does not participate in the array's sub-comm.
         Callers decide caching (None is NOT a cached result)."""
         sub_comm = self._array_comms.get(array_name)
         if sub_comm is None or sub_comm is _COMM_NULL:
@@ -962,13 +992,29 @@ class Bridge(IBridge):
         """Store one array's fetched scheduling state in the local caches.
 
         - ``:param array_name:`` Registered array the state belongs to.
-        - ``:param state:`` The ``{"branches", "runtime"}`` dict fetched (or broadcast) for it.
+        - ``:param state:`` The ``{"branches", "runtime", "legacy"}`` dict fetched (or broadcast) for it.
         """
         self._task_branches[array_name] = state.get("branches") or []
         if state.get("runtime"):
             self._runtime_delivery_arrays.add(array_name)
         else:
             self._runtime_delivery_arrays.discard(array_name)
+        if state.get("legacy"):
+            self._legacy_delivery_arrays.add(array_name)
+        else:
+            self._legacy_delivery_arrays.discard(array_name)
+
+    def _needs_chunk_delivery(self, array_name: str) -> bool:
+        """Whether ``send`` must scatter this array's data at all.
+
+        Only a runtime-delivery target can skip it, and only while nothing reads the chunk: every callback on such an
+        array either reads the eager menu, dispatches an on-demand plan, or both. An array with a legacy
+        (``precompute=False``) reader always needs the chunk -- that is decision F3's escape hatch -- and so does an
+        array nobody declared, whose delivery mode this bridge cannot know.
+
+        - ``:param array_name:`` Registered array the send is for.
+        """
+        return array_name not in self._runtime_delivery_arrays or array_name in self._legacy_delivery_arrays
 
     def _get_task_branches(self, array_name: str) -> List[BranchSpec]:
         """

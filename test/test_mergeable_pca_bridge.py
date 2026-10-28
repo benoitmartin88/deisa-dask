@@ -155,12 +155,16 @@ class _FakeHandshake:
     def __init__(self) -> None:
         self.branches: Dict[str, Any] = {}
         self.runtime_arrays: list = []
+        self.legacy_arrays: list = []
 
     def set_task_branches(self, array_name: str, hints: list) -> None:
         self.branches[array_name] = hints
 
     def set_runtime_arrays(self, array_names: list) -> None:
         self.runtime_arrays = list(array_names)
+
+    def set_legacy_arrays(self, array_names: list) -> None:
+        self.legacy_arrays = list(array_names)
 
 
 def _deisa_stub() -> Deisa:
@@ -172,6 +176,7 @@ def _deisa_stub() -> Deisa:
     d._callbacks = {}
     d._callbacks_by_array = {}
     d._runtime_arrays = set()
+    d._legacy_arrays = set()
     d._topic_handlers = {}
     d._callback_reductions = {}
     d._callback_seq = 0
