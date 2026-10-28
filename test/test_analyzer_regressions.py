@@ -120,12 +120,12 @@ def test_map_blocks_is_off_surface(body, analyzer_served) -> None:
     SERVED the resolvable one by folding ``np.abs`` into the branch. The runtime never inspects a callable, so both
     forms leave the closed surface and are refused there -- the same gate, named precisely.
     """
-    from deisa.dask import precompute_analyzer as analyzer_module
+    from deisa.dask import precompute_errors as analyzer_errors
 
     if analyzer_served:
         assert [spec.output_key for spec in _analyze(body)] == ["f-sum"], "the analyzer served the resolvable form"
     else:
-        with pytest.raises(analyzer_module.PrecomputeError):
+        with pytest.raises(analyzer_errors.PrecomputeError):
             _analyze(body)
     with pytest.raises(errors.UnsupportedReductionError) as refusal:
         _run_callback(body)
@@ -175,9 +175,9 @@ def test_cross_reduction_is_refused(body, expected) -> None:
     them at the operator, naming the completed reduction. The ordering-dependent bypass is the regression this guard
     exists for: ``arr.sum()`` first in the source must not hide the second ``sum``'s dependence on ``mean``.
     """
-    from deisa.dask import precompute_analyzer as analyzer_module
+    from deisa.dask import precompute_errors as analyzer_errors
 
-    with pytest.raises(analyzer_module.UnsupportedReductionError):
+    with pytest.raises(analyzer_errors.UnsupportedReductionError):
         _analyze(body)
     with pytest.raises(errors.UnsupportedReductionError) as refusal:
         _run_callback(body)
@@ -392,10 +392,10 @@ def test_raw_field_compute_boundary_without_reduction_refused() -> None:
     The analyzer reported it per boundary with a source line; the runtime refuses at the boundary and names the array
     and the timestep instead. Both are ``RawFieldReadError`` in one ``isinstance`` graph.
     """
-    from deisa.dask import precompute_analyzer as analyzer_module
+    from deisa.dask import precompute_errors as analyzer_errors
 
     body = "v = arr.compute()\ns = arr.sum()\nreturn s.compute(), v"
-    with pytest.raises(analyzer_module.RawFieldReadError):
+    with pytest.raises(analyzer_errors.RawFieldReadError):
         _analyze(body)
     with pytest.raises(errors.RawFieldReadError) as refusal:
         _run_callback(body)

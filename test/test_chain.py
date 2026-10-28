@@ -15,14 +15,13 @@ from typing import Any, Dict
 import dask.array as da
 import numpy as np
 import pytest
+from _oracle.branch_specs import _build_chain_branch_func, _walk_chain
 from utils import _make_callback
 
 from deisa.dask.branch import (
     _apply_full_local_fold,
-    _build_chain_branch_func,
     _find_chunk_layer,
     _find_single_upstream,
-    _walk_chain,
 )
 
 
@@ -249,7 +248,7 @@ class TestAnalyzeBranchLength1:
         """analyze_branch produces length-1 branches for the
         per-reduction path. The chain walker folds multi-layer chains into a single branch_func.
         """
-        from deisa.dask.branch import _analyze_branch
+        from _oracle.branch_specs import _analyze_branch
 
         # A multi-layer chain callback: (arr * arr).sum(). The chain
         # walker must fold {mul, sum} into a single branch_func; the
@@ -299,7 +298,7 @@ class TestMultiReductionBranches:
     """
 
     def _analyze(self, body: str) -> Dict[str, Any]:
-        from deisa.dask.branch import _analyze_branch
+        from _oracle.branch_specs import _analyze_branch
 
         cb = _make_callback("multi_reduction_cb", body)
         branches = _analyze_branch(cb, {"f": da.zeros((4, 4), chunks=2, dtype="float64")})
@@ -530,7 +529,7 @@ def test_merge_branches_refuses_same_key_different_signature() -> None:
     other's result.
     """
     from deisa.dask.branch import merge_branches
-    from deisa.dask.precompute_analyzer import PrecomputeRuntimeError
+    from deisa.dask.precompute_errors import PrecomputeRuntimeError
 
     window_read = _make_spec("f-sum", reduction_axes=())
     axis_zero = _make_spec("f-sum", reduction_axes=(0,))

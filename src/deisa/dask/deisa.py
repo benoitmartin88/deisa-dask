@@ -70,7 +70,6 @@ from distributed import Client, Event, Future, Queue
 
 import dask.array as da
 from deisa.dask import runtime_errors as runtime_errors
-from deisa.dask.branch import _BRANCH_KIND_PCA
 from deisa.dask.collection import DeisaCollection
 from deisa.dask.constants import (
     CALLBACK_PREFIX,
@@ -95,7 +94,7 @@ from deisa.dask.runtime_dispatch import (
     plan_request_queue_name,
 )
 from deisa.dask.runtime_errors import RuntimeRefusal
-from deisa.dask.utils import _PrecomputedDeisaArray, build_deisa_array, get_client, make_precomputed_view  # noqa: F401
+from deisa.dask.utils import build_deisa_array, get_client
 
 logger = logging.getLogger(__name__)
 
@@ -660,111 +659,6 @@ class Deisa(IDeisa):
                 logger.error(f"topic_handler: topic handler error array_name={array_name}, e={e}")
 
         return topic_handler
-
-    def _branch_spec_for(self, array_name: str, output_key: str) -> Optional[Any]:
-        """Return the registered :class:`BranchSpec` for ``output_key`` on ``array_name``, or ``None``.
-
-        ``self._branch_groups[array_name]`` is the merged spec list filed at registration time; it is the single
-        source of truth for per-reduction metadata.
-        """
-        for spec in self._branch_groups.get(array_name, []):
-            if spec.output_key == output_key:
-                return spec
-        return None
-
-    def _is_full_reduction(self, array_name: str, output_key: str) -> bool:
-        """Whether the recorded reduction for ``output_key`` collapses the WHOLE array (full reduction).
-
-        Read from the registered :class:`BranchSpec`'s ``reduction_axes`` (``()`` = full reduction). Unregistered
-        keys return ``False`` -- without a spec there is no basis for the stack-based delivery path, and the
-        combine/dispatch machinery raises on the unregistered case anyway.
-        """
-        spec = self._branch_spec_for(array_name, output_key)
-        return spec is not None and spec.reduction_axes == ()
-
-    def _build_callback_views(self, array_name: str, iteration: int, combined_by_key: Dict[str, Any]) -> Dict[str, Any]:
-        """Build the per-callback dispatch view for this array's event.
-
-        A callback that registered reductions on ``array_name`` receives a ``_PrecomputedDeisaArray`` whose signature
-        map routes ITS OWN reduction calls to the combined array the analyzer recorded for that callback and that
-        reduction. Callbacks whose branches all live on other arrays get no view here (nothing to deliver).
-        """
-        views: Dict[str, Any] = {}
-        registered_shape = tuple(self.arrays_metadata.get(array_name, {}).get("global_shape", ()) or ())
-        registered_ndim = len(registered_shape)
-        for callback_id in list(self._callbacks_by_array.get(array_name, [])):
-            descriptors = self._callback_reductions.get(callback_id, {}).get(array_name)
-            if not descriptors:
-                # No precomputed reduction of this callback reads this array.
-                continue
-            signatures: Dict[Tuple[str, Tuple[int, ...]], Any] = {}
-            reapply: Set[Tuple[str, Tuple[int, ...]]] = set()
-            pca_summary = None
-            first = None
-            for output_key, op_name, reduction_axes, kind in descriptors:
-                array = combined_by_key.get(output_key)
-                if array is None:
-                    raise PrecomputeRuntimeError(
-                        f"_build_callback_views: callback {callback_id!r} recorded reduction {output_key!r} "
-                        f"(op {op_name!r}, axes {reduction_axes!r}) on array {array_name!r} but the topic event "
-                        f"carried no partials for it (delivered keys: {sorted(combined_by_key)}). "
-                        f"Refusing to deliver a callback with a missing reduction."
-                    )
-                if kind == _BRANCH_KIND_PCA:
-                    # The merged in-situ summary. Attached to the view rather than routed through the signature
-                    # map: the callback consumes it via MergeablePCA().fit(<view>), not via a reduction-signature
-                    # lookup, so it must not be reachable as if it were an already-final combined array.
-                    pca_summary = array
-                    continue
-                sig = (op_name, reduction_axes)
-                if sig not in signatures:
-                    signatures[sig] = array
-                if kind == "scalar" and reduction_axes == ():
-                    reapply.add(sig)
-                if first is None:
-                    first = array
-            if pca_summary is not None and not signatures:
-                # A PCA-only callback has no combined reduction to use as the view's carrier array, so build the
-                # placeholder below instead of refusing to deliver a callback that is perfectly precomputable.
-                first = self._pca_carrier_array(array_name)
-            elif first is None:
-                continue
-            views[callback_id] = make_precomputed_view(
-                first,
-                t=iteration,
-                signatures=signatures,
-                reapply=reapply,
-                registered_ndim=registered_ndim,
-                pca_summary=pca_summary,
-                # The REGISTERED shape, never the carrier's own: a PCA-only carrier is a one-element placeholder whose
-                # shape[-1] is 1 for every array, so the estimator reading it would declare d=1 and refuse every real
-                # fit. This is the registered metadata the callback was written against.
-                registered_shape=registered_shape,
-            )
-        return views
-
-    def _pca_carrier_array(self, array_name: str) -> da.Array:
-        """A one-element zero array used ONLY as the ``DeisaArray`` carrier for a PCA-only dispatch view.
-
-        The PCA path delivers a merged :class:`~deisa.dask.mergeable_pca.PCASummary`, not array data, yet
-        :func:`~deisa.dask.utils.make_precomputed_view` instantiates its view from a real ``da.Array`` (whose ``dask``
-        graph, ``chunks``, ``dtype`` and ``shape`` the ``DeisaArray`` constructor reads). This is that array.
-
-        It carries no field data: one element, allocated at view-build time, never fetched from the bridge, and never
-        readable as the array the callback asked about. The callback must not read it -- the precompute contract does
-        not deliver the field, which is the whole point of the feature -- and the estimator takes the summary from
-        ``_deisa_pca_summary``, never from this.
-
-        Its ``shape`` is therefore NOT a source of truth about ``d``: every axis is 1, so an estimator that read
-        ``shape[-1]`` would declare a 1-feature array and refuse every real fit. The registered ``global_shape`` is
-        delivered alongside it (``registered_shape=``), which is where ``d`` is read from.
-
-        - ``:param array_name:`` The registered array the PCA was requested on, used for the metadata and the task name.
-        """
-        meta = self.arrays_metadata.get(array_name, {})
-        ndim = len(meta.get("global_shape", ())) or 1
-        shape = (1,) * ndim
-        return da.zeros(shape, chunks=shape, dtype=np.float64, name=f"deisa-pca-carrier-{array_name}")
 
     def _record_menu_failure(self, payload: Mapping[str, Any]) -> None:
         """Record a bridge's eager-menu failure as the RUN failure, so the cycle boundary raises it.

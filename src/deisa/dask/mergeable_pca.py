@@ -1032,10 +1032,10 @@ class MergeablePCA:
         """The feature dimension ``d`` the REGISTERED array declares, under this estimator's axis policy.
 
         Read from the REGISTERED shape, never from the array handed to :meth:`fit`. Those are different things on the
-        bridge path: a PCA-only dispatch view is instantiated from :meth:`Deisa._pca_carrier_array`, whose shape is 1
-        along every axis by construction, because it carries no field data and must never be read as the array the
-        callback asked about. Its ``shape[-1]`` is 1 for every registered array of every dimensionality, which is why
-        cross-checking a summary against it refused EVERY legitimate fit with ``d != 1``.
+        bridge path: a PCA-only delivery carries a merged :class:`PCASummary`, not field data, so the array handed to
+        :meth:`fit` is the callback's own object and must never be read as the array the bridge summarized. Its
+        ``shape[-1]`` is not the declared feature dimension for every registered array of every dimensionality, which
+        is why cross-checking a summary against it refused EVERY legitimate fit with ``d != 1``.
 
         The classification goes through the same :func:`_partition_axes` policy :meth:`_as_2d` applies, so the count
         agrees with the layout the bridge summarized under by construction rather than by coincidence: a multi-axis
@@ -1083,10 +1083,10 @@ class MergeablePCA:
         each leaf's local rank), never the truncated public representation.
 
         The feature-dimension check is the one guard this path adds, and it reads the REGISTERED shape the delivery
-        carries, never the array the callback passed. That distinction is the whole fix: the dispatch view is built
-        from a one-element placeholder carrier (:meth:`Deisa._pca_carrier_array`) whose ``shape[-1]`` is 1 for every
-        registered array, so cross-checking against the carrier's own shape refused every legitimate fit with
-        ``d != 1``. With ``d`` declared by the registered metadata under the same axis policy the bridge summarized
+        carries, never the array the callback passed. That distinction is the whole fix: the delivered collection
+        carries no field data, so cross-checking a summary against the callback's own array refused every legitimate
+        fit with ``d != 1``. With ``d`` declared by the registered metadata under the same axis policy the bridge
+        summarized
         under, the guard still catches a summary describing a DIFFERENT feature basis -- it now compares two real
         counts instead of a real one and a placeholder.
 

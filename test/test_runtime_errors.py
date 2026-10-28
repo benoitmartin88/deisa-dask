@@ -7,9 +7,9 @@ present -- which is also what keeps the wording from silently degrading.
 
 import pytest
 
-from deisa.dask import precompute_analyzer as analyzer_module
+from deisa.dask import precompute_errors as analyzer_errors
 from deisa.dask import runtime_errors as errors
-from deisa.dask.precompute_analyzer import PrecomputeError
+from deisa.dask.precompute_errors import PrecomputeError
 
 # Every refusal class of the v1 taxonomy (the brief's list, in the order it gives).
 REFUSAL_CLASSES = [
@@ -69,11 +69,11 @@ def test_every_refusal_is_a_precompute_error():
 
 
 NAMESAKE_PAIRS = [
-    (errors.RawFieldReadError, analyzer_module.RawFieldReadError),
-    (errors.MaterializationError, analyzer_module.MaterializationError),
-    (errors.UnsupportedReductionError, analyzer_module.UnsupportedReductionError),
-    (errors.NoPrecomputableReductionError, analyzer_module.NoPrecomputableReductionError),
-    (errors.PrecomputeRuntimeError, analyzer_module.PrecomputeRuntimeError),
+    (errors.RawFieldReadError, analyzer_errors.RawFieldReadError),
+    (errors.MaterializationError, analyzer_errors.MaterializationError),
+    (errors.UnsupportedReductionError, analyzer_errors.UnsupportedReductionError),
+    (errors.NoPrecomputableReductionError, analyzer_errors.NoPrecomputableReductionError),
+    (errors.PrecomputeRuntimeError, analyzer_errors.PrecomputeRuntimeError),
 ]
 
 

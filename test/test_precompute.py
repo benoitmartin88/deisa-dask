@@ -529,13 +529,13 @@ def test_non_associative_reductions_are_refused_as_such() -> None:
 
 def test_non_associative_refusal_is_not_a_raw_read() -> None:
     """The reclassification is observable: the same source raises the analyzer's raw-read class, the runtime's own."""
-    from deisa.dask import precompute_analyzer as analyzer_module
+    from deisa.dask import precompute_errors as analyzer_errors
 
-    with pytest.raises(analyzer_module.RawFieldReadError):
+    with pytest.raises(analyzer_errors.RawFieldReadError):
         _analyze("s = arr.argmax()\ns.compute()")
     with pytest.raises(errors.NonAssociativeReductionError) as refusal:
         _run_callback("s = arr.argmax()\ns.compute()")
-    assert not isinstance(refusal.value, analyzer_module.RawFieldReadError), "argmax is not a raw read"
+    assert not isinstance(refusal.value, analyzer_errors.RawFieldReadError), "argmax is not a raw read"
     assert "associative reductions" in str(refusal.value), "the remedy must name a working path"
 
 
@@ -548,9 +548,9 @@ def test_cross_array_expression_is_refused() -> None:
     Both paths refuse with ``UnsupportedReductionError``: the analyzer raises during analysis (a chunk-local branch
     cannot descend from two registered arrays), the runtime raises at the operator with the root pair in the message.
     """
-    from deisa.dask import precompute_analyzer as analyzer_module
+    from deisa.dask import precompute_errors as analyzer_errors
 
-    with pytest.raises(analyzer_module.UnsupportedReductionError) as oracle_refusal:
+    with pytest.raises(analyzer_errors.UnsupportedReductionError) as oracle_refusal:
         _analyze("result = (arr_a - arr_b).max()\nresult.compute()", params="arr_a, arr_b", meta=META_AB)
     assert "at least one other registered array" in str(oracle_refusal.value)
     with pytest.raises(errors.UnsupportedReductionError) as refusal:
@@ -620,12 +620,12 @@ def test_no_compute_boundary_plans_nothing() -> None:
     still the analyzer until the deletion lands -- raises ``NoPrecomputableReductionError``/``NoComputeBoundaryError``
     for exactly that source.
     """
-    from deisa.dask import precompute_analyzer as analyzer_module
+    from deisa.dask import precompute_errors as analyzer_errors
 
     for body in ("result = arr.sum()", "x = 1 + 2"):
         _, requests, _ = _run_callback(body)
         assert requests == []
-    with pytest.raises(analyzer_module.NoComputeBoundaryError):
+    with pytest.raises(analyzer_errors.NoComputeBoundaryError):
         _analyze("result = arr.sum()")
 
 
@@ -889,7 +889,7 @@ def test_analyzer_never_executes_the_callback() -> None:
         arr.sum().compute()
 
     callback.__source__ = "def callback(arr):\n    arr.sum().compute()\n"
-    from deisa.dask.branch import _analyze_callback_for_branches
+    from _oracle.branch_specs import _analyze_callback_for_branches
 
     branches = _analyze_callback_for_branches(callback, DEFAULT_META)
     assert [branch.output_key for branch in branches] == ["f-sum"]

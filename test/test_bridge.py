@@ -198,7 +198,7 @@ class TestBridge:
         bridge's ``n``). It raises a typed ``PrecomputeRuntimeError`` naming the branch.
         """
         from deisa.dask.branch import BranchSpec
-        from deisa.dask.precompute_analyzer import PrecomputeRuntimeError
+        from deisa.dask.precompute_errors import PrecomputeRuntimeError
 
         bridge, _ = self.get_new_bridge()
 

@@ -143,7 +143,7 @@ def _analyze(body: str, params: str = "arr", name: str = "analyze_cb", meta: Dic
 
     Defaults to a single array ``f`` with an (8, 8) global shape and (4, 4) chunk shape.
     """
-    from deisa.dask.branch import _analyze_callback_for_branches
+    from _oracle.branch_specs import _analyze_callback_for_branches
 
     if meta is None:
         meta = {"f": {"global_shape": (8, 8), "chunk_shape": (4, 4)}}
