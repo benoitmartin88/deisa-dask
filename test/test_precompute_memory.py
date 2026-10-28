@@ -24,10 +24,9 @@
 # e.g. ``(1, 2048) float64`` = 16 KB, while the full chunk of this harness is
 # 32 MB (three orders of magnitude larger).
 #
-# Every test here runs with RUNTIME_REDUCTION_DELIVERY_ENABLED on (flipped
-# through the module, the pattern test_runtime_wiring.py established), except
-# the control test, which pins that ``precompute=False`` still means the legacy
-# full-chunk scatter even while the flag is on (decision F3).
+# Every test here runs on the runtime delivery path, which is what ``precompute=True`` (the default) means since the
+# delivery flag was retired (decision F3: ``precompute`` is the only selector), except the control test, which pins that
+# ``precompute=False`` still means the legacy full-chunk scatter.
 # =============================================================================
 import logging
 import os
@@ -42,11 +41,10 @@ from distributed import Client, LocalCluster
 from TestSimulator import TestSimulation
 from utils import wait_for
 
-from deisa.dask import Deisa, runtime_dispatch
+from deisa.dask import Deisa
 from deisa.dask import runtime_errors as errors
 from deisa.dask.collection import DeisaCollection
 from deisa.dask.runtime_compose import compose_request, probe_partial
-from deisa.dask.runtime_dispatch import runtime_delivery_enabled
 
 logging.basicConfig(level=logging.DEBUG)
 
@@ -138,19 +136,6 @@ def _make_compute_callback(body: str, results: List[Any]) -> Callable:
     fn = scope["_cb"]
     fn.__source__ = src  # type: ignore[attr-defined]
     return fn
-
-
-@pytest.fixture(scope="function", autouse=True)
-def runtime_delivery(monkeypatch):
-    """Run every test in this file on the RUNTIME delivery path.
-
-    ``runtime_delivery_enabled`` reads the module global at call time, so flipping it through the module reaches every
-    consumer (the topic handler, the register path and the bridge's boundary collective). The assertion pins that the
-    port is really on the runtime path -- a silently flag-off test would measure the analyzer instead.
-    """
-    monkeypatch.setattr(runtime_dispatch, "RUNTIME_REDUCTION_DELIVERY_ENABLED", True)
-    assert runtime_delivery_enabled() is True
-    yield True
 
 
 @pytest.fixture(scope="function")
@@ -260,11 +245,11 @@ class TestRuntimeReductionMemory:
         # hang waiting for a bridge-done event that only fires on close.
 
     def test_legacy_control_worker_sees_full_chunk(self, env_setup_2workers):
-        """Control test: with ``precompute=False`` the full chunk DOES land on workers, even with the flag on.
+        """Control test: with ``precompute=False`` the full chunk DOES land on workers.
 
         Two things are pinned at once: the memory harness is sensitive enough to see the difference, and
-        ``precompute=False`` still selects the legacy full-chunk scatter while the runtime flag is on (decision F3 --
-        the escape hatch must survive the redesign).
+        ``precompute=False`` still selects the legacy full-chunk scatter (decision F3 -- the escape hatch must survive
+        the redesign).
         """
         client, cluster = env_setup_2workers
         chunk_shape = (2048, 2048)

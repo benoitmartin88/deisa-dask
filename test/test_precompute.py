@@ -864,6 +864,9 @@ def test_each_callback_gets_its_own_collection() -> None:
     deisa._runtime_transports = {}
     deisa._runtime_latest_timestep = {}
     deisa._callbacks_by_array = {"f": {"cb-1", "cb-2"}}
+    # Delivery mode is per CALLBACK (decision F3): the view builder reads each payload's ``precompute`` flag, so the
+    # stubbed registrations must carry one like a real one does.
+    deisa._callbacks = {"cb-1": {"precompute": True}, "cb-2": {"precompute": True}}
 
     views = deisa._runtime_views("f", 3, {"menu": []})
 

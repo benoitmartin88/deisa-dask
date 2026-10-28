@@ -55,6 +55,10 @@ class Handshake:
             self.feedback_queue_size = 1024
             self.timestep: Optional[int] = None
             self.task_branches = {}  # array_name -> List[Dict] for bridge-local execution
+            # Arrays the analytics host delivers to at least one runtime-delivery callback. The bridge reads this to
+            # decide whether its eager scalar menu has a reader at all: a menu for an array nobody subscribes to is
+            # six chunk folds per bridge per timestep of pure critical-path cost.
+            self.runtime_arrays = set()
 
         def set_bridges_ready(self, nb_bridges: int, arrays_metadata: dict) -> None:
             logger.debug(
@@ -93,6 +97,22 @@ class Handshake:
 
         def get_task_branches(self, array_name: str) -> List[BranchSpec] | Future:
             return self.task_branches.get(array_name, [])
+
+        def set_runtime_arrays(self, array_names: list) -> None:
+            logger.debug(f"set_runtime_arrays(): array_names={array_names}")
+            self.runtime_arrays = set(array_names)
+
+        def get_task_state(self, array_name: str) -> dict | Future:
+            """Both per-array scheduling facts in one read.
+
+            The bridge fetches this over a single per-array broadcast: branches and the runtime-delivery flag must
+            arrive in the same collective, because a second, separate broadcast would have to be entered in the same
+            order on every rank of the sub-comm -- two maskable sources of a hang for one dict entry.
+            """
+            return {
+                "branches": self.task_branches.get(array_name, []),
+                "runtime": array_name in self.runtime_arrays,
+            }
 
         def __go(self) -> None:
             logger.debug("Handshake go !")
@@ -150,6 +170,14 @@ class Handshake:
     def get_task_branches(self, array_name: str) -> List[BranchSpec]:
         assert self.__handshake_actor is not None
         return self.__handshake_actor.get_task_branches(array_name).result()
+
+    def set_runtime_arrays(self, array_names: list) -> None:
+        assert self.__handshake_actor is not None
+        self.__handshake_actor.set_runtime_arrays(array_names).result()
+
+    def get_task_state(self, array_name: str) -> dict:
+        assert self.__handshake_actor is not None
+        return self.__handshake_actor.get_task_state(array_name).result()
 
     def __wait_for_go(self) -> None:
         Event(Handshake._DEISA_WAIT_FOR_GO_EVENT, client=self.client).wait()

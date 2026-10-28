@@ -31,17 +31,18 @@
 The analytics-host side of deisa-dask: callback registration, the per-array topic handlers that deliver data to the
 callbacks, and the cycle boundary (``execute_callbacks``).
 
-Two delivery modes exist and the internal runtime flag selects between them for ``precompute=True`` callbacks:
+Two delivery modes exist and each callback's ``precompute`` argument selects its own (decision F3):
 
-- **runtime reduction delivery** (the internal ``DEISA_DASK_RUNTIME_REDUCTION`` flag on, read once at import by
-  :func:`deisa.dask.runtime_dispatch.runtime_delivery_enabled`): the callback receives one
+- **runtime reduction delivery** (``precompute=True``, the default): the callback receives one
   :class:`~deisa.dask.collection.DeisaCollection` per (registered array, timestep) instead of an array. The collection
   is not a dask collection and carries no data -- it exposes the closed reduction surface and dispatches each
   ``.compute()`` to the bridges, which reduce their OWN chunk. The bridges' eager scalar menu and the on-demand plan
   round both arrive through the topic event and the array transport attached to the delivery.
-- **legacy delivery** (flag off, and every ``precompute=False`` callback): unchanged. ``precompute=False`` keeps
-  meaning the legacy full-chunk scatter -- the chunk itself reaches the workers, which is the remedy every refusal
-  message points at.
+- **legacy full-chunk scatter** (``precompute=False``): unchanged. The chunk itself reaches the workers, which is the
+  remedy every refusal message points at.
+
+Delivery mode is per CALLBACK, not per run: two callbacks on the same array may be registered one way each, so the
+topic handler dispatches each callback down its own path within a single event.
 
 Window semantics under runtime delivery: the callback's argument is an ordinary Python list with one entry per array,
 so ``window[-1]`` is list indexing and delivers the current timestep's collection and ``window[-2]`` the previous
@@ -69,13 +70,7 @@ from distributed import Client, Event, Future, Queue
 
 import dask.array as da
 from deisa.dask import runtime_errors as runtime_errors
-from deisa.dask.branch import (
-    _BRANCH_KIND_PCA,
-    _analyze_callback_for_branches,
-    _combine_array_from_partials,
-    _combine_pca_summaries,
-    merge_branches,
-)
+from deisa.dask.branch import _BRANCH_KIND_PCA
 from deisa.dask.collection import DeisaCollection
 from deisa.dask.constants import (
     CALLBACK_PREFIX,
@@ -88,7 +83,6 @@ from deisa.dask.constants import (
 from deisa.dask.handshake import Handshake
 from deisa.dask.precompute_errors import (
     MaterializationError,
-    NoPrecomputableReductionError,
     PrecomputeRuntimeError,
     RawFieldReadError,
     UnsupportedReductionError,
@@ -99,16 +93,15 @@ from deisa.dask.runtime_dispatch import (
     QueuePlanExchange,
     plan_report_queue_name,
     plan_request_queue_name,
-    runtime_delivery_enabled,
 )
 from deisa.dask.runtime_errors import RuntimeRefusal
 from deisa.dask.utils import _PrecomputedDeisaArray, build_deisa_array, get_client, make_precomputed_view  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
-# The analyzer's refusal classes the LEGACY (flag OFF) precompute view raises mid-run: ``utils`` raises
-# ``PrecomputeRuntimeError``/``UnsupportedReductionError`` from the per-callback dispatch view, and the analyzer itself
-# raises ``RawFieldReadError``/``MaterializationError`` for a raw read. They are a separate family from
+# The refusal classes the legacy precompute view raises mid-run: ``utils`` raises
+# ``PrecomputeRuntimeError``/``UnsupportedReductionError`` from the per-callback dispatch view, and the analyzer raised
+# ``RawFieldReadError``/``MaterializationError`` for a raw read. They are a separate family from
 # :mod:`deisa.dask.runtime_errors` (which subclasses them, never the other way around), so the abort predicate has to
 # name them explicitly.
 _LEGACY_RUN_ABORTING: Tuple[type, ...] = (
@@ -126,11 +119,11 @@ def _is_run_aborting(ex: BaseException) -> bool:
     materialization, an off-surface or non-associative reduction, a bridge-side invariant violation). Continuing would
     deliver a wrong value on every later timestep, so the run stops once instead.
 
-    BOTH taxonomies are covered, because the delivery mode that raises one of them is selected by the runtime flag, not
-    by the run: :class:`~deisa.dask.runtime_errors.RuntimeRefusal` is the runtime path's family, and
-    :data:`_LEGACY_RUN_ABORTING` are the analyzer's classes that the precompute view raises mid-run on the default
-    (flag OFF) path. The runtime classes subclass their legacy namesakes, so a legacy ``except`` clause catches a new
-    refusal too -- the two families are one hierarchy, and this predicate walks it from the top.
+    BOTH taxonomies are covered because two delivery modes raise them:
+    :class:`~deisa.dask.runtime_errors.RuntimeRefusal` is the runtime path's family, and
+    :data:`_LEGACY_RUN_ABORTING` are the classes the legacy precompute view raises mid-run. The runtime classes
+    subclass their legacy namesakes, so a legacy ``except`` clause catches a new refusal too -- the two families are one
+    hierarchy, and this predicate walks it from the top.
 
     The check lives in this module-level predicate -- and not inline -- so a test can disable it and prove the abort
     test can fail.
@@ -189,6 +182,10 @@ class Deisa(IDeisa):
         # array's sub-comm). Internal, never a user parameter: the delivery attaches the collection's compute boundary
         # from here, and an array without an entry still serves its eager menu and refuses the rest.
         self._runtime_transports: Dict[str, Callable[[Any], Any]] = {}
+        # Arrays that at least one ``precompute=True`` callback reads. Declared to the bridges over the handshake
+        # (``_flush_delivery_state_to_handshake``), because an eager scalar menu for an array no callback subscribes to
+        # is six chunk folds per bridge per timestep of pure critical-path cost.
+        self._runtime_arrays: Set[str] = set()
         # array_name -> newest timestep the delivery handed to the callbacks. Read by every live dispatcher, including
         # the ones held by OLDER collections in a callback's window: the bridges retain one chunk per array, so an
         # on-demand reduction of an older window element is refused at compose time instead of aborting the run.
@@ -208,12 +205,11 @@ class Deisa(IDeisa):
         request on ``plan_request_queue_name``, the array's root bridge picks it up and answers on
         ``plan_report_queue_name``, and what comes back is merged exactly as a test-injected exchange's reports are.
 
-        Nothing is attached while the runtime delivery flag is off -- the topic handler never builds a runtime
-        collection then, so a transport would be dead weight on the default path. An array whose bridge count the
-        metadata does not describe is skipped: without a count the host cannot know when a round is complete.
+        Every array gets one: the first on-demand request can arrive as soon as the first delivered timestep, which is
+        before any callback has necessarily run, so there is no later point at which attaching could be justified over
+        attaching at ``__init__``. An array whose bridge count the metadata does not describe is skipped: without a
+        count the host cannot know when a round is complete.
         """
-        if not runtime_delivery_enabled():
-            return
         for array_name, metadata in self.arrays_metadata.items():
             bridge_count = _grid_size_from_metadata(metadata)
             if not bridge_count:
@@ -263,26 +259,24 @@ class Deisa(IDeisa):
                 for arr2 ``@deisa.register(Window("arr1", 2), Window("arr2", 5), "arr3")`` # window size 2 for arr1 and
                 5 for arr2, default window size for arr3
 
-                Every callback is automatically analyzed for dask reduction operations (sum, mean, std, var, max, min,
-                prod) which are executed locally on each bridge before scatter to reduce network transfer. Precompute
-                analysis is always attempted (the default), and any callback that cannot be precomputed (no reductions,
-                or a reduction that depends on another reduction's output) raises at registration time. Use
-                ``precompute=False`` to skip the analysis with a warning and fall back to the legacy full-chunk scatter
-                path.
+                Every callback is served by runtime reduction delivery by default: the bridges reduce their own chunk
+                and the callback receives one data-free collection per array and timestep, whose reductions answer
+                from an eager scalar menu or an on-demand plan round. A callback that needs the whole field -- a raw
+                read, a reduction whose input is a derived expression the closed surface cannot express -- registers
+                with ``precompute=False`` and receives the legacy full-chunk scatter instead.
 
-                Branch filing contract: registration merges branches in memory and files them with the handshake actor
-                immediately (required: a bridge on the wait_for_go=False path fetches lazily on its first send()).
-                ``unregister_callback`` prunes memory only; the pruned set is re-filed at the per-cycle boundary by
-                ``execute_callbacks()`` (which always flushes before unblocking the bridges). Callbacks registered
-                without a subsequent ``execute_callbacks()`` still reach the bridges via the immediate
-                registration-time filing.
+                Delivery state filing contract: registration declares its arrays as runtime-delivery targets to the
+                handshake actor immediately (required: a bridge on the wait_for_go=False path fetches the state lazily
+                on its first send()). ``unregister_callback`` prunes memory only; the pruned set is re-filed at the
+                per-cycle boundary by ``execute_callbacks()`` (which always flushes before unblocking the bridges).
 
         - ``:param callback_args:`` Variable-length arguments representing callback-specific parameters. - ``:param
         exception_handler:`` Optional exception handler to manage errors during callback execution. Defaults to
         ``__default_exception_handler``. - ``:param when:`` Specifies the conditional logic for triggering the
-        callback. Can be 'AND' or 'OR'. Defaults to 'AND'. - ``:param precompute:`` If False, skip precompute analysis
-        with a warning and use the full-chunk scatter path. Defaults to True (analysis is required). - ``:return:`` A
-        callable that wraps the provided callback with the configured parameters and logic. - ``:rtype:`` Callable
+        callback. Can be 'AND' or 'OR'. Defaults to 'AND'. - ``:param precompute:`` Selects the delivery mode of THIS
+        callback: True (default) for runtime reduction delivery, False for the legacy full-chunk scatter. -
+        ``:return:`` A callable that wraps the provided callback with the configured parameters and logic. -
+        ``:rtype:`` Callable
         """
 
         def decorator(callback: IDeisa.Callback) -> IDeisa.Callback:
@@ -318,9 +312,9 @@ class Deisa(IDeisa):
         - ``:param callback:`` Callback function to register. - ``:param callback_args:`` Variable-length
         arguments representing callback-specific parameters. - ``:param exception_handler:`` Optional exception
         handler to manage errors during callback execution. - ``:param when:`` Specifies the conditional logic
-        for triggering the callback. Can be 'AND' or 'OR'. - ``:param precompute:`` If False, skip precompute
-        analysis with a warning and send the full data to workers. - ``:return:`` A callable that wraps the
-        provided callback with the configured parameters and logic.
+        for triggering the callback. Can be 'AND' or 'OR'. - ``:param precompute:`` Selects the delivery mode of
+        this callback: True (default) for runtime reduction delivery, False for the legacy full-chunk scatter. -
+        ``:return:`` A callable that wraps the provided callback with the configured parameters and logic.
         """
         logger.debug(f"register_callback: callback={callback}, callback_args={callback_args}")
         if not callback_args:
@@ -375,79 +369,30 @@ class Deisa(IDeisa):
             for arr_name, ws in parsed
         }
 
-        # NOTE: ``self._callbacks[callback_id]`` is written at the END of this method, only after the analysis and topic
-        # subscription succeed. Writing it earlier left a half-registered entry behind when the analysis raised: the id
-        # stayed unreachable via ``unregister_callback`` and ``callback.callback_id`` was never set.
+        # NOTE: ``self._callbacks[callback_id]`` is written at the END of this method, only after the delivery state is
+        # filed and the topic subscription succeeds. Writing it earlier left a half-registered entry behind when a
+        # later step raised: the id stayed unreachable via ``unregister_callback`` and ``callback.callback_id`` was
+        # never set.
 
-        # Analyze all registered arrays together (single pass, not per-array loop). The method takes the full {name:
-        # stub} dict so cross-array callbacks (e.g. cb(temperature, pressure)) are handled in one analysis.
-
-        # ``precompute=False`` is the explicit opt-out of precompute: skip the analysis entirely and fall back to the
-        # full-chunk scatter path. This is the documented contract (see ``register``) and what the
-        # test_no_precompute_worker_sees_full_chunk test expects.
+        # ``precompute`` selects the DELIVERY MODE of this callback and nothing else (decision F3): True hands the
+        # callback one data-free collection per array and timestep, whose reductions the bridges answer chunk-locally,
+        # and False keeps the legacy full-chunk scatter that every refusal message names as the remedy.
+        #
+        # Nothing is analyzed at registration any more (plan P4): the reduction plan is composed from the callback's
+        # own expression at its compute boundary, so there is no upfront AST pass to fail. A raw read is therefore
+        # refused at the FIRST compute boundary -- which fails the run -- instead of at registration.
 
         if not precompute:
             logger.warning(
                 f"_register_callback_impl: callback {callback.__name__!r} registered "
-                f"with precompute=False -- skipping precompute analysis; the bridge will "
-                f"use the legacy full-chunk scatter path."
+                f"with precompute=False -- the bridge will use the legacy full-chunk scatter path."
             )
         else:
-            # Single analysis pass for all arrays (cross-array callbacks work because the method takes the full {name:
-            # stub} dict). Each BranchSpec carries its source array (``input_name``); branches are grouped per array in
-            # memory, so each bridge fetches only its own array's branches (filed per cycle by ``execute_callbacks``).
-            branches = _analyze_callback_for_branches(callback, self.arrays_metadata)
-            if not branches:
-                logger.debug(
-                    f"_register_callback_impl: callback {callback.__name__!r} produced no precomputable branches "
-                    f"for any of the registered arrays {array_names!r}."
-                    f"Without branches, the bridge falls back to scattering the FULL chunk to the dask workers only "
-                    f"when analysis is skipped (register with precompute=False; the analyzer is not run for that "
-                    f"callback). With precompute=True there is no fallback: registration raises, because the "
-                    f"precompute path requires at least one chunk-local reduction."
-                )
-                raise NoPrecomputableReductionError(
-                    f"Callback {callback.__name__!r} produced no precomputable reductions for any of the "
-                    f"registered arrays {array_names!r}."
-                    f"The precompute path requires at least one chunk-local reduction. To run the callback on the "
-                    f"full-chunk scatter path, redesign the callback to use a single dask reduction (sum, mean, var, "
-                    f"std, min, max, prod) and avoid expressions whose reduction depends on another reduction's output."
-                )
-            # Refuse non-direct reductions: a reduction over a pointwise chain or slice ((arr*arr).sum(),
-            # arr[2:5].sum()) cannot be reconstructed on the callback side -- delivery would compute the reduction of
-            # the WRONG input. Loud refusal beats a silent wrong value.
-            for b in branches:
-                if not b.deliver_direct:
-                    raise UnsupportedReductionError(
-                        f"Callback {callback.__name__!r}: cannot precompute reduction {b.output_key!r} "
-                        f"(op {b.op_name or '<unknown>'!r} on array {b.input_name!r}): the reduction input is "
-                        f"not the registered array chunk itself -- it is a pointwise chain or slice (e.g. "
-                        f"(arr*arr).sum() or arr[2:5].sum()), which the precompute delivery path cannot "
-                        f"reconstruct correctly on the callback side. Register a plain arr.<op>() reduction "
-                        f"or use precompute=False."
-                    )
-            # Group branches by source array and merge with previously registered callbacks' branches (identical
-            # signature -> shared single branch; distinct reductions coexist). Merging/pruning is in-memory only: filing
-            # happens in ``execute_callbacks`` -> ``_flush_branches_to_handshake``, never inside a running event handler
-            # (an actor call there stalls the handler loop).
-            by_array: Dict[str, List[Any]] = {}
-            for b in branches:
-                by_array.setdefault(b.input_name, []).append(b)
-            for arr_name, group in by_array.items():
-                merged = merge_branches(self._branch_groups.get(arr_name, []), group)
-                self._branch_groups[arr_name] = merged
-            # File the merged set with the handshake actor right away: a bridge on the wait_for_go=False path fetches
-            # lazily on its FIRST send(), which can happen long before the next execute_callbacks() cycle.
-            self._flush_branches_to_handshake()
-            # Record per-callback reduction descriptors (key, op, reduction axes, kind) for the topic handler's
-            # dispatch view. ``reduction_axes`` is the branch builder's recorded value, NOT a re-normalization of
-            # ``chunk_axis``: a chunk axis is partial even for window reads whose runtime reduction is full.
-            descriptors: Dict[str, List[Tuple[str, str, Tuple[int, ...], str]]] = {}
-            for b in branches:
-                desc = (b.output_key, b.op_name, b.reduction_axes, b.output_kind)
-                if desc not in descriptors.setdefault(b.input_name, []):
-                    descriptors[b.input_name].append(desc)
-            self._callback_reductions[callback_id] = descriptors
+            # These arrays are runtime-delivery targets: the bridges need to know, because an eager scalar menu for an
+            # array no callback reads is six chunk folds per bridge per timestep of pure critical-path cost. Filed
+            # with the handshake actor here and at the per-cycle boundary, like the rest of the delivery state.
+            self._runtime_arrays.update(array_names)
+            self._flush_delivery_state_to_handshake()
 
         # create the topic handler and subscribe for EVERY array in a callback (both precompute=True and
         # precompute=False paths. With precompute=False the bridge still needs the topic subscription to receive data
@@ -460,13 +405,16 @@ class Deisa(IDeisa):
                 logger.debug(f"_register_callback_impl: subscribe_topic() {array_name}")
                 self.client.subscribe_topic(array_name, handler)
 
-        # Register the callback payload only after every step that can raise (analysis, branch filing, subscription) has
-        # succeeded.
+        # Register the callback payload only after every step that can raise (delivery-state filing, subscription) has
+        # succeeded. ``precompute`` is carried in the payload because it is read per EVENT: the topic handler dispatches
+        # each callback down its own delivery path, and an unregistration recomputes the array's runtime-delivery
+        # membership from the surviving payloads.
         self._callbacks[callback_id] = {
             "callback": callback,
             "when": when,
             "exception_handler": exception_handler,
             "array_names": array_names,
+            "precompute": precompute,
             "state": callback_state,
         }
 
@@ -476,7 +424,7 @@ class Deisa(IDeisa):
         # Recompute the per-array branch set from the remaining registered callbacks (otherwise a later registration
         # collides with the stale (output_key, signature) at merge_branches). Deliberately does NOT re-file the
         # handshake actor: unregistering can run INSIDE the async topic handler, where an actor call stalls the handler
-        # loop; the pruned set is filed by the next ``_flush_branches_to_handshake``.
+        # loop; the pruned set is filed by the next ``_flush_delivery_state_to_handshake``.
         descriptors: Dict[str, List[Tuple[str, str, Tuple[int, ...], str]]] = {}
         for cid in self._callbacks_by_array.get(array_name, ()):
             for arr, descs in self._callback_reductions.get(cid, {}).items():
@@ -489,6 +437,24 @@ class Deisa(IDeisa):
             return
         remaining = [b for b in self._branch_groups.get(array_name, []) if b.output_key in wanted_keys]
         self._branch_groups[array_name] = remaining
+
+    def _prune_runtime_array(self, array_name: str) -> None:
+        """Recompute whether ``array_name`` is still a runtime-delivery target from the surviving callbacks.
+
+        An array stays a target while at least one callback registered on it delivered with ``precompute=True``. Like
+        the branch prune this only touches memory: the changed set reaches the bridges at the next flush point
+        (``execute_callbacks``), never from inside the async topic handler where the unregistration may run.
+
+        - ``:param array_name:`` Registered array the removed callback was registered on.
+        """
+        still_runtime = any(
+            self._callbacks.get(cid, {}).get("precompute", True)
+            for cid in self._callbacks_by_array.get(array_name, ())
+        )
+        if still_runtime:
+            self._runtime_arrays.add(array_name)
+        else:
+            self._runtime_arrays.discard(array_name)
 
     def unregister_callback(self, callback_id: Callback_id) -> None:
         # also accept a decorated callback function, which stores its id in .callback_id
@@ -505,9 +471,10 @@ class Deisa(IDeisa):
                 s.discard(callback_id)
                 if not s:
                     del self._callbacks_by_array[array_name]
-            # Prune unconditionally for every array the callback touched: the dead callback's branch must leave
-            # _branch_groups and the handshake actor even if other callbacks remain registered.
+            # Prune unconditionally for every array the callback touched: the dead callback's branch and its
+            # runtime-delivery claim must leave the set even if other callbacks remain registered.
             self._prune_branches(array_name)
+            self._prune_runtime_array(array_name)
 
     def set(self, key: str, value: Any, timestep: int) -> None:
         """
@@ -528,8 +495,16 @@ class Deisa(IDeisa):
         value = (timestep, value)
         q.put(value)
 
-    def _flush_branches_to_handshake(self) -> None:
-        """File every array's current branch set with the handshake actor.
+    def _flush_delivery_state_to_handshake(self) -> None:
+        """File every array's current delivery state with the handshake actor.
+
+        Two per-array facts travel to the bridges, over the ONE broadcast each of them already enters per array (see
+        :meth:`deisa.dask.handshake.Handshake.get_task_state`):
+
+        - the branch set of the array (empty by construction now that nothing files branches; kept until the legacy
+          branch machinery is deleted), and
+        - whether the array is a runtime-delivery target, i.e. whether the eager scalar menu it computes has any
+          reader at all.
 
         Called by ``register_callback`` (a bridge on the wait_for_go=False path fetches lazily on first send(),
         possibly before the next cycle) and by ``execute_callbacks`` (before the bridges are unblocked).
@@ -538,6 +513,7 @@ class Deisa(IDeisa):
         """
         for arr_name, branches in self._branch_groups.items():
             self.handshake.set_task_branches(arr_name, branches)
+        self.handshake.set_runtime_arrays(sorted(self._runtime_arrays))
 
     def execute_callbacks(self) -> None:
         """
@@ -547,18 +523,18 @@ class Deisa(IDeisa):
                 ensuring the orchestration of subsequent tasks. It is responsible for unblocking bridges and waiting
                 for dependencies to signal completion.
 
-                This is also the branch-filing boundary for unregistration: the pruned branch sets (pruned in memory by
-                ``unregister_callback``) are re-filed to the handshake actor here, once per cycle, before the bridges
-                see them. - ``:param self:`` The instance of the class invoking this method. - ``:return:`` None
+                This is also the delivery-state filing boundary for unregistration: the pruned state (pruned in memory
+                by ``unregister_callback``) is re-filed to the handshake actor here, once per cycle, before the bridges
+                see it. - ``:param self:`` The instance of the class invoking this method. - ``:return:`` None
         """
         logger.info("execute_callbacks()")
 
-        # Snapshot the pruned/merged branch sets into the handshake actor before unblocking the bridges: from their
-        # point of view the branch state is static for the whole cycle.
-        self._flush_branches_to_handshake()
+        # Snapshot the pruned/merged delivery state into the handshake actor before unblocking the bridges: from their
+        # point of view it is static for the whole cycle.
+        self._flush_delivery_state_to_handshake()
 
-        # From this point on the bridge contract is sealed: no new callbacks may be registered and no new branches will
-        # be filed.
+        # From this point on the bridge contract is sealed: no new callbacks may be registered and no new delivery
+        # state will be filed.
         self._execute_callbacks_called = True
 
         logger.info("Bridges are ready, unblock bridges")
@@ -628,114 +604,35 @@ class Deisa(IDeisa):
 
                 _weak_self.__update_futures_ownership(futures)
 
-                precomputed = payload.get("precomputed")
-                if precomputed and runtime_delivery_enabled():
-                    # Runtime reduction delivery: the callback gets one lazily-reducible collection per array and
-                    # timestep. Nothing is combined and nothing is persisted here -- the collection carries no data,
-                    # so there is no combined array to keep alive; its reductions either read the eager menu the
-                    # bridges shipped with this event or dispatch an on-demand plan.
+                # Delivery mode is a property of the CALLBACK, not of the event (decision F3): ``precompute=True``
+                # callbacks get one data-free collection per array and timestep, ``precompute=False`` callbacks keep
+                # the legacy full-chunk scatter. The event's ``precomputed`` field is no longer read -- with nothing
+                # filing branches it is empty by construction.
+                runtime_views: Dict[Any, Any] = {}
+                if _weak_self._has_runtime_callbacks(array_name):
+                    # The bridges' eager menu is the zero-round-trip half of the reduction path, so its failure is the
+                    # RUN's failure: recorded once per event, before any collection is built on top of it.
                     _weak_self._record_menu_failure(payload)
-                    views = _weak_self._runtime_views(array_name, iteration, payload)
-                elif precomputed:
-                    # Precompute path: one ``futures`` entry per (bridge, reduction); group by ``output_key`` and
-                    # dispatch on kind:
-                    # - scalar FULL: ``da.stack`` partials; the callback's reduction combines them via dask's graph.
-                    # - scalar AXIS: two-phase combine folds red grid levels, concatenates kept levels.
-                    #                mean/moment: ``{n, total[, M]}`` dict blobs; two-phase combine calls
-                    #                ``mean_agg``/``moment_agg`` and delivers the FINAL value
-                    #                (not a re-.var()-able (1,1) array).
-                    by_reduction: Dict[str, List[Any]] = {}
-                    for f in futures:
-                        by_reduction.setdefault(f["output_key"], []).append(f)
-                    metadata = _weak_self.arrays_metadata[array_name]
-                    array_ndim = len(metadata.get("global_shape", ())) if metadata.get("global_shape") else None
-                    grid_size = _grid_size_from_metadata(metadata)
-                    grid_extent = _grid_extent_from_metadata(metadata)
-                    combined_by_key: Dict[str, Any] = {}
-                    for output_key, partial_futures in by_reduction.items():
-                        kind = partial_futures[0].get("kind", "scalar")
-                        finalize = partial_futures[0].get("finalize")
-                        partial_shape = partial_futures[0]["shape"]
-                        partial_dtype = partial_futures[0]["dtype"]
-                        reduction_axes_hint = partial_futures[0].get("chunk_axis")
-                        op_name = partial_futures[0].get("op_name")
-                        # Every bridge must ship its partial for every reduction. A missing partial silently corrupts
-                        # the combined result (stacks shrink, n-totals lose a bridge). Refuse loudly.
-                        if grid_size is not None and len(partial_futures) != grid_size:
-                            raise PrecomputeRuntimeError(
-                                f"topic_handler: array {array_name!r} reduction {output_key!r}: expected "
-                                f"{grid_size} bridge partial(s) (grid {grid_extent}) but received "
-                                f"{len(partial_futures)}. A bridge dropped or failed a branch; refusing to "
-                                f"deliver a corrupted reduction."
-                            )
-                        if kind == "pca":
-                            # Bridge-side PCA: each bridge already summarized ITS OWN chunk, so the tree below consumes
-                            # summaries only. The root is where n_components/whiten are applied -- never on a bridge --
-                            # so what the callback receives is the exact pooled PCA, truncated to the requested
-                            # components at the last possible moment.
-                            spec = _weak_self._branch_spec_for(array_name, output_key)
-                            combined_by_key[output_key] = _combine_pca_summaries(
-                                partial_futures,
-                                config=(dict(spec.summary_config) if spec is not None else {}),
-                            )
-                        elif kind == "scalar" and _weak_self._is_full_reduction(array_name, output_key):
-                            # Full scalar reduction: stack per-bridge partials along a new axis so the callback's
-                            # reduction combines them via dask's natural graph.
-                            sorted_partials = sorted(partial_futures, key=lambda p: tuple(p["chunk_position"]))
-                            blocks = [
-                                da.from_delayed(p["future"], shape=partial_shape, dtype=partial_dtype)
-                                for p in sorted_partials
-                            ]
-                            if len(blocks) == 1:
-                                combined_by_key[output_key] = blocks[0]
-                            else:
-                                combined_by_key[output_key] = da.stack(blocks)
-                        elif kind in ("mean", "moment") or kind == "scalar":
-                            # Dict blobs or plain-array axis partials: the two-phase combine folds red levels and
-                            # concatenates kept levels; pass the grid extent and global shape so shape errors are loud.
-                            combined_by_key[output_key] = _combine_array_from_partials(
-                                partial_futures,
-                                kind=kind,
-                                finalize=finalize,
-                                reduction_axes_hint=reduction_axes_hint,
-                                array_ndim=(
-                                    array_ndim if array_ndim is not None else len(partial_futures[0]["chunk_position"])
-                                ),
-                                op_name=op_name,
-                                global_shape=(
-                                    tuple(metadata.get("global_shape", ())) if metadata.get("global_shape") else None
-                                ),
-                                grid_extent=grid_extent,
-                            )
-                        else:
-                            raise PrecomputeRuntimeError(
-                                f"topic_handler: unknown precompute kind {kind!r} for {output_key}, refusing to deliver"
-                            )
-                    # Every combined array must stay alive for the callback(s) that hold it. The pca
-                    # entry is a DeliveredPCA, not a dask array, and has no shape to persist, so it is skipped here: its
-                    # per-bridge LEAF futures are already retained by __update_futures_ownership, and the merge tree is
-                    # rebuilt on demand from those same keys each time a callback fits it.
-                    _persistable = [c for c in combined_by_key.values() if isinstance(c, da.Array)]
-                    if _persistable:
-                        _weak_self.client.persist(_persistable)
-                    logger.debug(
-                        f"topic_handler: precompute path produced {len(combined_by_key)} reduction chunk(s) "
-                        f"with shapes {[c.shape for c in _persistable]}"
-                    )
-                    # Per-callback dispatch view: each callback sees its OWN combined array; the view rejects unrecorded
-                    # calls.
-                    views = _weak_self._build_callback_views(array_name, iteration, combined_by_key)
-                else:
-                    views = {}
-                    # Full-chunk path: ``futures`` carries one entry per bridge with the full-chunk shape. Tile them
-                    # into a single dask array.
-                    parts = sorted(futures, key=lambda p: p["chunk_position"])
-                    darr_chunks = [da.from_delayed(p["future"], shape=p["shape"], dtype=p["dtype"]) for p in parts]
-                    darr = _weak_self.__tile_dask_blocks(
-                        darr_chunks, _weak_self.arrays_metadata[array_name]["global_shape"]
-                    )
-                    # tell the scheduler that gc must *not* collect the futures used by this dask array
-                    _weak_self.client.persist(darr)
+                    runtime_views = _weak_self._runtime_views(array_name, iteration, payload)
+
+                full_chunk_darr: List[Any] = []
+
+                def _get_full_chunk_darr():
+                    """Tile the full-chunk futures into one dask array on first use, and pin it in the scheduler.
+
+                    Built lazily on purpose: an event whose callbacks are ALL served by runtime delivery must not pay
+                    for a dask graph over a chunk nobody reads.
+                    """
+                    if not full_chunk_darr:
+                        parts = sorted(futures, key=lambda p: p["chunk_position"])
+                        blocks = [da.from_delayed(p["future"], shape=p["shape"], dtype=p["dtype"]) for p in parts]
+                        darr = _weak_self.__tile_dask_blocks(
+                            blocks, _weak_self.arrays_metadata[array_name]["global_shape"]
+                        )
+                        # tell the scheduler that gc must *not* collect the futures used by this dask array
+                        _weak_self.client.persist(darr)
+                        full_chunk_darr.append(darr)
+                    return full_chunk_darr[0]
 
                 # dispatch to interested callbacks
                 for callback_id in list(_weak_self._callbacks_by_array.get(array_name, [])):
@@ -746,14 +643,13 @@ class Deisa(IDeisa):
                     if array_name not in cb_data["state"]:
                         continue
 
-                    if precomputed:
-                        cb_darr = views.get(callback_id)
+                    if cb_data.get("precompute", True):
+                        cb_darr = runtime_views.get(callback_id)
                         if cb_darr is None:
-                            # This callback has no precomputed reduction for this array (its branches are all on another
-                            # array): nothing to deliver here.
+                            # The callback was unregistered while this event was in flight: nothing to deliver.
                             continue
                     else:
-                        cb_darr = darr
+                        cb_darr = _get_full_chunk_darr()
 
                     try:
                         _weak_self._process_callback(callback_id, cb_data, array_name, cb_darr, iteration)
@@ -889,6 +785,19 @@ class Deisa(IDeisa):
             self._run_failure = failure
         logger.error(f"the bridge eager menu failed for array {payload.get('array_name')!r}: {detail}")
 
+    def _has_runtime_callbacks(self, array_name: str) -> bool:
+        """Whether ANY callback registered on ``array_name`` is served by runtime delivery.
+
+        The topic handler reads this once per event: with no runtime callback there is nobody to hand a collection
+        to, so the event carries no menu worth recording and no view worth building.
+
+        - ``:param array_name:`` Registered array the topic event is for.
+        """
+        return any(
+            self._callbacks.get(cid, {}).get("precompute", True)
+            for cid in self._callbacks_by_array.get(array_name, ())
+        )
+
     def _runtime_views(self, array_name: str, iteration: int, payload: Mapping[str, Any]) -> Dict[Any, Any]:
         """Build the runtime delivery view of one array for one timestep: a FRESH collection per callback.
 
@@ -905,12 +814,16 @@ class Deisa(IDeisa):
 
         The newest timestep of the array is recorded here, before the views are built, so a dispatcher held by an
         OLDER collection in a callback's window can tell that its timestep is no longer the one the bridges retain.
+
+        ``precompute=False`` callbacks are skipped: they read the full-chunk scatter, so a collection for them would
+        be a delivery nobody consumes.
         """
         self._runtime_latest_timestep[array_name] = int(iteration)
         menus = None if payload.get("menu_error") else payload.get("menu")
         return {
             callback_id: self._runtime_collection(array_name, iteration, menus)
             for callback_id in list(self._callbacks_by_array.get(array_name, ()))
+            if self._callbacks.get(callback_id, {}).get("precompute", True)
         }
 
     def _runtime_collection(self, array_name: str, iteration: int, menus: Any = None) -> DeisaCollection:

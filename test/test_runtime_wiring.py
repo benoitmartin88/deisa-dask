@@ -50,9 +50,7 @@ import pytest
 from deisa.core.types import DeisaArray
 from utils import FakeComm
 
-from deisa.dask import bridge as bridge_module
 from deisa.dask import deisa as deisa_module
-from deisa.dask import precompute_analyzer as analyzer_module
 from deisa.dask import runtime_errors as errors
 from deisa.dask.bridge import Bridge
 from deisa.dask.collection import DeisaCollection
@@ -65,10 +63,8 @@ from deisa.dask.runtime_dispatch import (
     PlanResponder,
     build_eager_menu,
     dispatch_plan_over_comm,
-    runtime_delivery_enabled,
     serve_plan_requests,
 )
-from deisa.dask.utils import make_precomputed_view
 
 ARRAY_NAME = "f"
 # ``n_samples > d`` is what keeps the merged PCA summary smaller than the data it summarizes, so the estimator's
@@ -224,10 +220,14 @@ class _FakeHandshake:
 
     def __init__(self):
         self.branches = {}
+        self.runtime_arrays = set()
         self.finished = 0
 
     def set_task_branches(self, array_name, hints):  # noqa: D102
         self.branches[array_name] = hints
+
+    def set_runtime_arrays(self, array_names):  # noqa: D102
+        self.runtime_arrays = set(array_names)
 
     def wait_for_bridges_to_finish(self):  # noqa: D102
         self.finished += 1
@@ -273,17 +273,17 @@ def make_deisa(fleets, client, monkeypatch):
     deisa._callback_reductions = {}
     deisa._callback_seq = 0
     deisa._branch_groups = {}
+    deisa._runtime_arrays = set()
     deisa._tasks = set()
     deisa._execute_callbacks_called = False
     deisa._runtime_transports = {ARRAY_NAME: fleets.exchange}
     deisa._runtime_latest_timestep = {}
     deisa._run_failure = None
     deisa._topic_handlers[ARRAY_NAME] = deisa._make_topic_handler(ARRAY_NAME)
-    monkeypatch.setattr(deisa_module, "runtime_delivery_enabled", lambda: True)
     return deisa
 
 
-def register(deisa, callback, window_size=2, when="OR", exception_handler=None):
+def register(deisa, callback, window_size=2, when="OR", exception_handler=None, precompute=True):
     """Register ``callback`` directly: the precompute analysis is not this card's boundary."""
     callback_id = f"{deisa_module.CALLBACK_PREFIX}{len(deisa._callbacks) + 1}"
     deisa._callbacks[callback_id] = {
@@ -291,11 +291,14 @@ def register(deisa, callback, window_size=2, when="OR", exception_handler=None):
         "when": when,
         "exception_handler": exception_handler,
         "array_names": [ARRAY_NAME],
+        "precompute": precompute,
         "state": {
             ARRAY_NAME: {"window": collections.deque(maxlen=window_size), "changed": False, "last_iteration": None}
         },
     }
     deisa._callbacks_by_array.setdefault(ARRAY_NAME, set()).add(callback_id)
+    if precompute:
+        deisa._runtime_arrays.add(ARRAY_NAME)
     return callback_id
 
 
@@ -307,15 +310,11 @@ async def _drain(tasks, timeout=20.0):
     assert not tasks, "a callback task never finished"
 
 
-_DEFAULT_PRECOMPUTED = {"f-sum": {"kind": "scalar"}}
-
-
-def deliver(deisa, timestep, menus, precomputed=_DEFAULT_PRECOMPUTED, menu_error=None):
+def deliver(deisa, timestep, menus, menu_error=None):
     """Hand the topic event for ``timestep`` to the real handler, then drain the callback tasks it spawned."""
     payload = {
         "iteration": timestep,
         "futures": [],
-        "precomputed": precomputed,
         "menu": menus,
     }
     if menu_error is not None:
@@ -521,43 +520,27 @@ def test_mixed_timestep_expression_aborts_the_run(fleets, client, monkeypatch, g
         deisa.execute_callbacks()
 
 
-def test_flag_off_legacy_refusal_aborts_the_run(fleets, client, monkeypatch, go_event):
-    """The default (flag OFF) path aborts too: the legacy view raises the ANALYZER's classes mid-run.
+def test_precompute_taxonomy_refusal_aborts_the_run(fleets, client, monkeypatch, go_event):
+    """A refusal from the PRECOMPUTE taxonomy aborts too, not just the runtime one.
 
-    The legacy precompute view is the delivery mode of every deployment today, and it raises
-    ``precompute_analyzer.UnsupportedReductionError`` when a callback performs a reduction the analyzer never recorded.
-    R3's contract (a mid-run refusal fails the run, not a log line) has to hold for that path as well, so the abort
-    predicate must cover BOTH taxonomies.
+    The runtime classes subclass the precompute namesakes (``runtime_errors``), so a caller that catches
+    ``PrecomputeError`` still catches a runtime refusal -- one hierarchy, walked from the top by ``_is_run_aborting``.
+    This test raises the BASE class from a callback, which is what the legacy precompute view used to do, and proves
+    the precompute half of the predicate is covered on its own rather than only through a subclass.
     """
     deisa = make_deisa(fleets, client, monkeypatch)
-    monkeypatch.setattr(deisa_module, "runtime_delivery_enabled", lambda: False)
-
-    legacy_view = make_precomputed_view(
-        da.zeros(GLOBAL_SHAPE, chunks=CHUNK_SHAPE),
-        t=0,
-        signatures={("mean", ()): da.zeros((), chunks=())},
-        reapply=set(),
-        registered_ndim=len(GLOBAL_SHAPE),
-    )
-    refusals = []
 
     def callback(window):
-        try:
-            window[-1].min()
-        except BaseException as ex:  # recorded so the test can prove WHICH refusal the callback hit
-            refusals.append(ex)
-            raise
+        raise deisa_module.UnsupportedReductionError("the precompute view refused this reduction")
 
-    callback_id = register(deisa, callback)
-    monkeypatch.setattr(Deisa, "_build_callback_views", lambda self, a, i, combined: {callback_id: legacy_view})
-    deliver(deisa, 0, None)
+    register(deisa, callback)
+    deliver(deisa, 0, fleets.menus(0))
 
-    assert isinstance(refusals[0], analyzer_module.UnsupportedReductionError)
-    assert not isinstance(refusals[0], deisa_module.RuntimeRefusal), "the ANALYZER taxonomy, not the runtime one"
-    assert isinstance(deisa._run_failure, analyzer_module.UnsupportedReductionError)
+    assert isinstance(deisa._run_failure, deisa_module.UnsupportedReductionError)
+    assert not isinstance(deisa._run_failure, deisa_module.RuntimeRefusal), "the PRECOMPUTE taxonomy, not the runtime"
     assert deisa._callbacks == {}, "a refused callback must not stay registered for the next cycle"
 
-    with pytest.raises(analyzer_module.UnsupportedReductionError):
+    with pytest.raises(deisa_module.UnsupportedReductionError):
         deisa.execute_callbacks()
 
 
@@ -649,7 +632,11 @@ def test_pca_fit_without_a_transport_refuses(client):
 # The legacy paths are untouched
 # ---------------------------------------------------------------------------------------------------------------------
 def test_precompute_false_still_receives_the_full_chunk(fleets, client, monkeypatch):
-    """A ``precompute=False`` callback still gets the whole tiled array, not a collection."""
+    """A ``precompute=False`` callback still gets the whole tiled array, not a collection.
+
+    Delivery mode is the CALLBACK's, so this one registers ``precompute=False`` and the sibling tests' default
+    ``precompute=True`` callbacks are unaffected: one event may serve both paths.
+    """
     deisa = make_deisa(fleets, client, monkeypatch)
     received = []
     monkeypatch.setattr(
@@ -661,8 +648,9 @@ def test_precompute_false_still_receives_the_full_chunk(fleets, client, monkeypa
     def callback(window):
         received.append(window[-1])
 
-    register(deisa, callback)
-    deliver(deisa, 0, fleets.menus(0), precomputed=None)
+    register(deisa, callback, precompute=False)
+    assert deisa._runtime_arrays == set(), "a full-chunk callback declares no runtime-delivery array"
+    deliver(deisa, 0, fleets.menus(0))
 
     assert len(received) == 1
     assert isinstance(received[0], DeisaArray)
@@ -670,32 +658,47 @@ def test_precompute_false_still_receives_the_full_chunk(fleets, client, monkeypa
     assert received[0].shape == GLOBAL_SHAPE
 
 
-def test_flag_off_keeps_the_legacy_delivery(fleets, client, monkeypatch):
-    """With the flag off the topic handler never builds a collection: the legacy view is selected."""
+def test_one_event_serves_both_delivery_modes(fleets, client, monkeypatch):
+    """Two callbacks on ONE array, one per delivery mode: each gets its own payload from the same event (F3)."""
     deisa = make_deisa(fleets, client, monkeypatch)
-    monkeypatch.setattr(deisa_module, "runtime_delivery_enabled", lambda: False)
-    legacy_calls = []
+    collections_seen = []
+    arrays_seen = []
+    monkeypatch.setattr(
+        Deisa,
+        "_Deisa__tile_dask_blocks",
+        lambda self, blocks, global_shape: da.zeros(global_shape, chunks=CHUNK_SHAPE),
+    )
 
-    def fake_legacy_views(self, array_name, iteration, combined_by_key):
-        legacy_calls.append((array_name, iteration))
-        return {}
+    def runtime_callback(window):
+        collections_seen.append(window[-1])
 
-    def forbidden(self, array_name, iteration, payload):
-        raise AssertionError("the runtime delivery must not be selected while the flag is off")
+    def full_chunk_callback(window):
+        arrays_seen.append(window[-1])
 
-    monkeypatch.setattr(Deisa, "_build_callback_views", fake_legacy_views)
-    monkeypatch.setattr(Deisa, "_runtime_views", forbidden)
-
-    register(deisa, lambda window: None)
+    register(deisa, runtime_callback)
+    register(deisa, full_chunk_callback, precompute=False)
     deliver(deisa, 0, fleets.menus(0))
 
-    assert legacy_calls == [(ARRAY_NAME, 0)]
+    assert len(collections_seen) == 1 and isinstance(collections_seen[0], DeisaCollection)
+    assert len(arrays_seen) == 1 and isinstance(arrays_seen[0], DeisaArray)
+    assert not isinstance(arrays_seen[0], DeisaCollection)
 
 
-def test_delivery_flag_defaults_to_off():
-    """The delivery flag is an internal switch read once at import, off by default."""
-    assert runtime_delivery_enabled() is False
-    assert isinstance(deisa_module.runtime_delivery_enabled(), bool)
+def test_departed_runtime_callback_flips_the_array_off(fleets, client, monkeypatch, go_event):
+    """Unregistering the last ``precompute=True`` callback drops the array from the bridged runtime set."""
+    deisa = make_deisa(fleets, client, monkeypatch)
+
+    runtime_id = register(deisa, lambda window: None)
+    assert deisa._runtime_arrays == {ARRAY_NAME}
+    deisa._flush_delivery_state_to_handshake()
+    assert deisa.handshake.runtime_arrays == {ARRAY_NAME}
+
+    register(deisa, lambda window: None, precompute=False)
+    deisa.unregister_callback(runtime_id)
+
+    assert deisa._runtime_arrays == set(), "no runtime callback is left on the array"
+    deisa.execute_callbacks()
+    assert deisa.handshake.runtime_arrays == set(), "the pruned set is re-filed at the cycle boundary"
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -768,7 +771,6 @@ def send_one_chunk(monkeypatch, chunk):
     both run for real: only the scatter and the per-branch chunk stage are stubbed -- they are ``test_bridge.py``'s
     subject and need a scheduler.
     """
-    monkeypatch.setattr(bridge_module, "runtime_delivery_enabled", lambda: True)
     bridge = Bridge.__new__(Bridge)
     wire_client = _WireClient()
     bridge.id = 0
@@ -777,8 +779,10 @@ def send_one_chunk(monkeypatch, chunk):
     bridge.workers = {"worker-0": {}}
     bridge.arrays_metadata = WIRE_METADATA
     bridge._array_comms = {ARRAY_NAME: FakeComm(FakeComm.State(1), 0)}
-    # The menu is gated on a FILED branch, so file one; its chunk stage is not this test's subject.
-    bridge._task_branches = {ARRAY_NAME: [object()]}
+    # The menu is gated on the array being a runtime-delivery target, so declare it; its chunk stage is not this
+    # test's subject.
+    bridge._runtime_delivery_arrays = {ARRAY_NAME}
+    bridge._task_branches = {ARRAY_NAME: []}
     bridge._branch_by_key = {}
     bridge._runtime_plan_backlog = {}
     bridge._runtime_last_chunk = {}

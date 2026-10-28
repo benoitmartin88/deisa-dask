@@ -150,7 +150,7 @@ def make_deisa_stub(client, monkeypatch, transports=None):
     deisa._run_failure = None
     deisa._runtime_transports = {} if transports is None else transports
     deisa._runtime_latest_timestep = {}
-    monkeypatch.setattr(deisa_module, "runtime_delivery_enabled", lambda: True)
+    deisa._runtime_arrays = set()
     return deisa
 
 
@@ -162,17 +162,19 @@ def register_callback(deisa, callback, window_size=1):
         "when": "OR",
         "exception_handler": None,
         "array_names": [ARRAY_NAME],
+        "precompute": True,
         "state": {
             ARRAY_NAME: {"window": collections.deque(maxlen=window_size), "changed": False, "last_iteration": None}
         },
     }
     deisa._callbacks_by_array.setdefault(ARRAY_NAME, set()).add(callback_id)
+    deisa._runtime_arrays.add(ARRAY_NAME)
     return callback_id
 
 
 def deliver(deisa, timestep):
     """Push one production topic event through the array's handler and wait for the callback task."""
-    payload = {"iteration": timestep, "futures": [], "precomputed": {"f-sum": {"kind": "scalar"}}, "menu": None}
+    payload = {"iteration": timestep, "futures": [], "menu": None}
     handler = deisa._topic_handlers[ARRAY_NAME]
     deisa.client.sync(lambda: handler((None, payload)))
     deisa.client.sync(lambda: _drain(deisa._tasks))
@@ -321,16 +323,17 @@ def test_window_reduction_older_than_the_delivery_is_refused_at_compose_time(cli
     assert "window[-1]" in message, "the refusal must name the remedy: reduce the latest delivered element"
 
 
-def test_backlog_belongs_to_every_participating_array_whatever_the_flag(monkeypatch):
-    """The send-boundary collective is decided by PARTICIPATION, never by the per-process flag.
+def test_backlog_belongs_to_every_participating_array(monkeypatch):
+    """The send-boundary collective is decided by PARTICIPATION, and only the QUEUE PUMP needs a dask client.
 
-    A rank whose flag is off still enters the boundary collective the array root broadcasts in. Gating the backlog on
-    the flag (the pre-fix shape) made the root issue a ``bcast`` while its peers went straight to the scatter: two
-    different collectives on one communicator, i.e. a hang instead of a refusal. Only the queue pump is gated.
+    A rank still enters the boundary collective the array root broadcasts in. Gating the backlog on a per-process
+    setting (the pre-fix shape) made the root issue a ``bcast`` while its peers went straight to the scatter: two
+    different collectives on one communicator, i.e. a hang instead of a refusal. The pump, by contrast, is reachable
+    only through a dask client, so a rank without one cannot start it.
     """
-    monkeypatch.setattr(bridge_module, "runtime_delivery_enabled", lambda: False)
     bridge = Bridge.__new__(Bridge)
     bridge.id = 0
+    bridge.client = None  # this rank owns no dask client: nothing to poll a queue through
     bridge._runtime_plan_backlog = {}
     bridge._runtime_plan_threads = {}
     bridge._runtime_plan_stops = {}
@@ -342,8 +345,8 @@ def test_backlog_belongs_to_every_participating_array_whatever_the_flag(monkeypa
     assert set(bridge._runtime_plan_backlog) == {ARRAY_NAME}, (
         "every participating array needs a backlog, so the send boundary is the same collective on every rank"
     )
-    assert bridge._runtime_plan_threads == {}, "the queue pump is the only thing the flag gates"
-    assert bridge._runtime_plan_report_queues == {}, "no queue is touched without the flag"
+    assert bridge._runtime_plan_threads == {}, "the queue pump is what the client gate stops"
+    assert bridge._runtime_plan_report_queues == {}, "no queue is touched without a client"
 
 
 def test_bridge_send_boundary_serves_the_backlog_over_the_sub_comm(client):

@@ -112,7 +112,6 @@ __all__ = [
     "PlanRequestBacklog",
     "PlanResponder",
     "QueuePlanExchange",
-    "RUNTIME_REDUCTION_DELIVERY_ENABLED",
     "build_eager_menu",
     "dispatch_plan_over_comm",
     "eager_menu_requests",
@@ -120,25 +119,9 @@ __all__ = [
     "plan_report_queue_name",
     "plan_report_timeout",
     "plan_request_queue_name",
-    "runtime_delivery_enabled",
     "serve_plan_queue",
     "serve_plan_requests",
 ]
-
-# Internal delivery flag of the runtime reduction path: an environment variable read ONCE at import, deliberately not a
-# user parameter. It selects the experimental delivery mode while the analyzer-driven one is still present; the default
-# is off, so nothing changes until a deployment sets it.
-RUNTIME_REDUCTION_DELIVERY_ENABLED: bool = os.environ.get("DEISA_DASK_RUNTIME_REDUCTION", "").strip().lower() in (
-    "1",
-    "true",
-    "yes",
-    "on",
-)
-
-
-def runtime_delivery_enabled() -> bool:
-    """Whether the runtime reduction delivery path is selected, read through the module so a test can flip it."""
-    return RUNTIME_REDUCTION_DELIVERY_ENABLED
 
 
 # The combine algebra ``_combine_two_phase`` is a ``dask.delayed`` function: a merge must not build a task graph, so the

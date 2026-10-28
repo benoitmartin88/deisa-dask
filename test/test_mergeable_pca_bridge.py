@@ -27,48 +27,51 @@
 # POSSIBILITY OF SUCH DAMAGE.
 # =============================================================================
 """
-End-to-end tests for the BRIDGE-SIDE MergeablePCA path: registration, delivery, and the delivered fit.
+End-to-end tests for the BRIDGE-SIDE MergeablePCA path on RUNTIME DELIVERY: registration, the dispatched PCA branch,
+and the delivered fit.
 
-This file exists because every stage of the bridge path was implemented and NONE of it was exercised. The full suite
-was green with zero tests touching registration of a ``MergeablePCA`` callback, the per-callback dispatch view, or the
-delivered fit, which is how two execution blockers shipped unnoticed:
+This file exists because two execution blockers once shipped unnoticed: the analyzer None-filled every constructor
+parameter the caller did not write (the estimator rejects a ``None`` ``whiten``, so ``MergeablePCA(n_components=3)`` was
+refused at registration), and the delivered fit cross-checked the summary's feature count against the PCA-only
+CARRIER's ``shape[-1]``, which is 1 for every registered array, so every legitimate fit with ``d != 1`` was refused.
 
-- the analyzer None-filled every constructor parameter the caller did not write, and the estimator rejects a
-  ``None`` ``whiten``, so ``MergeablePCA(n_components=3).fit(arr)`` -- the documented motivating example -- was refused
-  at registration;
-- the delivered fit cross-checked the summary's feature count against the PCA-only CARRIER's ``shape[-1]``, which is 1
-  for every registered array, so every legitimate fit with ``d != 1`` was refused.
+Both blockers were pinned through the analyzer and through ``make_precomputed_view``. Neither surface exists any more
+(plan P4 deletes the discovery machinery and the legacy precomputed view), so the contracts were PORTED to what replaced
+them rather than dropped -- the four below are the acceptance, and each still fails on the unfixed tree:
 
-The four contracts below are the acceptance for those two fixes, and each was written to fail on the unfixed tree:
+1. ``MergeablePCA(n_components=3)`` on a registered array is ACCEPTED end to end (``Deisa._register_callback_impl``).
+   Registration analyzes nothing now, so acceptance is pinned by what registration actually produces -- the callback
+   payload plus the array filed as a runtime-delivery target -- and by the bridge policy the estimator dispatches,
+   which carries no root-only field and therefore cannot invent an omitted parameter. That is blocker 1's fix
+   expressed structurally.
+2. A fit on a delivered collection completes through ``MergeablePCA._fit_runtime_collection`` -> the composed PCA
+   request -> per-bridge leaves -> the merge tree -> ``_fit_delivered``, and yields the requested number of components
+   with the right ``n_features_in_``, against a numpy batch-PCA reference.
+3. An EXPLICITLY invalid configuration is still refused -- by the estimator's own constructor, which is the only
+   validator left. Registration accepts it, because with no AST pass a callback that builds an invalid estimator fails
+   at its first compute boundary; the test pins that shift so it cannot come back silently as a registration-time pass.
+4. A non-trivial ``d >= 2`` works -- the exact ``shape[-1] == 1`` case blocker 2 refused -- and a summary over a
+   DIFFERENT feature basis is still refused, so the fix is not \"delete the check\".
 
-1. ``MergeablePCA(n_components=3)`` on a registered array is ACCEPTED end to end (registration through the real
-   ``Deisa._register_callback_impl``).
-2. A fit through the delivered path completes and yields the requested number of components, with the right
-   ``n_features_in_``, against a numpy batch-PCA reference.
-3. A non-bool ``whiten`` passed EXPLICITLY is still refused, so fix 1 did not weaken validation.
-4. A non-trivial ``d >= 2`` works -- the exact ``shape[-1] == 1`` case blocker 2 refused.
-
-Everything asserted here is real behaviour: the analyzer runs on real callback source, the branch's ``branch_func``
-runs on real numpy chunks, the merge tree really executes, and the numbers are compared to a numpy reference. Nothing
-is a mock.
-
-Test 2 also proves the invariant the whole feature rests on: the raw chunk never reaches the callback side. The
-per-bridge payload is the summary, and the fit's public attributes come out of that summary alone.
+Everything asserted here is real behaviour: the branch's ``branch_func`` runs on real numpy chunks, the merge tree
+really executes, and the numbers are compared to a numpy reference. Nothing is a mock -- the only stand-in is the
+dispatcher, which replaces the QUEUE ROUND TRIP and runs the very same composed request over the very same chunks.
 """
 
 from __future__ import annotations
 
 import textwrap
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, Optional, Sequence
 
 import numpy as np
 import pytest
 from deisa.core.types import Window
 from utils import _make_callback
 
+from deisa.dask.collection import DeisaCollection
 from deisa.dask.deisa import Deisa
-from deisa.dask.mergeable_pca import MergeablePCA, PCASummary, local_pca, merge_pca, merge_tree
-from deisa.dask.precompute_analyzer import IncompatibleCallbackError
+from deisa.dask.mergeable_pca import MergeablePCA, PCASummary, local_pca, merge_tree
+from deisa.dask.runtime_compose import compose_pca_request
 
 # The registered array every test here works against: 12 samples over 6 features, split into 4 chunks of 3 rows.
 # ``d = 6`` is deliberately greater than 1, which is the case the carrier's ``shape[-1] == 1`` refused.
@@ -95,6 +98,42 @@ def _batch_reference(X: np.ndarray) -> PCASummary:
     )
 
 
+# ------------------------------------------------------------------------------ the bridge side, without the queues
+# -------------------------------------------------------------------------------------------------------
+class _FieldDispatcher:
+    """The queue round trip, replaced by the work it does: run the composed request per chunk, merge the leaves.
+
+    ``PlanDispatcher.compute_pca`` puts the request on the plan queues and merges what the bridges report back. The
+    ROUND TRIP is all this stands in for: the request, the per-bridge leaf and the merge tree are the real ones, so a
+    fit driven through here covers the same code path the runtime delivery takes.
+    """
+
+    def __init__(self, field: np.ndarray, chunk_shape: Sequence[int], summary: Optional[PCASummary] = None) -> None:
+        self.field = field
+        self.chunk_shape = tuple(int(size) for size in chunk_shape)
+        self.summary = summary
+        self.requests: list = []
+
+    def compute_pca(self, request) -> PCASummary:
+        self.requests.append(request)
+        if self.summary is not None:
+            return self.summary
+        rows = self.chunk_shape[0]
+        leaves = [request.branch_func(self.field[start : start + rows]) for start in range(0, len(self.field), rows)]
+        return merge_tree(leaves)
+
+
+def _collection(
+    shape: Sequence[int] = GLOBAL_SHAPE,
+    chunk_shape: Sequence[int] = CHUNK_SHAPE,
+    dispatcher: Any = None,
+    name: str = "f",
+    timestep: int = 0,
+) -> DeisaCollection:
+    """The collection the topic handler delivers for one array and timestep."""
+    return DeisaCollection(name, timestep, shape, chunk_shape=chunk_shape, dispatcher=dispatcher)
+
+
 # ------------------------------------------------------------------------------ a Deisa stub that accepts registrations
 # -------------------------------------------------------------------------------------------------------
 class _FakeClient:
@@ -111,13 +150,17 @@ class _FakeClient:
 
 
 class _FakeHandshake:
-    """The handshake surface registration touches: filing branches per array."""
+    """The handshake surface registration touches: filing the per-array delivery state."""
 
     def __init__(self) -> None:
         self.branches: Dict[str, Any] = {}
+        self.runtime_arrays: list = []
 
     def set_task_branches(self, array_name: str, hints: list) -> None:
         self.branches[array_name] = hints
+
+    def set_runtime_arrays(self, array_names: list) -> None:
+        self.runtime_arrays = list(array_names)
 
 
 def _deisa_stub() -> Deisa:
@@ -128,6 +171,7 @@ def _deisa_stub() -> Deisa:
     d.arrays_metadata = META
     d._callbacks = {}
     d._callbacks_by_array = {}
+    d._runtime_arrays = set()
     d._topic_handlers = {}
     d._callback_reductions = {}
     d._callback_seq = 0
@@ -141,7 +185,7 @@ def _pca_callback(constructor: str = "MergeablePCA(n_components=3)") -> Callable
     """A callback that fits the registered array and returns its singular values, compiled from real source.
 
     ``constructor`` is spliced into the body so each test can vary the estimator configuration without hand-writing
-    and re-lexing a snippet. The analyzer reads this source, so the snippet is the code under test, not a stand-in.
+    and re-lexing a snippet.
 
     - ``:param constructor:`` The ``MergeablePCA(...)`` expression to splice in.
     """
@@ -162,7 +206,11 @@ def test_registration_accepts_the_documented_motivating_example():
 
     The motivating example of the feature, and the case that was refused: the analyzer used to None-fill ``whiten``,
     the estimator rejects a ``None`` ``whiten``, so EVERY PCA callback died at registration. Asserted through the real
-    registration entry point, not through the analyzer, because registration is where users hit this.
+    registration entry point, not through the estimator, because registration is where users hit it.
+
+    Registration analyzes nothing any more (plan P4), so acceptance is pinned by what it produces: the callback payload
+    carrying the delivery mode, and the array filed as a runtime-delivery target with the handshake actor. Nothing is
+    filed as branches -- nothing files branches any more.
     """
     d = _deisa_stub()
     cid = d._register_callback_impl(
@@ -170,26 +218,41 @@ def test_registration_accepts_the_documented_motivating_example():
     )
 
     assert cid in d._callbacks, "the callback must be registered, not refused"
-    specs = d._branch_groups["f"]
-    assert [b.output_key for b in specs] == ["f-pca"], f"expected one pca branch, got {[b.output_key for b in specs]}"
-    # The recorded config carries ONLY what the caller wrote: an omitted parameter is absent, so the estimator's own
-    # default applies when the config is replayed. This is the rule that makes registration work.
-    assert specs[0].summary_config == {"n_components": 3}, (
-        f"only the written parameters may be recorded, got {specs[0].summary_config}"
+    assert d._callbacks[cid]["precompute"] is True, "the payload must carry the delivery mode selected per callback"
+    assert d._runtime_arrays == {"f"}, f"the array must be filed as a runtime-delivery target, got {d._runtime_arrays}"
+    assert d.handshake.runtime_arrays == ["f"], "registration files the runtime arrays with the handshake actor"
+    assert d._branch_groups == {}, "no analyzer runs, so no branch spec may be filed at registration"
+
+
+def test_the_bridge_policy_carries_only_the_leaf_relevant_fields():
+    """Blocker 1's fix, structurally: nothing re-invents a parameter the caller did not write.
+
+    The estimator dispatches the bridge-side axis policy and NOTHING else. ``n_components`` and ``whiten`` are
+    root-only, so they cannot reach the leaf even when the caller writes them, and an omitted parameter therefore
+    behaves exactly as it does on the standalone path (the estimator's own default). That is what makes the documented
+    motivating example work now that the analyzer -- which fabricated a ``whiten=None`` -- is gone.
+    """
+    policy = MergeablePCA(n_components=3)._bridge_policy()
+
+    assert set(policy) == {"local_rank", "axis_names", "feature_axes", "sample_axes"}, (
+        f"the bridge policy must carry only leaf-relevant fields, got {sorted(policy)}"
     )
+    assert "n_components" not in policy and "whiten" not in policy, "root-only parameters must never be dispatched"
+    assert policy["axis_names"] is None, "an omitted axis policy stays omitted instead of being filled in"
 
 
-def test_registration_records_the_config_the_bridge_and_root_both_need():
-    """The recorded config carries the axis policy through to the bridge branch as concrete values."""
-    d = _deisa_stub()
-    callback = _pca_callback("MergeablePCA(n_components=3, axis_names=('tor1', 'tor2'))")
-    d._register_callback_impl(callback, [Window("f", size=1)], exception_handler=None, when="AND", precompute=True)
+def test_registration_records_the_axis_policy_the_bridge_leaf_needs():
+    """The axis policy reaches the bridge leaf as concrete values, and the leaf summarizes under it."""
+    policy = MergeablePCA(n_components=3, axis_names=("tor1", "tor2"))._bridge_policy()
+    assert policy["axis_names"] == ("tor1", "tor2"), f"the written axis policy must survive, got {policy['axis_names']}"
 
-    spec = d._branch_groups["f"][0]
-    assert spec.summary_config == {"n_components": 3, "axis_names": ("tor1", "tor2")}
+    request = compose_pca_request(_collection(), policy)
+    assert request.key == "f-pca", f"the wire key must not fork from the analyzer-era name, got {request.key!r}"
+    assert request.input_name == "f"
+
     # The bridge branch runs the local decomposition under that policy: two axes named, the last one the feature axis.
     chunk = np.arange(6, dtype=np.float64).reshape(3, 2)
-    summary = spec.branch_func(chunk)
+    summary = request.branch_func(chunk)
     assert isinstance(summary, PCASummary), f"a pca branch must ship a summary, got {type(summary).__name__}"
     assert summary.mean.shape == (2,), f"the feature axis is tor2 (2 cells), got mean shape {summary.mean.shape}"
 
@@ -197,46 +260,24 @@ def test_registration_records_the_config_the_bridge_and_root_both_need():
 # ------------------------------------------------------------------------------ 2. the delivered fit completes
 # -------------------------------------------------------------------------------------------------------
 def test_delivered_fit_yields_the_requested_components_for_a_non_trivial_d():
-    """A fit through the delivered path completes and returns ``n_components`` components over the real ``d``.
+    """A fit on a delivered collection completes and returns ``n_components`` components over the real ``d``.
 
-    This is the blocker-2 case end to end: the delivered view's carrier has ``shape[-1] == 1`` while the summary spans
-    ``d = 6``, so the feature-dimension guard refused every such fit. The declared count now comes from the
-    REGISTERED array's metadata, so ``d = 6`` fits and reports ``n_features_in_ == 6``.
+    This is the blocker-2 case end to end: the deleted carrier had ``shape[-1] == 1``, while the delivered collection
+    declares the registered shape, so the feature-dimension guard refused every such fit. The declared count now comes
+    from the registered metadata, so ``d = 6`` fits and reports ``n_features_in_ == 6``.
 
     The numbers are checked against a batch PCA of the whole array: per-bridge leaves are merged exactly, so the
     truncated singular values must match the reference's leading ones.
     """
     field = _field()
-    d = _deisa_stub()
-    d._register_callback_impl(
-        _pca_callback("MergeablePCA(n_components=3)"),
-        [Window("f", size=1)],
-        exception_handler=None,
-        when="AND",
-        precompute=True,
-    )
-    spec = d._branch_groups["f"][0]
+    dispatcher = _FieldDispatcher(field, CHUNK_SHAPE)
 
-    # What the bridges actually do: each summarizes its own chunk, and the summaries merge on the Dask side.
-    per_bridge = [
-        spec.branch_func(field[start : start + CHUNK_SHAPE[0]]) for start in range(0, len(field), CHUNK_SHAPE[0])
-    ]
-    delivered = merge_pca(merge_pca(per_bridge[0], per_bridge[1]), merge_pca(per_bridge[2], per_bridge[3]))
+    fitted = MergeablePCA(n_components=3).fit(_collection(dispatcher=dispatcher))
 
-    # The dispatch view a PCA-only callback receives, built exactly as the topic handler builds it.
-    from deisa.dask.utils import make_precomputed_view
-
-    view = make_precomputed_view(
-        d._pca_carrier_array("f"),
-        t=0,
-        signatures={},
-        reapply=set(),
-        registered_ndim=len(GLOBAL_SHAPE),
-        registered_shape=GLOBAL_SHAPE,
-        pca_summary=delivered,
-    )
-
-    fitted = MergeablePCA(n_components=3).fit(view)
+    assert len(dispatcher.requests) == 1, "the fit must dispatch exactly one PCA request to the bridges"
+    request = dispatcher.requests[0]
+    assert request.input_name == "f" and request.timestep == 0, "the request must name the delivered array/timestep"
+    assert request.key == "f-pca"
 
     assert fitted.n_components_ == 3, f"requested 3 components, got n_components_={fitted.n_components_}"
     assert fitted.components_.shape == (3, GLOBAL_SHAPE[1]), (
@@ -257,24 +298,14 @@ def test_delivered_fit_ships_summaries_not_the_truncated_public_form():
     """The bridge payload stays the MERGEABLE summary, which is what makes the merge exact.
 
     Truncating at the bridge to ``n_components`` would drop the directions the cross-bridge correction needs, so this
-    asserts the shape property that catches it: a per-bridge leaf over 3 samples of ``d = 6`` keeps rank
-    ``min(n_block, d) = 3`` here, and a leaf over a WIDE short block keeps the full ``d``, never ``n_components``.
+    asserts the shape property that catches it: a leaf over a WIDE short block keeps its full local rank ``min(n, d)``,
+    never ``n_components``.
     """
-    d = _deisa_stub()
-    d._register_callback_impl(
-        _pca_callback("MergeablePCA(n_components=2)"),
-        [Window("f", size=1)],
-        exception_handler=None,
-        when="AND",
-        precompute=True,
-    )
-    spec = d._branch_groups["f"][0]
+    request = compose_pca_request(_collection(), MergeablePCA(n_components=2)._bridge_policy())
 
-    # A wide, short block: 2 samples over d = 6, so the leaf's rank is min(2, 6) = 2 and n_components = 2 could not
-    # distinguish truncation. Use 4 samples instead: min(4, 6) = 4 > n_components = 2, so a truncated payload would
-    # be visibly smaller than the mergeable one.
+    # 4 samples over d = 6: the leaf's rank is 4 > n_components = 2, so a truncated payload would be visibly smaller.
     wide = _field(n_rows=4, n_cols=GLOBAL_SHAPE[1], seed=11)
-    leaf = spec.branch_func(wide)
+    leaf = request.branch_func(wide)
 
     assert leaf.rank == 4, f"the leaf must keep its full local rank min(n_block, d) = 4, got {leaf.rank}"
     assert leaf.components.shape == (4, GLOBAL_SHAPE[1]), (
@@ -284,33 +315,38 @@ def test_delivered_fit_ships_summaries_not_the_truncated_public_form():
     assert local_pca(wide).rank == leaf.rank, "the branch must use the same leaf primitive the estimator does"
 
 
-# ------------------------------------------------------------------------------ 3. explicit invalid is refused
+# ------------------------------------------------------------------------------ 3. explicit invalid is still refused
 # -------------------------------------------------------------------------------------------------------
 @pytest.mark.parametrize(
-    "constructor, expected_fragment",
+    "kwargs, constructor, expected_fragment",
     [
-        ("MergeablePCA(n_components=3, whiten=1)", "whiten must be a bool"),
-        ("MergeablePCA(n_components=3, whiten=None)", "whiten must be a bool"),
-        ("MergeablePCA(n_components=3, whiten='yes')", "whiten must be a bool"),
-        ("MergeablePCA(n_components=0)", "n_components must be None or a positive integer"),
-        ("MergeablePCA(n_components=-2)", "n_components must be None or a positive integer"),
+        ({"n_components": 3, "whiten": 1}, "MergeablePCA(n_components=3, whiten=1)", "whiten must be a bool"),
+        ({"n_components": 3, "whiten": None}, "MergeablePCA(n_components=3, whiten=None)", "whiten must be a bool"),
+        ({"n_components": 3, "whiten": "yes"}, "MergeablePCA(n_components=3, whiten='yes')", "whiten must be a bool"),
+        ({"n_components": 0}, "MergeablePCA(n_components=0)", "n_components must be None or a positive integer"),
+        ({"n_components": -2}, "MergeablePCA(n_components=-2)", "n_components must be None or a positive integer"),
     ],
 )
-def test_explicit_invalid_configuration_is_still_refused_at_registration(constructor, expected_fragment):
+def test_explicit_invalid_configuration_is_refused_by_the_estimator(kwargs, constructor, expected_fragment):
     """Blocker 1's fix omitted UNSET parameters; it must not have made an EXPLICIT invalid value acceptable.
 
     The distinction is the whole point: omitting is how "use the default" is spelled, so an explicit value still goes
     through the estimator's own validation and is still refused. ``whiten=None`` is the sharpest case, because it is
     exactly what the analyzer used to inject -- refusing it here is what proves the injection is gone rather than
     merely tolerated.
+
+    What CHANGED is WHERE. Registration parses nothing now, so an invalid constructor registers and fails at the
+    callback's first compute boundary instead of at registration. The second half pins that shift.
     """
+    with pytest.raises(ValueError, match=expected_fragment):
+        MergeablePCA(**kwargs)
+
     d = _deisa_stub()
-    with pytest.raises(IncompatibleCallbackError, match=expected_fragment):
-        d._register_callback_impl(
-            _pca_callback(constructor), [Window("f", size=1)], exception_handler=None, when="AND", precompute=True
-        )
-    assert d._callbacks == {}, "a refused registration must leave no half-registered entry behind"
-    assert d._branch_groups == {}, "a refused registration must leave no branch state behind"
+    cid = d._register_callback_impl(
+        _pca_callback(constructor), [Window("f", size=1)], exception_handler=None, when="AND", precompute=True
+    )
+    assert cid in d._callbacks, "with no AST pass nothing is left to refuse an invalid constructor at registration"
+    assert d._runtime_arrays == {"f"}
 
 
 def test_constructor_rejects_non_bool_whiten_outside_the_bridge_path():
@@ -328,7 +364,7 @@ def test_constructor_rejects_non_bool_whiten_outside_the_bridge_path():
 # -------------------------------------------------------------------------------------------------------
 @pytest.mark.parametrize("n_features", [2, 3, 6, 11])
 def test_declared_feature_count_multiplies_the_feature_axes(n_features):
-    """The declared ``d`` is read from the REGISTERED shape under the axis policy, so any ``d >= 2`` works.
+    """The declared ``d`` is read from the DELIVERED COLLECTION's registered shape, so any ``d >= 2`` works.
 
     The delivered path's guard used to compare the summary's ``d`` against the carrier's ``shape[-1]``, which is 1 for
     every registered array, so no ``d`` other than 1 could ever match. These are exactly the ``d`` values that were
@@ -339,38 +375,14 @@ def test_declared_feature_count_multiplies_the_feature_axes(n_features):
     ``test_mergeable_pca_estimator.py``; raising the row count here keeps this test about the DECLARED count alone.
     """
     n_rows = 24
-    meta = {"f": {"global_shape": (n_rows, n_features), "chunk_shape": (3, n_features)}}
-    d = _deisa_stub()
-    d.arrays_metadata = meta
-    d._register_callback_impl(
-        _pca_callback("MergeablePCA(n_components=2)"),
-        [Window("f", size=1)],
-        exception_handler=None,
-        when="AND",
-        precompute=True,
-    )
-    spec = d._branch_groups["f"][0]
-
-    from deisa.dask.utils import make_precomputed_view
-
+    shape = (n_rows, n_features)
+    chunk_shape = (3, n_features)
     field = _field(n_rows=n_rows, n_cols=n_features, seed=13)
-    leaves = [spec.branch_func(field[start : start + 3]) for start in range(0, n_rows, 3)]
-    delivered = merge_tree(leaves)
 
-    view = make_precomputed_view(
-        d._pca_carrier_array("f"),
-        t=0,
-        signatures={},
-        reapply=set(),
-        registered_ndim=2,
-        registered_shape=meta["f"]["global_shape"],
-        pca_summary=delivered,
-    )
-    # The carrier is the one-element placeholder by construction; asserting it here documents why the guard had to move.
-    assert tuple(view.shape) == (1, 1), f"the carrier must stay a one-element placeholder, got {tuple(view.shape)}"
-    assert view.shape[-1] == 1, "this is the value the old guard compared against"
+    collection = _collection(shape=shape, chunk_shape=chunk_shape, dispatcher=_FieldDispatcher(field, chunk_shape))
+    assert tuple(collection.shape) == shape, "the collection carries the REGISTERED shape, which is what declares d"
 
-    fitted = MergeablePCA(n_components=2).fit(view)
+    fitted = MergeablePCA(n_components=2).fit(collection)
     assert fitted.n_features_in_ == n_features, f"expected d={n_features}, got n_features_in_={fitted.n_features_in_}"
     reference = _batch_reference(field)
     assert np.max(np.abs(fitted.singular_values_ - reference.singular_values[:2])) < 1e-10
@@ -380,28 +392,17 @@ def test_a_real_feature_basis_mismatch_is_still_refused():
     """Moving the declared count off the carrier must not make the guard useless.
 
     The guard exists to catch a summary describing a DIFFERENT feature basis than the array it was requested for. With
-    the declared count taken from the registered metadata, that mismatch is still detected -- this is the test that
-    keeps the blocker-2 fix from being "delete the check".
+    the declared count taken from the delivered collection's registered shape, that mismatch is still detected -- this
+    is the test that keeps the blocker-2 fix from being "delete the check".
     """
-    from deisa.dask.utils import make_precomputed_view
-
-    d = _deisa_stub()
     field = _field(n_cols=6, seed=17)
     # A summary over a 4-feature basis, delivered for a 6-feature registered array.
     wrong = local_pca(field[:, :4])
-
-    view = make_precomputed_view(
-        d._pca_carrier_array("f"),
-        t=0,
-        signatures={},
-        reapply=set(),
-        registered_ndim=2,
-        registered_shape=GLOBAL_SHAPE,
-        pca_summary=wrong,
-    )
+    dispatcher = _FieldDispatcher(field, CHUNK_SHAPE, summary=wrong)
 
     with pytest.raises(ValueError) as caught:
-        MergeablePCA(n_components=2).fit(view)
+        MergeablePCA(n_components=2).fit(_collection(dispatcher=dispatcher))
+
     message = str(caught.value)
     assert "spans 4 features" in message, f"the message must name the summary's feature count, got {message!r}"
     assert "has 6" in message, f"the message must name the declared feature count, got {message!r}"
@@ -412,32 +413,16 @@ def test_multidim_registered_shape_declares_the_product_of_its_feature_axes():
     """A multi-axis feature dimension multiplies out through the same policy ``_as_2d`` applies.
 
     A 3-D registered array with ``axis_names`` and the default last-axis feature policy declares ``d`` = that axis's
-    extent. Using the registered shape rather than the carrier's own shape is what makes this agree with the bridge,
-    which summarized under the same policy.
+    extent. Using the delivered collection's registered shape rather than a carrier's own shape is what makes this
+    agree with the bridge, which summarized under the same policy.
     """
-    from deisa.dask.utils import make_precomputed_view
-
-    meta = {"f": {"global_shape": (4, 5, 6), "chunk_shape": (4, 5, 6)}}
-    d = _deisa_stub()
-    d.arrays_metadata = meta
-
+    shape = (4, 5, 6)
+    chunk_shape = (2, 5, 6)
     estimator = MergeablePCA(n_components=2, axis_names=("tor1", "tor2", "vpar"))
-    assert estimator._declared_feature_count((4, 5, 6)) == 6, "the default feature axis is the last one"
+    assert estimator._declared_feature_count(shape) == 6, "the default feature axis is the last one"
 
-    field = np.random.RandomState(19).randn(4, 5, 6)
-    leaves = [local_pca(np.ascontiguousarray(part)) for part in np.split(field.reshape(-1, 6), 2)]
-    delivered = merge_pca(leaves[0], leaves[1])
+    field = np.random.RandomState(19).randn(*shape)
+    dispatcher = _FieldDispatcher(field, chunk_shape)
+    fitted = estimator.fit(_collection(shape=shape, chunk_shape=chunk_shape, dispatcher=dispatcher))
 
-    view = make_precomputed_view(
-        d._pca_carrier_array("f"),
-        t=0,
-        signatures={},
-        reapply=set(),
-        registered_ndim=3,
-        registered_shape=meta["f"]["global_shape"],
-        pca_summary=delivered,
-    )
-    assert tuple(view.shape) == (1, 1, 1), "the carrier is a one-element placeholder in every dimension"
-
-    fitted = estimator.fit(view)
     assert fitted.n_features_in_ == 6, f"the last axis is the feature axis, got d={fitted.n_features_in_}"
