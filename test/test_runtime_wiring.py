@@ -50,6 +50,7 @@ from deisa.core.types import DeisaArray
 from utils import FakeComm
 
 from deisa.dask import deisa as deisa_module
+from deisa.dask import precompute_analyzer as analyzer_module
 from deisa.dask import runtime_errors as errors
 from deisa.dask.collection import DeisaCollection
 from deisa.dask.deisa import Deisa
@@ -63,6 +64,7 @@ from deisa.dask.runtime_dispatch import (
     runtime_delivery_enabled,
     serve_plan_requests,
 )
+from deisa.dask.utils import make_precomputed_view
 
 ARRAY_NAME = "f"
 # ``n_samples > d`` is what keeps the merged PCA summary smaller than the data it summarizes, so the estimator's
@@ -350,6 +352,32 @@ def test_axis_fold_dispatches_on_demand(fleets, client, monkeypatch):
     assert len(fleets.rounds(0)) == 1, "an axis fold must dispatch exactly one on-demand request"
 
 
+def test_derived_reduction_is_not_answered_by_the_bare_array_menu(fleets, client, monkeypatch):
+    """A derived reduction misses the menu: the menu holds the BARE array's partials, so serving it would be wrong.
+
+    The menu is built from the bare collection (``build_eager_menu`` composes the identity program), so its ``sum``
+    entry is ``sum(field)``. ``(window[-1] * 2).sum()`` is ``2 * sum(field)``; answering it from the menu silently
+    returns the wrong number with no round trip and no exception. Only the on-demand path can serve it.
+    """
+    deisa = make_deisa(fleets, client, monkeypatch)
+    seen = []
+
+    def callback(window):
+        derived = (window[-1] * 2).sum().compute()
+        bare = window[-1].sum().compute()
+        seen.append((derived, bare))
+
+    register(deisa, callback)
+    deliver(deisa, 0, fleets.menus(0))
+
+    derived, bare = seen[0]
+    truth = fleets.fields[0].sum()
+    assert bare == pytest.approx(truth), "the bare fold is still the menu's job"
+    assert derived == pytest.approx(2 * truth), "a derived reduction must fold the DERIVED operand"
+    assert derived != pytest.approx(bare), "the derived value must not be the bare array's partial"
+    assert len(fleets.rounds(0)) == 1, "exactly the derived reduction may dispatch; the bare fold stays in the menu"
+
+
 def test_menu_value_of_another_timestep_cannot_answer(fleets, client, monkeypatch):
     """A menu computed for timestep N never answers a timestep N+1 request: the dispatcher keys the menu by timestep."""
     deisa = make_deisa(fleets, client, monkeypatch)
@@ -441,6 +469,46 @@ def test_mixed_timestep_expression_aborts_the_run(fleets, client, monkeypatch, g
 
     assert isinstance(deisa._run_failure, errors.UnsupportedReductionError)
     with pytest.raises(errors.UnsupportedReductionError):
+        deisa.execute_callbacks()
+
+
+def test_flag_off_legacy_refusal_aborts_the_run(fleets, client, monkeypatch, go_event):
+    """The default (flag OFF) path aborts too: the legacy view raises the ANALYZER's classes mid-run.
+
+    The legacy precompute view is the delivery mode of every deployment today, and it raises
+    ``precompute_analyzer.UnsupportedReductionError`` when a callback performs a reduction the analyzer never recorded.
+    R3's contract (a mid-run refusal fails the run, not a log line) has to hold for that path as well, so the abort
+    predicate must cover BOTH taxonomies.
+    """
+    deisa = make_deisa(fleets, client, monkeypatch)
+    monkeypatch.setattr(deisa_module, "runtime_delivery_enabled", lambda: False)
+
+    legacy_view = make_precomputed_view(
+        da.zeros(GLOBAL_SHAPE, chunks=CHUNK_SHAPE),
+        t=0,
+        signatures={("mean", ()): da.zeros((), chunks=())},
+        reapply=set(),
+        registered_ndim=len(GLOBAL_SHAPE),
+    )
+    refusals = []
+
+    def callback(window):
+        try:
+            window[-1].min()
+        except BaseException as ex:  # recorded so the test can prove WHICH refusal the callback hit
+            refusals.append(ex)
+            raise
+
+    callback_id = register(deisa, callback)
+    monkeypatch.setattr(Deisa, "_build_callback_views", lambda self, a, i, combined: {callback_id: legacy_view})
+    deliver(deisa, 0, None)
+
+    assert isinstance(refusals[0], analyzer_module.UnsupportedReductionError)
+    assert not isinstance(refusals[0], deisa_module.RuntimeRefusal), "the ANALYZER taxonomy, not the runtime one"
+    assert isinstance(deisa._run_failure, analyzer_module.UnsupportedReductionError)
+    assert deisa._callbacks == {}, "a refused callback must not stay registered for the next cycle"
+
+    with pytest.raises(analyzer_module.UnsupportedReductionError):
         deisa.execute_callbacks()
 
 

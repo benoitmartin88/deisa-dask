@@ -7,6 +7,7 @@ present -- which is also what keeps the wording from silently degrading.
 
 import pytest
 
+from deisa.dask import precompute_analyzer as analyzer_module
 from deisa.dask import runtime_errors as errors
 from deisa.dask.precompute_analyzer import PrecomputeError
 
@@ -65,6 +66,30 @@ def test_every_refusal_is_a_precompute_error():
     for kind in REFUSAL_CLASSES:
         assert issubclass(kind, errors.RuntimeRefusal)
         assert issubclass(kind, PrecomputeError)
+
+
+NAMESAKE_PAIRS = [
+    (errors.RawFieldReadError, analyzer_module.RawFieldReadError),
+    (errors.MaterializationError, analyzer_module.MaterializationError),
+    (errors.UnsupportedReductionError, analyzer_module.UnsupportedReductionError),
+    (errors.NoPrecomputableReductionError, analyzer_module.NoPrecomputableReductionError),
+    (errors.PrecomputeRuntimeError, analyzer_module.PrecomputeRuntimeError),
+]
+
+
+@pytest.mark.parametrize("runtime_kind,analyzer_kind", NAMESAKE_PAIRS)
+def test_every_runtime_refusal_is_its_analyzer_namesake(runtime_kind, analyzer_kind):
+    """The two taxonomies share their names, so they must also share their classes.
+
+    Two unrelated classes with the same name are a trap: a handler written as ``except PrecomputeRuntimeError`` (the
+    analyzer's) silently misses a runtime refusal that now aborts the run, and ``isinstance`` checks against the legacy
+    names would not see the new refusals at all. Subclassing the analyzer namesake in the runtime taxonomy closes both
+    directions for the errors that cross the delivery boundary.
+    """
+    assert runtime_kind is not analyzer_kind, "the runtime class is its own type, not an alias"
+    assert issubclass(runtime_kind, analyzer_kind), f"{runtime_kind.__name__} must subclass the analyzer namesake"
+    assert issubclass(runtime_kind, errors.RuntimeRefusal)
+    assert isinstance(runtime_kind("a message"), analyzer_kind)
 
 
 def test_every_class_carries_a_remedy_that_names_the_escape_hatch():
