@@ -272,6 +272,7 @@ def make_deisa(fleets, client, monkeypatch):
     deisa._tasks = set()
     deisa._execute_callbacks_called = False
     deisa._runtime_transports = {ARRAY_NAME: fleets.exchange}
+    deisa._runtime_latest_timestep = {}
     deisa._run_failure = None
     deisa._topic_handlers[ARRAY_NAME] = deisa._make_topic_handler(ARRAY_NAME)
     monkeypatch.setattr(deisa_module, "runtime_delivery_enabled", lambda: True)
@@ -305,7 +306,7 @@ async def _drain(tasks, timeout=20.0):
 _DEFAULT_PRECOMPUTED = {"f-sum": {"kind": "scalar"}}
 
 
-def deliver(deisa, timestep, menus, precomputed=_DEFAULT_PRECOMPUTED):
+def deliver(deisa, timestep, menus, precomputed=_DEFAULT_PRECOMPUTED, menu_error=None):
     """Hand the topic event for ``timestep`` to the real handler, then drain the callback tasks it spawned."""
     payload = {
         "iteration": timestep,
@@ -313,6 +314,8 @@ def deliver(deisa, timestep, menus, precomputed=_DEFAULT_PRECOMPUTED):
         "precomputed": precomputed,
         "menu": menus,
     }
+    if menu_error is not None:
+        payload["menu_error"] = menu_error
     handler = deisa._topic_handlers[ARRAY_NAME]
     deisa.client.sync(lambda: handler((None, payload)))
     deisa.client.sync(lambda: _drain(deisa._tasks))
@@ -409,6 +412,48 @@ def test_window_is_a_list_of_collections(fleets, client, monkeypatch):
     deliver(deisa, 1, fleets.menus(1))
 
     assert seen == [(1, 0, pytest.approx(fleets.fields[1].sum()))]
+
+
+def test_each_callback_gets_its_own_collection(fleets, client, monkeypatch):
+    """Isolation: a collection one callback received is not the object a sibling callback receives.
+
+    A collection is mutable metadata, so a callback that writes an attribute -- by accident, or through a helper that
+    "normalizes" its argument -- must not poison the other callbacks of the same array and timestep.
+    """
+    deisa = make_deisa(fleets, client, monkeypatch)
+    seen = {}
+
+    def first(window):
+        window[-1].name = "mutated-by-the-first-callback"
+        seen["first"] = window[-1]
+
+    def second(window):
+        seen["second"] = window[-1]
+
+    register(deisa, first)
+    register(deisa, second)
+    deliver(deisa, 0, fleets.menus(0))
+
+    assert seen["first"] is not seen["second"], "each callback must get its own collection object"
+    assert seen["second"].name == ARRAY_NAME, "a sibling's write must not reach the other callback's view"
+
+
+def test_menu_failure_payload_aborts_the_run(fleets, client, monkeypatch):
+    """A bridge that could not build its menu ships the cause; the delivery must record it as the run failure."""
+    deisa = make_deisa(fleets, client, monkeypatch)
+    calls = []
+
+    def callback(window):
+        calls.append(window[-1])
+
+    register(deisa, callback)
+    deliver(deisa, 0, None, menu_error="array 'f' at timestep 0, bridge 1: ValueError('empty chunk')")
+
+    assert calls, "the delivery still reaches the callback: fail-loud, not fail-the-send"
+    assert isinstance(deisa._run_failure, errors.PrecomputeRuntimeError), (
+        f"the menu failure must fail the run at the cycle boundary: {deisa._run_failure!r}"
+    )
+    assert "empty chunk" in str(deisa._run_failure), "the run failure must carry the bridge's cause"
 
 
 # ---------------------------------------------------------------------------------------------------------------------
