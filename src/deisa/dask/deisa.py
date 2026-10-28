@@ -68,6 +68,7 @@ from deisa.core.interface import IDeisa
 from distributed import Client, Event, Future, Queue
 
 import dask.array as da
+from deisa.dask import runtime_errors as runtime_errors
 from deisa.dask.branch import (
     _BRANCH_KIND_PCA,
     _analyze_callback_for_branches,
@@ -86,8 +87,10 @@ from deisa.dask.constants import (
 )
 from deisa.dask.handshake import Handshake
 from deisa.dask.precompute_analyzer import (
+    MaterializationError,
     NoPrecomputableReductionError,
     PrecomputeRuntimeError,
+    RawFieldReadError,
     UnsupportedReductionError,
 )
 from deisa.dask.runtime_dispatch import EagerMenu, PlanDispatcher, runtime_delivery_enabled
@@ -96,17 +99,38 @@ from deisa.dask.utils import _PrecomputedDeisaArray, build_deisa_array, get_clie
 
 logger = logging.getLogger(__name__)
 
+# The analyzer's refusal classes the LEGACY (flag OFF) precompute view raises mid-run: ``utils`` raises
+# ``PrecomputeRuntimeError``/``UnsupportedReductionError`` from the per-callback dispatch view, and the analyzer itself
+# raises ``RawFieldReadError``/``MaterializationError`` for a raw read. They are a separate family from
+# :mod:`deisa.dask.runtime_errors` (which subclasses them, never the other way around), so the abort predicate has to
+# name them explicitly.
+_LEGACY_RUN_ABORTING: Tuple[type, ...] = (
+    RawFieldReadError,
+    MaterializationError,
+    UnsupportedReductionError,
+    PrecomputeRuntimeError,
+)
+
 
 def _is_run_aborting(ex: BaseException) -> bool:
-    """Whether ``ex`` is a runtime refusal, i.e. a callback failure that must FAIL THE RUN rather than be logged.
+    """Whether ``ex`` is a refusal, i.e. a callback failure that must FAIL THE RUN rather than be logged.
 
-    Every refusal in :mod:`deisa.dask.runtime_errors` means the delivery path cannot serve what the callback asked for
-    (a raw read, a numpy materialization, an off-surface or non-associative reduction, a bridge-side invariant
-    violation). Continuing would deliver a wrong value on every later timestep, so the run stops once instead. The
-    check lives in this module-level predicate -- and not inline -- so a test can disable it and prove the abort test
-    can fail.
+    Every refusal means the delivery path cannot serve what the callback asked for (a raw read, a numpy
+    materialization, an off-surface or non-associative reduction, a bridge-side invariant violation). Continuing would
+    deliver a wrong value on every later timestep, so the run stops once instead.
+
+    BOTH taxonomies are covered, because the delivery mode that raises one of them is selected by the runtime flag, not
+    by the run: :class:`~deisa.dask.runtime_errors.RuntimeRefusal` is the runtime path's family, and
+    :data:`_LEGACY_RUN_ABORTING` are the analyzer's classes that the precompute view raises mid-run on the default
+    (flag OFF) path. The runtime classes subclass their legacy namesakes, so a legacy ``except`` clause catches a new
+    refusal too -- the two families are one hierarchy, and this predicate walks it from the top.
+
+    The check lives in this module-level predicate -- and not inline -- so a test can disable it and prove the abort
+    test can fail.
+
+    - ``:param ex:`` The exception a callback raised.
     """
-    return isinstance(ex, RuntimeRefusal)
+    return isinstance(ex, (RuntimeRefusal, *_LEGACY_RUN_ABORTING))
 
 
 class Deisa(IDeisa):
@@ -571,6 +595,7 @@ class Deisa(IDeisa):
                     # timestep. Nothing is combined and nothing is persisted here -- the collection carries no data,
                     # so there is no combined array to keep alive; its reductions either read the eager menu the
                     # bridges shipped with this event or dispatch an on-demand plan.
+                    _weak_self._record_menu_failure(payload)
                     views = _weak_self._runtime_views(array_name, iteration, payload)
                 elif precomputed:
                     # Precompute path: one ``futures`` entry per (bridge, reduction); group by ``output_key`` and
@@ -806,19 +831,44 @@ class Deisa(IDeisa):
         shape = (1,) * ndim
         return da.zeros(shape, chunks=shape, dtype=np.float64, name=f"deisa-pca-carrier-{array_name}")
 
-    def _runtime_views(self, array_name: str, iteration: int, payload: Mapping[str, Any]) -> Dict[Any, Any]:
-        """Build the runtime delivery view of one array for one timestep: the same collection for every callback.
+    def _record_menu_failure(self, payload: Mapping[str, Any]) -> None:
+        """Record a bridge's eager-menu failure as the RUN failure, so the cycle boundary raises it.
 
-        One collection per (array, timestep) is safe to share because it is immutable metadata: what a callback does
-        with it builds its own reduction objects, and every one of them dispatches through the compute boundary
-        attached here.
+        A menu entry that cannot fold a chunk (an empty chunk is enough: ``np.min`` of it raises) used to escape
+        ``Bridge.send()`` as an uncaught error and break the simulation's send loop. The bridge now ships the failure
+        with the event and keeps the legacy scatter going, and the run fails HERE -- at the boundary the caller already
+        blocks on -- rather than degrading into a silently menu-less delivery that looks healthy for the whole run.
+
+        - ``:param payload:`` The topic event; its ``menu_error`` entry is absent unless a bridge failed to build its
+          menu for this timestep.
+        """
+        detail = payload.get("menu_error")
+        if not detail:
+            return
+        failure = runtime_errors.precompute_runtime_invariant("the bridge eager menu", str(detail))
+        if getattr(self, "_run_failure", None) is None:
+            self._run_failure = failure
+        logger.error(f"the bridge eager menu failed for array {payload.get('array_name')!r}: {detail}")
+
+    def _runtime_views(self, array_name: str, iteration: int, payload: Mapping[str, Any]) -> Dict[Any, Any]:
+        """Build the runtime delivery view of one array for one timestep: a FRESH collection per callback.
 
         - ``:param array_name:`` Registered array the topic event is for.
         - ``:param iteration:`` Timestep the event delivered.
-        - ``:param payload:`` The topic event, read for the bridges' eager menus.
+        - ``:param payload:`` The topic event, read for the bridges' eager menus and for a menu failure.
+
+        One instance per callback, not one per (array, timestep): a collection is mutable metadata (``name``,
+        ``timestep``, ``chunk_shape`` ... are plain attributes), so a callback that writes an attribute -- by accident
+        or through a helper that "normalizes" its argument -- would poison every sibling callback on that
+        array/timestep AND the retained window history, and every later refusal would name the wrong array/timestep.
+        Building one per callback is metadata-only work: no data is copied, and the deliveries of two callbacks are
+        independent objects.
         """
-        collection = self._runtime_collection(array_name, iteration, payload.get("menu"))
-        return {callback_id: collection for callback_id in list(self._callbacks_by_array.get(array_name, ()))}
+        menus = None if payload.get("menu_error") else payload.get("menu")
+        return {
+            callback_id: self._runtime_collection(array_name, iteration, menus)
+            for callback_id in list(self._callbacks_by_array.get(array_name, ()))
+        }
 
     def _runtime_collection(self, array_name: str, iteration: int, menus: Any = None) -> DeisaCollection:
         """Build the collection a callback receives for ``array_name`` at ``iteration``.

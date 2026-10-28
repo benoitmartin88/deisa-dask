@@ -39,7 +39,11 @@ asserted by the test suite:
   delivery mode (decision F3), so a refused callback is never left without an escape hatch.
 
 Every class derives from :class:`~deisa.dask.precompute_analyzer.PrecomputeError`, the base the precompute path
-already raises, so existing ``except PrecomputeError`` handlers keep catching refusals.
+already raises, so existing ``except PrecomputeError`` handlers keep catching refusals. The five classes that have a
+namesake in the analyzer's taxonomy ALSO subclass that namesake, so the two families are one ``isinstance`` graph:
+a handler written for the legacy class catches the runtime refusal that replaced it, and
+:func:`deisa.dask.deisa._is_run_aborting` can cover the legacy classes raised mid-run by the precompute view without
+two unrelated name look-alikes.
 
 The raise sites are deliberately thin: build the exception through one of the module-level factory functions below
 instead of hand-writing a message, so the wording (and therefore the tests over it) lives in exactly one place.
@@ -49,7 +53,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from deisa.dask.precompute_analyzer import PrecomputeError
+import deisa.dask.precompute_analyzer as _analyzer
 
 __all__ = [
     "MaterializationError",
@@ -89,7 +93,7 @@ _SURFACE_SUMMARY = (
 )
 
 
-class RuntimeRefusal(PrecomputeError):
+class RuntimeRefusal(_analyzer.PrecomputeError):
     """Base class of the v1 refusals: a message naming the offending symbol, plus a remedy.
 
     ``str(exception)`` is ``"<message> Remedy: <remedy>"`` and the two halves are also kept as the ``message`` and
@@ -106,7 +110,7 @@ class RuntimeRefusal(PrecomputeError):
         super().__init__(f"{self.message} Remedy: {self.remedy}")
 
 
-class RawFieldReadError(RuntimeRefusal):
+class RawFieldReadError(RuntimeRefusal, _analyzer.RawFieldReadError):
     """The callback reads a registered array's raw data, which the reduction path never delivers.
 
     The precompute path ships per-bridge reduction partials only -- the chunk itself never crosses the network. A
@@ -116,7 +120,7 @@ class RawFieldReadError(RuntimeRefusal):
     """
 
 
-class MaterializationError(RuntimeRefusal):
+class MaterializationError(RuntimeRefusal, _analyzer.MaterializationError):
     """A numpy conversion of a DEISA operand was attempted; that would gather the whole field.
 
     The hole this closes is silent: ``np.asarray(collection)`` leaves no graph artifact at all, so no analysis can see
@@ -139,7 +143,7 @@ class NonAssociativeReductionError(RuntimeRefusal):
     )
 
 
-class UnsupportedReductionError(RuntimeRefusal):
+class UnsupportedReductionError(RuntimeRefusal, _analyzer.UnsupportedReductionError):
     """The expression leaves the closed DEISA operator surface.
 
     Covers cross-array and mixed-timestep roots, a reduction used as an operand of another expression, slicing,
@@ -149,7 +153,7 @@ class UnsupportedReductionError(RuntimeRefusal):
     remedy = f"rewrite the callback with {_SURFACE_SUMMARY}, or {_REMEDY_PRECOMPUTE_OFF}"
 
 
-class NoPrecomputableReductionError(RuntimeRefusal):
+class NoPrecomputableReductionError(RuntimeRefusal, _analyzer.NoPrecomputableReductionError):
     """The callback contains no reduction the surface can dispatch.
 
     A callback that only builds pointwise expressions (or only reads metadata) asks for nothing a bridge could compute
@@ -157,7 +161,7 @@ class NoPrecomputableReductionError(RuntimeRefusal):
     """
 
 
-class PrecomputeRuntimeError(RuntimeRefusal):
+class PrecomputeRuntimeError(RuntimeRefusal, _analyzer.PrecomputeRuntimeError):
     """A runtime invariant of the reduction path was violated (bridge side or combine side).
 
     Raised when the metadata, the composed request and the delivered partials disagree -- for example a chunk grid

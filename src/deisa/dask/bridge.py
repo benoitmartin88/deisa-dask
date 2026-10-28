@@ -33,7 +33,7 @@ import uuid
 import zlib
 from collections import defaultdict, deque
 from numbers import Number
-from typing import Any, Deque, Dict, Final, Iterator, List, Mapping, Optional, Union
+from typing import Any, Deque, Dict, Final, Iterator, List, Mapping, Optional, Tuple, Union
 
 import numpy as np
 from deisa.core import IBridge, ICommunicator, validate_arrays_metadata
@@ -401,7 +401,9 @@ class Bridge(IBridge):
         # Eager scalar menu (the zero-round-trip half of the transfer strategy): computed HERE, on the local numpy
         # chunk and before ANY scatter, so the menu values are chunk-local reductions and the chunk itself is never
         # shipped to convey them. Nothing below may run before this line without breaking the ordering invariant.
-        menu = self._build_runtime_menu(array_name, chunk, timestep)
+        # Gated on this array having a filed reduction at all: with no branch to deliver, no callback can ask for a
+        # menu value, and the folds would be pure critical-path cost.
+        menu, menu_error = self._build_runtime_menu(array_name, chunk, timestep, branches)
 
         # With partials: scatter them only. Without: full-chunk scatter (backwards compatibility for non-reduction
         # callbacks).
@@ -427,6 +429,7 @@ class Bridge(IBridge):
                 timestep,
                 precomputed_meta=precomputed_meta,
                 menu=menu,
+                menu_error=menu_error,
             )
             return
 
@@ -436,6 +439,8 @@ class Bridge(IBridge):
             "precomputed": precomputed_meta,
             "menu": menu,
         }
+        if menu_error is not None:
+            to_send["menu_error"] = menu_error
         logger.debug(f"[{self.id}] send() gather: to_send={to_send}")
 
         gathered_data = sub_comm.gather(to_send, root=0)
@@ -453,7 +458,10 @@ class Bridge(IBridge):
             # coordinates (or under-count the grid) and corrupt the combine.
             all_partials_meta: List[Dict[str, Any]] = []
             menus: List[EagerMenu] = []
+            menu_errors: List[str] = []
             for d in gathered_data:
+                if d.get("menu_error") is not None:
+                    menu_errors.append(d["menu_error"])
                 who_has.update(d["future-info"]["who_has"])
                 nbytes.update(d["future-info"]["nbytes"])
                 future_field = d["future-info"]["future"]
@@ -512,6 +520,10 @@ class Bridge(IBridge):
                 # Every participating bridge's eager menu, carried with the timestep it was computed for. Absent from
                 # the payload on the legacy path, so that payload stays byte-identical there.
                 to_send["menu"] = menus
+            if menu_errors:
+                # A bridge could not build its menu for this timestep: the payload carries the cause so the analytics
+                # side fails the RUN at its cycle boundary instead of serving a silently menu-less delivery.
+                to_send["menu_error"] = " | ".join(menu_errors)
             logger.debug(
                 f"[{self.id}] send() log_event: array={array_name}, "
                 f"timestep={timestep}, n_futures={len(futures_payload)}"
@@ -520,30 +532,63 @@ class Bridge(IBridge):
 
         # TODO: what to do if error ?
 
-    def _build_runtime_menu(self, array_name: str, chunk: np.ndarray, timestep: int) -> Optional[EagerMenu]:
-        """Build this bridge's eager scalar menu for one timestep, or ``None`` when the runtime path is off.
+    def _build_runtime_menu(
+        self,
+        array_name: str,
+        chunk: np.ndarray,
+        timestep: int,
+        branches: Optional[List[Any]] = None,
+    ) -> Tuple[Optional[EagerMenu], Optional[str]]:
+        """Build this bridge's eager scalar menu for one timestep: ``(menu, error)``.
 
         The menu is computed on the bridge's OWN numpy chunk, so it obeys the standing invariant: what leaves this
         method is a handful of chunk-local scalars and the two small ``{n, total[, M]}`` dict partials, never the chunk.
         It is called from ``send()`` after the per-branch local reductions and before the first scatter.
 
+        Two gates, both deliberate:
+
+        - the runtime flag, because the menu only exists for that delivery mode;
+        - at least one FILED branch on the array (``branches``), i.e. at least one callback that the runtime delivery
+          will hand a collection to. A deployment that merely has the flag set -- ``precompute=False`` callbacks, or
+          callbacks registered on other arrays -- paid six chunk folds per bridge per timestep for a menu nobody could
+          read (measured at 2.8-45.2 ms per bridge per timestep at 2-32 MB).
+
+        Coexistence cost, documented because P4 removes it: while the analyzer-driven branches and the eager menu
+        coexist, the ``sum``/``min``/``max``/``prod`` entries recompute what ``_execute_operations_on_chunk`` just
+        computed on the SAME chunk (``bridge.send``). That is straight double work that the P4 analyzer deletion
+        eliminates by making the menu the only fold site.
+
+        The failure contract is fail-loud but NOT fail-the-send: a menu entry that cannot fold its chunk (an empty
+        chunk, a numeric edge) is returned as ``error`` and shipped with the topic event, where the analytics side
+        records it as the run failure and raises it at the cycle boundary. Raising here instead would abort the
+        simulation's send loop with no diagnostic on the analytics side, and dropping it silently would deliver a
+        menu-less timestep that looks healthy.
+
         - ``:param array_name:`` Registered array the chunk belongs to.
         - ``:param chunk:`` The bridge's own numpy chunk, already available at ``send()``.
         - ``:param timestep:`` Timestep the chunk belongs to; every menu value is stamped with it, which is what lets
           the analytics side refuse a menu value of an earlier timestep.
+        - ``:param branches:`` The branches filed for this array, read only for the "is there anything to serve" gate.
         """
-        if not runtime_delivery_enabled():
-            return None
+        if not runtime_delivery_enabled() or not branches:
+            return None, None
         metadata = self.arrays_metadata[array_name]
         collection = DeisaCollection.from_metadata(array_name, timestep, metadata)
         sub_comm = self._array_comms.get(array_name)
         rank = 0 if sub_comm is None or sub_comm is _COMM_NULL else sub_comm.Get_rank()
-        return build_eager_menu(
-            collection,
-            chunk,
-            rank=rank,
-            chunk_position=metadata.get("chunk_position", ()),
-        )
+        try:
+            return (
+                build_eager_menu(
+                    collection,
+                    chunk,
+                    rank=rank,
+                    chunk_position=metadata.get("chunk_position", ()),
+                ),
+                None,
+            )
+        except Exception as exc:  # the fail-loud path: ship the cause, abort at the cycle boundary
+            logger.error(f"[{self.id}] eager menu failed for array {array_name!r} at timestep {timestep}: {exc!r}")
+            return None, f"array {array_name!r} at timestep {timestep}, bridge {rank}: {exc!r}"
 
     def _direct_send(
         self,
@@ -553,6 +598,7 @@ class Bridge(IBridge):
         timestep: int,
         precomputed_meta: Optional[Dict[str, Dict]] = None,
         menu: Optional[EagerMenu] = None,
+        menu_error: Optional[str] = None,
     ) -> None:
         """
         Handle single-bridge array send without collective.
@@ -607,6 +653,8 @@ class Bridge(IBridge):
         }
         if menu is not None:
             to_send["menu"] = [menu]
+        if menu_error is not None:
+            to_send["menu_error"] = menu_error
         self.client.log_event(array_name, to_send)
 
     def get(self, key: str, timestep: Optional[int] = None, default: Any = None) -> Optional[Union[Deque, Any]]:

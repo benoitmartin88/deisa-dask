@@ -52,7 +52,10 @@ because merging it would silently mix two timesteps of one field.
 
 :class:`EagerMenu` is the eager half of the transfer strategy: the six tiny scalar full folds a bridge computes once for
 its chunk, so the common scalar reduction costs no round trip. A menu value IS the payload an on-demand request for the
-same operation would return (same composed callable, same chunk), so the merge path consumes it unchanged.
+same operation would return (same composed callable, same chunk) -- **for a reduction of the bare registered array**,
+which is the program the menu is built from. A derived operand (``(collection * 2).sum()``) needs partials computed
+from its own program, so it never reads the menu and always dispatches on demand; :class:`PlanDispatcher` gates the
+menu path on the operand program for exactly that reason.
 
 The same exchange carries the estimator-side PCA branch: :meth:`PlanDispatcher.compute_pca` dispatches a
 :class:`~deisa.dask.runtime_compose.PCARequest`, whose per-bridge partial is a mergeable
@@ -73,7 +76,7 @@ from deisa.dask import runtime_errors as errors
 from deisa.dask.branch import _BRANCH_KIND_PCA, _SCALAR_FOLDS, _combine_two_phase
 from deisa.dask.mergeable_pca import PCASummary, merge_tree
 from deisa.dask.runtime_compose import PCARequest, RuntimeRequest, compose_request
-from deisa.dask.runtime_expr import KIND_BOOLEAN, KIND_COUNT, KIND_SCALAR
+from deisa.dask.runtime_expr import _CHUNK_PROGRAM, KIND_BOOLEAN, KIND_COUNT, KIND_SCALAR
 
 __all__ = [
     "EAGER_MENU_OPS",
@@ -180,6 +183,10 @@ class PartialReport:
 @dataclass(frozen=True)
 class EagerMenu:
     """The eager scalar menu of ONE bridge for ONE timestep (the zero-round-trip half of the transfer strategy).
+
+    Every value is a full fold of the BARE registered array's chunk (the identity program), so the menu answers a
+    reduction of the bare collection and nothing else: a reduction of a derived operand (``(c * 2).sum()``) must be
+    dispatched, because its partials are folds of a different program.
 
     - ``:param array_name:`` Registered array the menu was computed for.
     - ``:param timestep:`` Timestep the bridge's chunk belonged to.
@@ -567,7 +574,16 @@ class PlanDispatcher:
         request = compose_request(reduction)
         ndim = reduction.operand.ndim
         menus = self._menus.get((request.input_name, reduction.root.timestep))
-        if menus and not request.axes and all(reduction.op_name in eager.values for eager in menus):
+        # The menu holds the BARE registered array's partials (``build_eager_menu`` composes the identity program), so
+        # it may only answer a reduction whose operand IS the bare chunk program. A derived operand (``(c * 2).sum()``)
+        # needs its own partials computed from the derived program: answering it from the menu would silently return
+        # the un-derived field's value, with no round trip and no exception.
+        if (
+            menus
+            and not request.axes
+            and reduction.operand.program == _CHUNK_PROGRAM
+            and all(reduction.op_name in eager.values for eager in menus)
+        ):
             reports = self._menu_reports(menus, reduction.op_name)
             if self._bridge_count is not None and len(reports) != self._bridge_count:
                 raise errors.precompute_runtime_invariant(
