@@ -39,16 +39,49 @@ from deisa.dask.branch import (
     _BRANCH_KIND_MOMENT,
     _BRANCH_KIND_PCA,
     _BRANCH_KIND_SCALAR,
+    _FULL_FOLD_FINALIZERS,
     _PCA_OP_NAME,
-    _apply_full_local_fold,
     _chain_branch_func,
     _discover_partial_metadata,
+    _full_fold_layer,
 )
 from deisa.dask.mergeable_pca import _build_pca_branch_func
 from deisa.dask.precompute_errors import UnsupportedReductionError
 from deisa.dask.utils import build_deisa_array
 
 logger = logging.getLogger(__name__)
+
+
+def _apply_full_local_fold(
+    op_name: Optional[str],
+    full_local_fold: bool,
+    chain: List[Tuple[Callable, dict, int]],
+) -> List[Tuple[Callable, dict, int]]:
+    """Append the op's full-fold finalizer to ``chain`` (the last layer) when ``full_local_fold`` holds.
+
+    The single site of the minimal-scalar-partial rule: the bridge-local ``branch_func`` becomes
+    ``tier -> finalizer`` so the bridge folds its whole chunk before sending (smallest payload, shortest critical
+    path), while the recorded signature stays the tier's own ``chunk_axis``-derived value. No builder rebinds dask's
+    chunk kwargs and no operator is special-cased outside this table.
+
+    Lives in the oracle: the recorded branch contract is what this builds, and the run time that carries the same
+    guarantee is ``runtime_compose._build_chain`` -> :func:`deisa.dask.branch._full_fold_layer` over
+    :data:`deisa.dask.branch._FULL_FOLD_FINALIZERS` (both still in ``src/``, live via ``runtime_compose``).
+    """
+    if not full_local_fold:
+        return chain
+    finalizer = _FULL_FOLD_FINALIZERS.get(op_name or "")
+    if finalizer is None:
+        # A kind that is scalar-flagged but has no finalizer cannot fold eagerly: keep the tier partial (the delivery
+        # contract still holds -- only the payload is larger than minimal).
+        return chain
+    tier_func, tier_kwargs, input_count = chain[-1]
+    layer = (
+        functools.partial(_full_fold_layer, tier_func=tier_func, tier_kwargs=tier_kwargs, finalizer=finalizer),
+        {},
+        input_count,
+    )
+    return list(chain[:-1]) + [layer]
 
 
 def _analyze_callback_for_branches(callback: Callable, registered_arrays: Dict[str, Any]):
@@ -244,10 +277,10 @@ def _build_pca_branch(pca_request: Dict[str, Any]) -> BranchSpec:
     )
     # ``deliver_direct=True`` and ``reduction_axes=()``: the PCA branch reads the registered chunk ITSELF and consumes
     # the WHOLE feature dimension, so it passes the same "the callback's own op can consume this delivery" gate every
-    # reduction branch passes. The runtime dispatch is NOT by ``op_name``: there is no ``_PrecomputedDeisaArray.pca``
-    # method to route to. The summary is attached to the view as ``_deisa_pca_summary`` and consumed by
-    # ``MergeablePCA.fit`` looking that attribute up, which is the explicit separate route this comment used to name
-    # wrongly.
+    # reduction branch passes. The runtime dispatch is NOT by ``op_name``: there is no per-branch ``.pca`` method to
+    # route to. At run time the bridge's ``PCASummary`` comes back over the runtime PCA request channel and the root
+    # merges it (``runtime_dispatch`` PCA request -> ``merge_tree``) before ``MergeablePCA._fit_delivered`` adopts it;
+    # no object ever carries the summary on a ``_deisa_pca_summary`` attribute.
     return BranchSpec(
         output_key=f"{array_name}-{_PCA_OP_NAME}",
         input_name=array_name,

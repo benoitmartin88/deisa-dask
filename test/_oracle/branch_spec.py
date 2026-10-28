@@ -50,30 +50,30 @@ from typing import Any, Callable, Dict, Optional, Tuple
 class BranchSpec:
     """One chunk-local sub-expression the bridge can execute + combine.
 
-        Attributes
-        ----------
-        output_key : str
-            Stable identifier for this branch (e.g. ``"f-mean"``). The bridge uses it to namespace its scatter key and
-            the Deisa topic handler uses it to route the per-bridge partials back to the same branch.
-        input_name : str
-            Registered array name the branch is rooted at (e.g. ``"a"``).
-        output_kind : str
-            One of ``"scalar"`` / ``"mean"`` / ``"moment"`` / ``"pca"``.
-        branch_func : Callable
-            Python callable that, given a numpy chunk, returns the branch's per-bridge partial value (a scalar /
-            ndarray / dict). Pickled across the bridge process boundary.
-        chunk_axis : Optional[Tuple[int, ...]]
-            For reductions, the tuple of axes being reduced in the chunk (e.g. ``(0, 1)`` for full reduction on a 2-D
-            chunk). ``None`` for pointwise-only branches.
-        finalize : Optional[str]
-            ``"sqrt"`` for std (apply ``np.sqrt`` after combining), else ``None``.
-        partial_shape : Tuple[int, ...]
-            Shape of the **per-bridge partial** (what the branch_func returns). For ``scalar`` reductions on a 2-D chunk
-            with ``keepdims=False`` this is ``()``; with ``keepdims=True`` it is ``(1, 1)``. For axis reductions the
-            partial keeps the un-reduced axes' full size (e.g. ``mean(axis=0)`` on ``(M, N)`` partial has shape ``(1,
-            N)``).
-        partial_dtype : str
-            NumPy dtype string of the per-bridge partial.
+    Attributes
+    ----------
+    output_key : str
+        Stable identifier for this branch (e.g. ``"f-mean"``). The bridge uses it to namespace its scatter key and
+        the Deisa topic handler uses it to route the per-bridge partials back to the same branch.
+    input_name : str
+        Registered array name the branch is rooted at (e.g. ``"a"``).
+    output_kind : str
+        One of ``"scalar"`` / ``"mean"`` / ``"moment"`` / ``"pca"``.
+    branch_func : Callable
+        Python callable that, given a numpy chunk, returns the branch's per-bridge partial value (a scalar /
+        ndarray / dict). Pickled across the bridge process boundary.
+    chunk_axis : Optional[Tuple[int, ...]]
+        For reductions, the tuple of axes being reduced in the chunk (e.g. ``(0, 1)`` for full reduction on a 2-D
+        chunk). ``None`` for pointwise-only branches.
+    finalize : Optional[str]
+        ``"sqrt"`` for std (apply ``np.sqrt`` after combining), else ``None``.
+    partial_shape : Tuple[int, ...]
+        Shape of the **per-bridge partial** (what the branch_func returns). For ``scalar`` reductions on a 2-D chunk
+        with ``keepdims=False`` this is ``()``; with ``keepdims=True`` it is ``(1, 1)``. For axis reductions the
+        partial keeps the un-reduced axes' full size (e.g. ``mean(axis=0)`` on ``(M, N)`` partial has shape ``(1,
+        N)``).
+    partial_dtype : str
+        NumPy dtype string of the per-bridge partial.
     """
 
     output_key: str

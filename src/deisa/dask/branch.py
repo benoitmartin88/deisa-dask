@@ -37,15 +37,12 @@ callables that consume them.
 
 from __future__ import annotations
 
-import functools
 import itertools
 import logging
-from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
-import dask.array as da
 from dask import delayed
 from dask.array.reductions import mean_agg, moment_agg
 from deisa.dask.mergeable_pca import PCASummary
@@ -91,7 +88,8 @@ _SCALAR_FOLDS = {
     "count": lambda entries: np.sum(entries, axis=0),
 }
 
-# Bridge-local finishing step for a FULL local fold (see :func:`_apply_full_local_fold`): reduce dask's tier-shaped
+# Bridge-local finishing step for a FULL local fold (the analyzer that composes it lives in
+# ``test/_oracle/branch_specs.py::_apply_full_local_fold``): reduce dask's tier-shaped
 # chunk-stage output down to the minimal per-bridge partial the operator's combine can consume. Generic by design --
 # the table is keyed by op name and no build path special-cases an operator. ``mean``/``moment`` never reach here:
 # their tier-shaped dict partials are REQUIRED by ``mean_agg`` / ``moment_agg`` (a bare scalar cannot carry
@@ -131,167 +129,6 @@ def _full_fold_layer(x, tier_func, tier_kwargs, finalizer):
     same constraint that shaped :func:`_chain_branch_func`).
     """
     return finalizer(tier_func(x, **tier_kwargs))
-
-
-def _apply_full_local_fold(
-    op_name: Optional[str],
-    full_local_fold: bool,
-    chain: List[Tuple[Callable, dict, int]],
-) -> List[Tuple[Callable, dict, int]]:
-    """Append the op's full-fold finalizer to ``chain`` (the last layer) when ``full_local_fold`` holds.
-
-    The single site of the minimal-scalar-partial rule: the bridge-local ``branch_func`` becomes
-    ``tier -> finalizer`` so the bridge folds its whole chunk before sending (smallest payload, shortest critical
-    path), while the recorded signature stays the tier's own ``chunk_axis``-derived value. No builder rebinds dask's
-    chunk kwargs and no operator is special-cased outside this table.
-    """
-    if not full_local_fold:
-        return chain
-    finalizer = _FULL_FOLD_FINALIZERS.get(op_name or "")
-    if finalizer is None:
-        # A kind that is scalar-flagged but has no finalizer cannot fold eagerly: keep the tier partial (the delivery
-        # contract still holds -- only the payload is larger than minimal).
-        return chain
-    tier_func, tier_kwargs, input_count = chain[-1]
-    layer = (
-        functools.partial(_full_fold_layer, tier_func=tier_func, tier_kwargs=tier_kwargs, finalizer=finalizer),
-        {},
-        input_count,
-    )
-    return list(chain[:-1]) + [layer]
-
-
-def _nest_partial_dicts_by_grid(
-    partials: List[Dict[str, Any]], grid_extent: Optional[Tuple[int, ...]] = None
-) -> Tuple[Any, Tuple[int, ...]]:
-    """Arrange per-bridge dict-blob partials into a nested list that mirrors
-    the MPI chunk grid, so that ``mean_agg`` / ``moment_agg`` (which walk the nested list with ``_concatenate2``) can
-    combine them.
-
-    ``partials`` is a list of dicts each carrying a ``chunk_position`` -- the bridge's MPI coords. Returns
-    ``(nested_list, grid_shape)`` where ``grid_shape`` is the MPI grid shape (``(N, M, ...)``) and
-    ``nested_list[i_0][i_1]...`` is the dict (or future-of-dict) at MPI coords ``(i_0, i_1, ...)``.
-
-    ``grid_extent`` (per data axis, from ``global_shape // chunk_shape``) is validated against the coords when
-    provided: a mismatch means the grid layout the partials describe contradicts the array metadata, which would
-    silently corrupt any axis combine -- raise instead (F5).
-
-    For a 1-D MPI grid (e.g. ``(2,)`` or ``(4,)``) this returns a flat list of length N. For higher-D grids the list is
-    nested.
-    """
-    # Determine grid shape from the unique coords across all partials.
-    coords = [tuple(p["chunk_position"]) for p in partials]
-    if not coords:
-        raise ValueError("_nest_partial_dicts_by_grid: no partials provided")
-    ndim = len(coords[0])
-    # Validate uniform ndim
-    for c in coords:
-        if len(c) != ndim:
-            raise ValueError(f"_nest_partial_dicts_by_grid: partials have inconsistent coord dimensions: {coords}")
-    # Per-axis sizes
-    axis_sizes: Dict[int, set] = {ax: set() for ax in range(ndim)}
-    for c in coords:
-        for ax, v in enumerate(c):
-            axis_sizes[ax].add(v)
-    grid_shape = tuple(len(axis_sizes[ax]) for ax in range(ndim))
-    if grid_extent is not None and tuple(grid_extent) != grid_shape:
-        raise PrecomputeRuntimeError(
-            f"_nest_partial_dicts_by_grid: partials' chunk grid {grid_shape} contradicts the array metadata "
-            f"grid {tuple(grid_extent)}. The grid<->data axis mapping is ambiguous; refusing to combine "
-            f"rather than silently producing a wrong reduction."
-        )
-    # Validate full grid is filled
-    expected = set(itertools.product(*(range(g) for g in grid_shape)))
-    actual = set(coords)
-    if actual != expected:
-        raise ValueError(
-            f"_nest_partial_dicts_by_grid: partials do not cover the full grid (expected {expected}, got {actual})"
-        )
-
-    # Build a map from coords -> dict (or future)
-    by_coord: Dict[Tuple[int, ...], int] = {c: i for i, c in enumerate(coords)}
-
-    def _build_nested(dims_remaining: Tuple[int, ...], prefix: Tuple[int, ...]) -> Any:
-        if not dims_remaining:
-            return partials[by_coord[prefix]]["future"]
-        head, *tail = dims_remaining
-        return [_build_nested(tuple(tail), (*prefix, i)) for i in range(head)]
-
-    nested = _build_nested(grid_shape, ())
-    return nested, grid_shape
-
-
-def _combine_pca_summaries(
-    partial_futures: List[Dict[str, Any]],
-    config: Optional[Dict[str, Any]] = None,
-) -> Any:
-    """Reduce the per-bridge PCA summaries into ONE delivered in-situ PCA, without a worker ever seeing a sample.
-
-    This is the Deisa-side half of the in-situ placement. Each entry of ``partial_futures`` is a scattered
-    :class:`~deisa.dask.mergeable_pca.PCASummary` produced by a bridge running
-    :func:`~deisa.dask.mergeable_pca.local_pca_from_chunk` over its OWN chunk; the returned object merges them with the
-    balanced pairwise tree of :func:`~deisa.dask.mergeable_pca.merge_pca` (the reduction shape of Qin & Yan,
-    arXiv:1601.07010, Algorithm 1, and Kjolstad/Demmel et al., arXiv:1710.02812, merge-and-truncate).
-
-    Three properties this is built to have, each of which the acceptance tests assert:
-
-    - **No sample crosses.** The tree's leaves are the scattered summaries, so a merge node consumes summaries only. No
-      task in the graph ever holds a raw sample, which is what makes "the chunk never reaches a worker" provable rather
-      than asserted: there is no task that COULD return one.
-    - **Not truncated at the bridge.** ``n_components`` and ``whiten`` in ``config`` are applied at the ROOT only,
-      inside :meth:`MergeablePCA._fit_delivered`. Truncating per bridge would drop directions before the cross-bridge
-      Chan-Golub-LeVeque (1979) correction term ever runs and silently destroy exactness.
-    - **A real Dask graph, returned unbuilt.** The result is a ``Delayed`` carrying the merged ``PCASummary``, so each
-      merge node costs ``O(d^3)`` -- independent of the sample count -- and the graph is inspectable before it runs.
-
-    The merge algebra is classical (Chan-Golub-LeVeque 1979; Qin & Yan; Kjolstad/Demmel); what is claimed as ours is
-    only that the leaves are evaluated inside the simulation's MPI bridge rather than on the analytics workers.
-
-    - ``:param partial_futures:`` One ``{"future": Future, ...}`` entry per bridge, each holding a scattered
-      ``PCASummary``.
-    - ``:param config:`` The recorded root-only estimator configuration (``n_components`` / ``whiten`` / ...), used to
-      build the same estimator the user wrote. ``None`` or empty means the defaults.
-    """
-    from deisa.dask.mergeable_pca import merge_pca
-
-    # Sort by chunk_position for determinism: merge_pca is associative, so the ORDER cannot change the result, but a
-    # stable order makes the graph reproducible and the tests comparable run to run.
-    ordered = sorted(partial_futures, key=lambda p: tuple(p["chunk_position"]))
-    level = [delayed(p["future"]) for p in ordered]
-    while len(level) > 1:
-        merged = [delayed(merge_pca)(level[i], level[i + 1]) for i in range(0, len(level) - 1, 2)]
-        if len(level) % 2:
-            # An odd level carries its last node up unchanged, keeping the tree balanced instead of degenerating into
-            # a chain -- the same reasoning merge_tree makes, and safe because merge_pca is associative.
-            merged.append(level[-1])
-        level = merged
-    return DeliveredPCA(level[0], dict(config or {}))
-
-
-@dataclass(frozen=True)
-class DeliveredPCA:
-    """A merged in-situ PCA summary plus the estimator configuration that should consume it.
-
-    Carried as the attribute ``_deisa_pca_summary`` on whatever object hands the merged summary to the estimator;
-    :meth:`MergeablePCA._fit_delivered` reads it. Nothing in this package attaches it: the per-callback dispatch view
-    that did was removed with the analyzer, and the runtime path passes the summary it merged itself to the same
-    fitter. A frozen dataclass pickles by value: no reconstruction callback, no globals to resolve on a worker, and the
-    ``Delayed`` inside it rebuilds its own graph when it does.
-
-    - ``:param merged:`` ``Delayed`` (or any object with ``.compute()``) yielding the merged ``PCASummary``.
-    - ``:param config:`` Root-only estimator configuration: ``n_components``, ``whiten``, and the axis policy.
-    """
-
-    merged: Any
-    config: Dict[str, Any]
-
-    def compute(self) -> Any:
-        """Materialize the merged summary. Equivalent to ``self.merged.compute()``.
-
-        Named explicitly so the estimator's ``hasattr(delivered, "compute")`` branch treats this wrapper and a bare
-        ``Delayed`` identically, instead of a wrapper silently reading ``.merged`` as if it were the summary.
-        """
-        return self.merged.compute()
 
 
 def _flatten_grid_entries(nested: Any) -> List[Any]:
@@ -387,70 +224,6 @@ def _combine_two_phase(
     if finalize == "sqrt":
         result = np.sqrt(result)
     return result
-
-
-def _combine_array_from_partials(
-    partials: List[Dict[str, Any]],
-    kind: str,
-    finalize: Optional[str],
-    reduction_axes_hint: Optional[Tuple[int, ...]],
-    array_ndim: int,
-    op_name: Optional[str] = None,
-    global_shape: Optional[Tuple[int, ...]] = None,
-    grid_extent: Optional[Tuple[int, ...]] = None,
-) -> Any:
-    """Build a single-block dask array that combines per-bridge partials."""
-    if not partials:
-        raise ValueError("_combine_array_from_partials: no partials provided")
-    nested, grid_shape = _nest_partial_dicts_by_grid(partials, grid_extent=grid_extent)
-    out_dtype = str(partials[0]["dtype"])
-
-    # Grid <-> data axis mapping must be explicit: each grid level is one data axis (the harness's cart dims == array
-    # ndim invariant).
-    if len(grid_shape) != array_ndim:
-        raise PrecomputeRuntimeError(
-            f"_combine_array_from_partials: chunk grid {grid_shape} has {len(grid_shape)} levels but the "
-            f"array has {array_ndim} data axes; cannot map grid axes to data axes. Refusing to combine."
-        )
-
-    # Red axes = the data axes being reduced. ``reduction_axes_hint is None`` is the legacy no-axis form of a
-    # full reduction (reduce all data axes).
-    if reduction_axes_hint is None:
-        red_axes = tuple(range(array_ndim))
-    else:
-        red_axes = tuple(int(a) for a in reduction_axes_hint)
-        for ax in red_axes:
-            if not 0 <= ax < array_ndim:
-                raise PrecomputeRuntimeError(
-                    f"_combine_array_from_partials: reduction axis {ax} out of range for {array_ndim}-D array"
-                )
-    kept_axes = tuple(ax for ax in range(array_ndim) if ax not in red_axes)
-
-    # Compute the combined output shape.
-    if global_shape is not None:
-        out_shape = tuple(int(global_shape[ax]) for ax in kept_axes)
-    else:
-        # Legacy fallback (no metadata): derive from the per-bridge partial.
-        if reduction_axes_hint is None:
-            out_shape = tuple(partials[0]["shape"])
-        else:
-            out_shape = tuple(partials[0]["shape"][ax] for ax in kept_axes)
-
-    flat_entries = [(tuple(p["chunk_position"]), p["future"]) for p in partials]
-    return da.from_delayed(
-        _combine_two_phase(
-            flat_entries,
-            kind=kind,
-            op_name=op_name,
-            red_axes=red_axes,
-            kept_axes=kept_axes,
-            grid_shape=grid_shape,
-            out_dtype=out_dtype,
-            finalize=finalize,
-        ),
-        shape=out_shape,
-        dtype=out_dtype,
-    )
 
 
 def _discover_partial_metadata(

@@ -906,13 +906,9 @@ class MergeablePCA:
         Three paths, all ending in the SAME root state (``_summary_`` plus the materialized public attributes), so
         "in-situ on the bridge" and "standalone on Dask" cannot drift apart:
 
-        - A **delivered** object (one carrying ``_deisa_pca_summary``) takes :meth:`_fit_delivered`. Nothing in this
-          package attaches that attribute any more -- the per-callback dispatch view that did was removed with the
-          analyzer -- so the branch serves a caller carrying a merged summary from elsewhere; the runtime path reaches
-          the same fitter through :meth:`_fit_runtime_collection`.
         - A **runtime collection** (a DEISA callback's window entry, which carries no data) takes
           :meth:`_fit_runtime_collection`: it dispatches a PCA branch request to the bridges, merges their summaries
-          at the root and adopts the result through the same :meth:`_fit_delivered`.
+          at the root and adopts the result through :meth:`_fit_delivered`.
         - A **dask array** is fitted through :meth:`_fit_dask_delayed` / :meth:`_fit_dask`.
         - A **numpy array** takes the in-memory path, the single-leaf base case of the same tree.
 
@@ -924,9 +920,6 @@ class MergeablePCA:
           dimensions, ``axis_names`` / ``feature_axes`` / ``sample_axes`` say which axes are which.
         - ``:param y:`` Accepted and ignored, for scikit-learn parity.
         """
-        delivered = getattr(X, "_deisa_pca_summary", None)
-        if delivered is not None:
-            return self._fit_delivered(delivered, X)
         if self._is_runtime_collection(X):
             return self._fit_runtime_collection(X)
 

@@ -15,13 +15,9 @@ from typing import Any, Dict
 import dask.array as da
 import numpy as np
 import pytest
-from _oracle.branch_specs import _build_chain_branch_func, _walk_chain
+from _oracle.branch_specs import _apply_full_local_fold, _build_chain_branch_func, _walk_chain
 from _oracle.task_branches import _find_chunk_layer, _find_single_upstream
 from utils import _make_callback
-
-from deisa.dask.branch import (
-    _apply_full_local_fold,
-)
 
 
 def _find_agg_layer(graph) -> str:
@@ -404,88 +400,6 @@ class TestMultiReductionBranches:
         mn = self._analyze("return (arr * arr).min().compute()")["f-min"]
         assert np.isclose(self._scalar(mn.branch_func(neg)), (neg**2).min())
         assert "chunk_min" in self._chain_names(mn)
-
-    def test_var_std_folded_partials_combine_correctly(self):
-        # var/std fold their pointwise chain AND ship {n, total, M} dict
-        # partials that _combine_array_from_partials (kind='moment') can
-        # combine into the correct global value.
-        from deisa.dask.branch import _combine_array_from_partials
-
-        real = np.arange(1, 17, dtype=np.float64).reshape(4, 4)
-        chunks = [real[i : i + 2, j : j + 2] for i in range(0, 4, 2) for j in range(0, 4, 2)]
-
-        for label, expected in [("std", (real**2).std()), ("var", (real**2).var())]:
-            branch = self._analyze(f"return (arr * arr).{label}().compute()")[f"f-{label}"]
-            assert "moment_chunk" in self._chain_names(branch)
-            partials = []
-            for c in chunks:
-                p = branch.branch_func(c)
-                partials.append(
-                    {
-                        "future": p,
-                        "chunk_position": tuple(np.unravel_index(len(partials), (2, 2))),
-                        "shape": tuple(np.asarray(p["total"]).shape),
-                        "dtype": np.asarray(p["total"]).dtype,
-                    }
-                )
-            combined = _combine_array_from_partials(
-                partials,
-                kind=branch.output_kind,
-                finalize=branch.finalize,
-                reduction_axes_hint=(0, 1),
-                array_ndim=2,
-            )
-            # Compute on an explicit scheduler. Earlier tests in the same worker
-            # can leave dask's global scheduler set to "dask.distributed" (any
-            # Client does), and a bare .compute() then raises
-            # "Requested dask.distributed scheduler but no Client active".
-            assert np.isclose(self._scalar(combined.compute(scheduler="sync")), float(expected))
-
-    def test_axis_reduction_combine_correct(self):
-        # The two-phase, data-axis-ordered combine must produce the
-        # TRUE axis reduction for per-bridge partials on a 2x2 grid.
-        # A crash here, or mean(axis=1) silently returning the wrong
-        # values ([7.5 9.5] vs truth [2.5 6.5 10.5 14.5]), means the
-        # red/kept-level geometry was misread.
-        from deisa.dask.branch import _combine_array_from_partials
-
-        real = np.arange(1, 17, dtype=np.float64).reshape(4, 4)
-        chunks = [real[i : i + 2, j : j + 2] for i in range(0, 4, 2) for j in range(0, 4, 2)]
-        truth = {
-            "mean": (np.mean(real, axis=0), np.mean(real, axis=1)),
-            "sum": (np.sum(real, axis=0), np.sum(real, axis=1)),
-        }
-        for op in ("mean", "sum"):
-            for ax in (0, 1):
-                branch = self._analyze(f"r = arr.{op}(axis={ax})\nreturn r.compute()")[f"f-{op}"]
-                partials = []
-                for c in chunks:
-                    p = branch.branch_func(c)
-                    rep = np.asarray(p["total"]) if isinstance(p, dict) else np.asarray(p)
-                    partials.append(
-                        {
-                            "future": p,
-                            "chunk_position": tuple(np.unravel_index(len(partials), (2, 2))),
-                            "shape": tuple(rep.shape),
-                            "dtype": str(rep.dtype),
-                        }
-                    )
-                combined = _combine_array_from_partials(
-                    partials,
-                    kind=branch.output_kind,
-                    finalize=branch.finalize,
-                    reduction_axes_hint=(ax,),
-                    array_ndim=2,
-                    op_name=branch.op_name,
-                )
-                # Explicit scheduler: this module is cluster-free, so it must not
-                # depend on whatever default scheduler an earlier test left behind.
-                got = np.asarray(combined.compute(scheduler="sync"))
-                expected = truth[op][ax]
-                assert got.shape == expected.shape, f"{op}(axis={ax}): got shape {got.shape}, expected {expected.shape}"
-                assert np.allclose(got, expected, rtol=1e-10, atol=1e-12), (
-                    f"{op}(axis={ax}): got {got.tolist()}, expected {expected.tolist()}"
-                )
 
 
 # ---------------------------------------------------------------------------
