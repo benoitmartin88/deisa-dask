@@ -223,11 +223,19 @@ def _analyze_callback_for_branches(callback: Callable, registered_arrays: Dict[s
 
 # Scalar-kind (``sum``/``prod``/``max``/``min``) elementwise fold for the first combine stage: scalar-axis partials
 # are plain arrays (reduced axes already dropped), combined by binary-ufunc fold over identical shapes.
+#
+# The boolean/count kinds fold with the same signature and join the table here, because their cross-bridge step IS a
+# scalar fold: ``any`` is a max-like OR, ``all`` a min-like AND, and ``count`` is additive (each bridge ships the count
+# of its own non-zero elements, so the global count is their sum). Keying them here keeps one table for every fold --
+# no build path special-cases an operator.
 _SCALAR_FOLDS = {
     "sum": lambda entries: np.sum(entries, axis=0),
     "prod": lambda entries: np.prod(entries, axis=0),
     "max": lambda entries: np.max(entries, axis=0),
     "min": lambda entries: np.min(entries, axis=0),
+    "any": lambda entries: np.any(entries, axis=0),
+    "all": lambda entries: np.all(entries, axis=0),
+    "count": lambda entries: np.sum(entries, axis=0),
 }
 
 # Bridge-local finishing step for a FULL local fold (see :func:`_apply_full_local_fold`): reduce dask's tier-shaped

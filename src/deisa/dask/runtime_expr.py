@@ -57,8 +57,8 @@ import numpy as np
 from deisa.dask import runtime_errors as errors
 
 # Kinds of reduction payload. The first three are the values the existing combine algebra already understands; the last
-# two are the F4 extension (any/all -> boolean, count -> count). The combine tables must gain the two new kinds before
-# P2 delivers them -- P1 only composes and verifies the per-bridge partials.
+# two are the F4 extension (any/all -> boolean, count -> count). Their cross-bridge folds live in the combine tables
+# (``_SCALAR_FOLDS``), which is what lets the dispatch step merge them like any other fold.
 KIND_SCALAR = "scalar"
 KIND_MEAN = "mean"
 KIND_MOMENT = "moment"
@@ -303,6 +303,15 @@ class LazyOperand:
         """The picklable program node this operand contributes to a composed ``branch_func``."""
         return self._program
 
+    @property
+    def dispatcher(self) -> Any:
+        """The compute boundary this operand dispatches through, or ``None`` when it has no bridge transport.
+
+        The delivery path attaches it to the collection, and every expression inherits it from the operand it was built
+        from, so ``.compute()`` on a reduction reaches the bridges without a registry and without global state.
+        """
+        return self._dispatcher
+
     def _symbol(self) -> str:
         """Short description of this operand used as the offending-symbol half of a refusal message."""
         return type(self).__name__
@@ -369,7 +378,9 @@ class LazyOperand:
                 raise errors.mixed_root(self._symbol(), repr(self._root), repr(operand.root))
             _node(operand)
         shape, dtype = _pointwise_metadata(op, all_operands)
-        return PointwiseExpr(op=op, operands=all_operands, root=self._root, shape=shape, dtype=dtype)
+        return PointwiseExpr(
+            op=op, operands=all_operands, root=self._root, shape=shape, dtype=dtype, dispatcher=self.dispatcher
+        )
 
     def __add__(self, other: Any) -> "PointwiseExpr":
         return self._pointwise("add", other)
@@ -538,6 +549,7 @@ class LazyOperand:
             finalize=_REDUCTION_FINALIZERS.get(op_name),
             shape=shape,
             dtype=_reduction_dtype(op_name, self._dtype),
+            dispatcher=self.dispatcher,
         )
 
     def sum(self, axis: Any = None, keepdims: bool = False, dtype: Any = None, out: Any = None) -> "ReductionExpr":
@@ -613,9 +625,10 @@ class PointwiseExpr(LazyOperand):
     - ``:param root:`` The root every lazy operand in the tree shares.
     - ``:param shape:`` Broadcast shape of the node.
     - ``:param dtype:`` numpy result dtype of the node.
+    - ``:param dispatcher:`` The compute boundary inherited from the operand this node was built from.
     """
 
-    __slots__ = ("op", "operands", "_root", "_shape", "_dtype", "_program")
+    __slots__ = ("op", "operands", "_root", "_shape", "_dtype", "_program", "_dispatcher")
 
     def __init__(
         self,
@@ -624,6 +637,7 @@ class PointwiseExpr(LazyOperand):
         root: Root,
         shape: Tuple[int, ...],
         dtype: Any,
+        dispatcher: Any = None,
     ) -> None:
         self.op = op
         self.operands = tuple(operands)
@@ -631,6 +645,7 @@ class PointwiseExpr(LazyOperand):
         self._shape = tuple(int(size) for size in shape)
         self._dtype = np.dtype(dtype)
         self._program = (op,) + tuple(_node(operand) for operand in self.operands)
+        self._dispatcher = dispatcher
 
     def _symbol(self) -> str:
         return f"the pointwise expression {self.op!r}"
@@ -655,9 +670,21 @@ class ReductionExpr(LazyOperand):
     - ``:param finalize:`` Post-combine step (``"sqrt"`` for std, else ``None``).
     - ``:param shape:`` Shape of the delivered value.
     - ``:param dtype:`` dtype of the delivered value.
+    - ``:param dispatcher:`` The compute boundary inherited from the operand this reduction was built from.
     """
 
-    __slots__ = ("operand", "op_name", "axes", "kind", "finalize", "_root", "_shape", "_dtype", "_program")
+    __slots__ = (
+        "operand",
+        "op_name",
+        "axes",
+        "kind",
+        "finalize",
+        "_root",
+        "_shape",
+        "_dtype",
+        "_program",
+        "_dispatcher",
+    )
 
     def __init__(
         self,
@@ -668,6 +695,7 @@ class ReductionExpr(LazyOperand):
         finalize: Any,
         shape: Tuple[int, ...],
         dtype: Any,
+        dispatcher: Any = None,
     ) -> None:
         self.operand = operand
         self.op_name = op_name
@@ -678,6 +706,7 @@ class ReductionExpr(LazyOperand):
         self._shape = tuple(int(size) for size in shape)
         self._dtype = np.dtype(dtype)
         self._program = ("reduce", op_name, self.axes, operand.program)
+        self._dispatcher = dispatcher
 
     @property
     def key(self) -> str:
@@ -704,16 +733,19 @@ class ReductionExpr(LazyOperand):
         return f"the reduction {self.key!r}"
 
     def compute(self) -> Any:
-        """Refuse in P1: the dispatch that answers this call is P2's.
+        """Deliver the concrete value of this reduction, synchronously.
 
-        - ``:raises NotImplementedError:`` always, with the reason and the path that will implement it.
+        The dispatcher composes the slim wire request, asks every bridge that owns a chunk of the root array for its
+        partial, and merges the partials with the surviving combine algebra. The chunk never crosses: only the partials
+        do, and the callback gets a concrete scalar/array back.
+
+        - ``:raises PrecomputeRuntimeError:`` when the collection carries no bridge transport, i.e. when it was built
+          outside the delivery path that attaches one.
         """
-        raise NotImplementedError(
-            f"{self._symbol()} cannot be computed yet: the per-object dispatch boundary (.compute() -> wire request -> "
-            f"bridge partials -> combine) is P2 of the local-reduction redesign. Per-object dispatch is the locked "
-            f"batching decision, so there is no registry to fall back on. Use compose_request() to inspect the exact "
-            f"request this reduction will send."
-        )
+        dispatcher = self.dispatcher
+        if dispatcher is None:
+            raise errors.no_dispatch_transport(self._symbol())
+        return dispatcher.compute(self)
 
     def _pointwise(self, op: str, *operands: Any) -> "PointwiseExpr":
         raise errors.cross_reduction(self._symbol(), "it is used as an operand of a pointwise expression")

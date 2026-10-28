@@ -80,9 +80,21 @@ class DeisaCollection(LazyOperand):
     - ``:param bridge_count:`` Number of bridges that own a chunk. Auto-detected from ``shape`` and ``chunk_shape`` when
       omitted; when given it is CROSS-CHECKED against them, because a caller-supplied count that disagrees with the
       metadata would make every reduction's combine grid wrong.
+    - ``:param dispatcher:`` The compute boundary that delivers this collection's reductions, attached by the delivery
+      path. Left ``None`` by a collection built outside that path, whose reductions then refuse instead of gathering.
     """
 
-    __slots__ = ("name", "timestep", "chunk_shape", "bridge_count", "_root", "_shape", "_dtype", "_program")
+    __slots__ = (
+        "name",
+        "timestep",
+        "chunk_shape",
+        "bridge_count",
+        "_root",
+        "_shape",
+        "_dtype",
+        "_program",
+        "_dispatcher",
+    )
 
     def __init__(
         self,
@@ -92,6 +104,7 @@ class DeisaCollection(LazyOperand):
         dtype: Any = np.float64,
         chunk_shape: Optional[Sequence[int]] = None,
         bridge_count: Optional[int] = None,
+        dispatcher: Any = None,
     ) -> None:
         self.name = str(name)
         self.timestep = int(timestep)
@@ -119,6 +132,7 @@ class DeisaCollection(LazyOperand):
             )
         self._root = Root(array_name=self.name, timestep=self.timestep)
         self._program = _CHUNK_PROGRAM
+        self._dispatcher = dispatcher
 
     @classmethod
     def from_metadata(
@@ -127,6 +141,7 @@ class DeisaCollection(LazyOperand):
         timestep: int,
         metadata: Mapping[str, Any],
         bridge_count: Optional[int] = None,
+        dispatcher: Any = None,
     ) -> "DeisaCollection":
         """Build a collection from the array metadata the handshake already exposes.
 
@@ -138,6 +153,7 @@ class DeisaCollection(LazyOperand):
         - ``:param metadata:`` Entry of the handshake's ``arrays_metadata`` for this array (``global_shape``,
           ``chunk_shape``, optional ``dtype``).
         - ``:param bridge_count:`` Optional cross-check, as in the constructor.
+        - ``:param dispatcher:`` The compute boundary to attach, as in the constructor.
         """
         global_shape = metadata.get("global_shape")
         if not global_shape:
@@ -151,6 +167,7 @@ class DeisaCollection(LazyOperand):
             dtype=metadata.get("dtype", np.float64),
             chunk_shape=metadata.get("chunk_shape"),
             bridge_count=bridge_count,
+            dispatcher=dispatcher,
         )
 
     def _symbol(self) -> str:

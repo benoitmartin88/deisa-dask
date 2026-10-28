@@ -212,8 +212,8 @@ class RuntimeRequest:
 def compose_request(reduction: ReductionExpr) -> RuntimeRequest:
     """Compose the wire request for one reduction.
 
-    Pure object-model work: no graph, no analysis, nothing is sent. P2 hands the result to the bridge communicator and
-    reuses the unchanged combine algebra on the partials that come back.
+    Pure object-model work: no graph, no analysis, nothing is sent. :mod:`deisa.dask.runtime_dispatch` hands the result
+    to the bridges and reuses the unchanged combine algebra on the partials that come back.
 
     - ``:param reduction:`` The :class:`~deisa.dask.runtime_expr.ReductionExpr` a callback computed.
     - ``:return:`` The :class:`RuntimeRequest` for it.

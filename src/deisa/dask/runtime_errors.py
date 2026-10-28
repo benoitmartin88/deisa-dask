@@ -66,8 +66,9 @@ __all__ = [
     "iteration_materialization",
     "keepdims_unsupported",
     "mixed_root",
-    "non_associative",
+    "no_dispatch_transport",
     "no_precomputable_reduction",
+    "non_associative",
     "numpy_materialization",
     "off_surface",
     "precompute_runtime_invariant",
@@ -285,6 +286,22 @@ def no_precomputable_reduction(symbol: str, detail: str = "") -> NoPrecomputable
 def precompute_runtime_invariant(symbol: str, detail: str) -> PrecomputeRuntimeError:
     """Refusal for a violated runtime invariant, naming ``symbol`` and the ``detail`` that broke it."""
     return PrecomputeRuntimeError(f"{symbol}: {detail}.")
+
+
+def no_dispatch_transport(symbol: str) -> PrecomputeRuntimeError:
+    """Refusal for ``symbol``, a reduction whose collection carries no bridge transport.
+
+    A collection is only able to dispatch because the delivery path attaches the transport of the array's bridges to
+    it. A collection built by hand -- outside that path -- describes an array but owns no way to ask the bridges for
+    anything, so the reduction has no partials to merge.
+    """
+    return PrecomputeRuntimeError(
+        f"{symbol} cannot be dispatched: the collection it is rooted in carries no bridge transport. A reduction is "
+        f"delivered by asking every bridge that owns a chunk for its partial, and the delivery path attaches that "
+        f"transport when it hands the collection to the callback; a collection built outside that path has no bridges "
+        f"to ask.",
+        remedy=_REMEDY_PRECOMPUTE_OFF,
+    )
 
 
 def rewrap(refusal: RuntimeRefusal, remedy: str) -> RuntimeRefusal:
