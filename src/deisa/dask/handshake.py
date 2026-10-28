@@ -27,11 +27,10 @@
 # POSSIBILITY OF SUCH DAMAGE.
 # =============================================================================
 import logging
-from typing import List, Optional
+from typing import Optional
 
 from distributed import Client, Event, Future, get_client
 
-from deisa.dask.branch import BranchSpec
 from deisa.dask.constants import KEY_PREFIX
 from deisa.dask.utils import _get_actor
 
@@ -54,7 +53,6 @@ class Handshake:
             self.bridges_ready = False
             self.feedback_queue_size = 1024
             self.timestep: Optional[int] = None
-            self.task_branches = {}  # array_name -> List[Dict] for bridge-local execution
             # Arrays the analytics host delivers to at least one runtime-delivery callback. The bridge reads this to
             # decide whether its eager scalar menu has a reader at all: a menu for an array nobody subscribes to is
             # six chunk folds per bridge per timestep of pure critical-path cost.
@@ -96,13 +94,6 @@ class Handshake:
         def get_feedback_queue_size(self) -> int | Future:
             return self.feedback_queue_size
 
-        def set_task_branches(self, array_name: str, hints: list) -> None:
-            logger.debug(f"set_task_branches(): array_name={array_name}, hints={hints}")
-            self.task_branches[array_name] = hints
-
-        def get_task_branches(self, array_name: str) -> List[BranchSpec] | Future:
-            return self.task_branches.get(array_name, [])
-
         def set_runtime_arrays(self, array_names: list) -> None:
             logger.debug(f"set_runtime_arrays(): array_names={array_names}")
             self.runtime_arrays = set(array_names)
@@ -114,8 +105,8 @@ class Handshake:
         def get_task_state(self, array_name: str) -> dict | Future:
             """Every per-array scheduling fact in one read.
 
-            The bridge fetches this over a single per-array broadcast: the branch set, the runtime-delivery flag and
-            the legacy-reader flag must arrive in the same collective, because a second, separate broadcast would have
+            The bridge fetches this over a single per-array broadcast: the runtime-delivery flag and the
+            legacy-reader flag must arrive in the same collective, because a second, separate broadcast would have
             to be entered in the same order on every rank of the sub-comm -- two maskable sources of a hang for one
             dict entry.
 
@@ -124,7 +115,6 @@ class Handshake:
             ``runtime`` is true AND ``legacy`` is false.
             """
             return {
-                "branches": self.task_branches.get(array_name, []),
                 "runtime": array_name in self.runtime_arrays,
                 "legacy": array_name in self.legacy_arrays,
             }
@@ -177,14 +167,6 @@ class Handshake:
     def get_nb_bridges(self) -> int:
         assert self.__handshake_actor is not None
         return self.__handshake_actor.get_nb_bridges().result()
-
-    def set_task_branches(self, array_name: str, hints: list) -> None:
-        assert self.__handshake_actor is not None
-        self.__handshake_actor.set_task_branches(array_name, hints).result()
-
-    def get_task_branches(self, array_name: str) -> List[BranchSpec]:
-        assert self.__handshake_actor is not None
-        return self.__handshake_actor.get_task_branches(array_name).result()
 
     def set_runtime_arrays(self, array_names: list) -> None:
         assert self.__handshake_actor is not None

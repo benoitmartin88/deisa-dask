@@ -22,6 +22,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import dask.array as da
 import numpy as np
 
+from _oracle.branch_spec import BranchSpec
 from _oracle.precompute_analyzer import _match_source_arrays, analyze_callback_full
 from deisa.dask.branch import (
     _BRANCH_KIND_MEAN,
@@ -29,7 +30,6 @@ from deisa.dask.branch import (
     _BRANCH_KIND_PCA,
     _BRANCH_KIND_SCALAR,
     _PCA_OP_NAME,
-    BranchSpec,
     _apply_full_local_fold,
     _chain_branch_func,
     _discover_partial_metadata,

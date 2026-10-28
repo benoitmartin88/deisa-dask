@@ -46,8 +46,8 @@ callable (:func:`probe_partial`) instead of being hand-maintained, ``chunk_axis`
 not to a reduction.
 
 The composed callable is ``functools.partial(_chain_branch_func, _chain=<layers>)`` where each layer is a
-``(func, kwargs, input_count)`` triple -- the same shape the bridge already executes, so
-``_execute_operations_on_chunk`` stays untouched. The layers are, in order:
+``(func, kwargs, input_count)`` triple -- the same shape the bridge executes, so
+:meth:`deisa.dask.runtime_dispatch.PlanResponder.respond` needs no knowledge of the chain. The layers are, in order:
 
 1. the pointwise program (skipped when the reduction is taken straight off the collection),
 2. the reduction's chunk stage, and

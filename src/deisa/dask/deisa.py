@@ -169,13 +169,6 @@ class Deisa(IDeisa):
         self._tasks = set()
         # True once execute_callbacks() has run; no new callbacks may be registered after the cycle has started.
         self._execute_callbacks_called = False
-        # Per-array merged branch groups. Merged and filed at registration; pruned in memory only at unregistration (an
-        # actor call inside the async topic handler stalls the handler loop), re-filed at the per-cycle boundary by
-        # ``execute_callbacks`` -> ``_flush_branches_to_handshake``.
-        self._branch_groups: Dict[str, List[Any]] = {}
-        # callback_id -> array_name -> ordered [(output_key, op_name, axis_sig, kind)] recorded at registration; the
-        # topic handler builds the per-callback dispatch view from these descriptors.
-        self._callback_reductions: Dict[Deisa.Callback_id, Dict[str, List[Tuple[str, str, Tuple[int, ...], str]]]] = {}
         # array_name -> exchange callable of the runtime reduction path (one request/reports round trip over the
         # array's sub-comm). Internal, never a user parameter: the delivery attaches the collection's compute boundary
         # from here, and an array without an entry still serves its eager menu and refuses the rest.
@@ -428,24 +421,6 @@ class Deisa(IDeisa):
 
         return callback_id
 
-    def _prune_branches(self, array_name: str) -> None:
-        # Recompute the per-array branch set from the remaining registered callbacks (otherwise a later registration
-        # collides with the stale (output_key, signature) at merge_branches). Deliberately does NOT re-file the
-        # handshake actor: unregistering can run INSIDE the async topic handler, where an actor call stalls the handler
-        # loop; the pruned set is filed by the next ``_flush_delivery_state_to_handshake``.
-        descriptors: Dict[str, List[Tuple[str, str, Tuple[int, ...], str]]] = {}
-        for cid in self._callbacks_by_array.get(array_name, ()):
-            for arr, descs in self._callback_reductions.get(cid, {}).items():
-                if arr == array_name:
-                    descriptors.setdefault(arr, []).extend(descs)
-
-        wanted_keys = {d[0] for d in descriptors.get(array_name, [])}
-        if not wanted_keys:
-            self._branch_groups.pop(array_name, None)
-            return
-        remaining = [b for b in self._branch_groups.get(array_name, []) if b.output_key in wanted_keys]
-        self._branch_groups[array_name] = remaining
-
     def _prune_delivery_flags(self, array_name: str) -> None:
         """Recompute both per-array delivery facts from the surviving callbacks.
 
@@ -453,7 +428,7 @@ class Deisa(IDeisa):
         - ``legacy``: at least one callback registered on the array delivers with ``precompute=False``, i.e. reads the
           chunk itself, so the bridges must keep scattering it.
 
-        Like the branch prune this only touches memory: the changed sets reach the bridges at the next flush point
+        This only touches memory: the changed sets reach the bridges at the next flush point
         (``execute_callbacks``), never from inside the async topic handler where the unregistration may run.
 
         - ``:param array_name:`` Registered array the removed callback was registered on.
@@ -475,17 +450,14 @@ class Deisa(IDeisa):
         if cb_data is None:
             return
 
-        self._callback_reductions.pop(callback_id, None)
-
         for array_name in cb_data["array_names"]:
             s = self._callbacks_by_array.get(array_name)
             if s:
                 s.discard(callback_id)
                 if not s:
                     del self._callbacks_by_array[array_name]
-            # Prune unconditionally for every array the callback touched: the dead callback's branch and its
-            # runtime-delivery claim must leave the set even if other callbacks remain registered.
-            self._prune_branches(array_name)
+            # Prune unconditionally for every array the callback touched: the dead callback's runtime-delivery claim
+            # must leave the set even if other callbacks remain registered.
             self._prune_delivery_flags(array_name)
 
     def set(self, key: str, value: Any, timestep: int) -> None:
@@ -510,11 +482,9 @@ class Deisa(IDeisa):
     def _flush_delivery_state_to_handshake(self) -> None:
         """File every array's current delivery state with the handshake actor.
 
-        Three per-array facts travel to the bridges, over the ONE broadcast each of them already enters per array (see
+        Two per-array facts travel to the bridges, over the ONE broadcast each of them already enters per array (see
         :meth:`deisa.dask.handshake.Handshake.get_task_state`):
 
-        - the branch set of the array (empty by construction now that nothing files branches; kept until the legacy
-          branch machinery is deleted),
         - whether the array is a runtime-delivery target, i.e. whether the eager scalar menu it computes has any
           reader at all, and
         - whether the array still has a legacy (``precompute=False``) reader, i.e. whether its chunk must be scattered
@@ -525,8 +495,6 @@ class Deisa(IDeisa):
         ``unregister_callback`` never files: an actor call inside the async topic handler stalls the handler loop. The
         pruned state is filed at the next flush point.
         """
-        for arr_name, branches in self._branch_groups.items():
-            self.handshake.set_task_branches(arr_name, branches)
         self.handshake.set_runtime_arrays(sorted(self._runtime_arrays))
         self.handshake.set_legacy_arrays(sorted(self._legacy_arrays))
 

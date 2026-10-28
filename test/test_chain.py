@@ -489,54 +489,6 @@ class TestMultiReductionBranches:
                 )
 
 
-def _make_spec(output_key, op_name="sum", output_kind="scalar", reduction_axes=(), **kw):
-    """Minimal BranchSpec for merge_branches unit tests (no cluster needed)."""
-    from deisa.dask.branch import BranchSpec
-
-    return BranchSpec(
-        output_key=output_key,
-        input_name="f",
-        output_kind=output_kind,
-        branch_func=lambda chunk: chunk,
-        chunk_axis=None,
-        finalize=None,
-        partial_shape=(),
-        partial_dtype="float64",
-        op_name=op_name,
-        reduction_axes=reduction_axes,
-        **kw,
-    )
-
-
-def test_merge_branches_dedup_same_key_keeps_all_distinct_keys() -> None:
-    """Merging identical signatures dedups; distinct keys survive."""
-    from deisa.dask.branch import merge_branches
-
-    existing = [_make_spec("f-sum"), _make_spec("f-mean", op_name="mean", output_kind="mean")]
-    new = [_make_spec("f-sum"), _make_spec("f-max", op_name="max")]
-    merged = merge_branches(existing, new)
-    assert {b.output_key for b in merged} == {"f-sum", "f-mean", "f-max"}
-    # The identical f-sum survived exactly once (the existing branch).
-    assert sum(1 for b in merged if b.output_key == "f-sum") == 1
-
-
-def test_merge_branches_refuses_same_key_different_signature() -> None:
-    """Merging a same-key/different-signature collision must raise.
-
-    A window read ``x[-1].sum()`` and a true ``x.sum(axis=0)`` can both carry ``f-sum`` from different callbacks (each
-    starts a fresh per-callback seen map); their recorded reduction axes (() vs (0,)) differ, so a single shared
-    branch cannot serve both callbacks. Refusing loudly at registration beats silently delivering one callback the
-    other's result.
-    """
-    from deisa.dask.branch import merge_branches
-    from deisa.dask.precompute_errors import PrecomputeRuntimeError
-
-    window_read = _make_spec("f-sum", reduction_axes=())
-    axis_zero = _make_spec("f-sum", reduction_axes=(0,))
-    with pytest.raises(PrecomputeRuntimeError):
-        merge_branches([window_read], [axis_zero])
-
-
 # ---------------------------------------------------------------------------
 # Full local fold: the operator-generic minimal-scalar-partial machinery
 # ---------------------------------------------------------------------------

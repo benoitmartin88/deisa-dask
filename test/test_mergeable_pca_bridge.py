@@ -61,7 +61,7 @@ dispatcher, which replaces the QUEUE ROUND TRIP and runs the very same composed 
 from __future__ import annotations
 
 import textwrap
-from typing import Any, Callable, Dict, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 import numpy as np
 import pytest
@@ -153,12 +153,8 @@ class _FakeHandshake:
     """The handshake surface registration touches: filing the per-array delivery state."""
 
     def __init__(self) -> None:
-        self.branches: Dict[str, Any] = {}
         self.runtime_arrays: list = []
         self.legacy_arrays: list = []
-
-    def set_task_branches(self, array_name: str, hints: list) -> None:
-        self.branches[array_name] = hints
 
     def set_runtime_arrays(self, array_names: list) -> None:
         self.runtime_arrays = list(array_names)
@@ -178,9 +174,7 @@ def _deisa_stub() -> Deisa:
     d._runtime_arrays = set()
     d._legacy_arrays = set()
     d._topic_handlers = {}
-    d._callback_reductions = {}
     d._callback_seq = 0
-    d._branch_groups = {}
     d._tasks = set()
     d._execute_callbacks_called = False
     return d
@@ -226,7 +220,6 @@ def test_registration_accepts_the_documented_motivating_example():
     assert d._callbacks[cid]["precompute"] is True, "the payload must carry the delivery mode selected per callback"
     assert d._runtime_arrays == {"f"}, f"the array must be filed as a runtime-delivery target, got {d._runtime_arrays}"
     assert d.handshake.runtime_arrays == ["f"], "registration files the runtime arrays with the handshake actor"
-    assert d._branch_groups == {}, "no analyzer runs, so no branch spec may be filed at registration"
 
 
 def test_the_bridge_policy_carries_only_the_leaf_relevant_fields():

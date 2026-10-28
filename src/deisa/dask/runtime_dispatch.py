@@ -331,9 +331,9 @@ class PlanResponder:
     def respond(self, plan: PlanRequest) -> PartialReport:
         """Execute ``plan`` on the held chunk and report the partial -- or the error that replaced it.
 
-        Fail-loud contract (the same one ``_execute_operations_on_chunk`` enforces): a branch that raises produces an
-        ERROR report, never a partial. A dropped partial would silently corrupt the merge (a smaller sum, a mean
-        missing a whole bridge's ``n``).
+        Fail-loud contract (the one the retired ``_execute_operations_on_chunk`` enforced, now carried by this responder
+        and :meth:`Bridge._serve_pending_plans`): a branch that raises produces an ERROR report, never a partial. A
+        dropped partial would silently corrupt the merge (a smaller sum, a mean missing a whole bridge's ``n``).
 
         - ``:param plan:`` The request to answer.
         """

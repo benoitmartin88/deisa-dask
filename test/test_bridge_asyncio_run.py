@@ -74,58 +74,6 @@ def test_scatter_full_no_client_path_under_a_running_loop():
     assert result["value"]["future"] == ["k"]
 
 
-def test_scatter_partials_no_client_path_under_a_running_loop():
-    """Second real call site: ``_scatter_partials`` must survive a running loop.
-
-    ``_scatter_partials`` also scattered via bare ``asyncio.run`` on the no-client path (the precomputed-partials send
-    used by the mergeable reductions). Covering only ``_scatter_full`` leaves this site unprotected: a change that
-    reintroduced ``asyncio.run`` here would pass the other tests and still fail in production.
-    """
-    from deisa.dask.branch import BranchSpec
-
-    bridge = Bridge.__new__(Bridge)  # no __init__: no cluster, no comm
-    bridge.client = None  # force the no-client branch
-    bridge.id = "test-bridge"
-    bridge._branch_by_key = {}  # cache dict built in __init__
-
-    captured = {}
-
-    def fake_get_branch_by_key(array_name, branches):
-        return {b.output_key: b for b in branches}
-
-    bridge._get_branch_by_key = fake_get_branch_by_key
-
-    async def fake_scatter_to_workers_async(target, payload2):
-        captured["called"] = True
-        return ["who"], {"n": 1}
-
-    bridge._scatter_to_workers_async = fake_scatter_to_workers_async
-
-    branch = BranchSpec(
-        output_key="f-sum",
-        input_name="a",
-        output_kind="scalar",
-        branch_func=lambda chunk: float(chunk.sum()),
-        chunk_axis=(0, 1),
-        finalize=None,
-        partial_shape=(),
-        partial_dtype="float64",
-    )
-
-    result = {}
-
-    async def main():
-        # Synchronous bridge call from inside a running loop: the failure condition.
-        result["value"] = bridge._scatter_partials({"f-sum": 3.0}, [branch], "a", ["w-0"])
-
-    asyncio.run(main())
-    assert captured.get("called") is True, "the no-client partials path was not taken"
-    # The scattered keys are namespaced (KEY_PREFIX + array + output_key + uuid), so assert on membership rather than
-    # exact equality.
-    future_keys = result["value"]["future-info"]["future"]
-    assert len(future_keys) == 1 and "f-sum" in future_keys[0]
-
-
 def test_private_loop_helper_propagates_exceptions():
     """An exception inside the coroutine must surface on the caller, not vanish."""
 

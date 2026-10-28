@@ -259,13 +259,9 @@ class _FakeHandshake:
     """The handshake surface ``execute_callbacks`` touches."""
 
     def __init__(self):
-        self.branches = {}
         self.runtime_arrays = set()
         self.legacy_arrays = set()
         self.finished = 0
-
-    def set_task_branches(self, array_name, hints):  # noqa: D102
-        self.branches[array_name] = hints
 
     def set_runtime_arrays(self, array_names):  # noqa: D102
         self.runtime_arrays = set(array_names)
@@ -314,9 +310,7 @@ def make_deisa(fleets, client, monkeypatch):
     deisa._callbacks = {}
     deisa._callbacks_by_array = {}
     deisa._topic_handlers = {}
-    deisa._callback_reductions = {}
     deisa._callback_seq = 0
-    deisa._branch_groups = {}
     deisa._runtime_arrays = set()
     deisa._legacy_arrays = set()
     deisa._tasks = set()
@@ -770,11 +764,10 @@ def test_mixed_array_still_gets_the_full_chunk(fleets, client, monkeypatch):
 
     # The actor's read: the shape the bridge consumes, with both facts in one dict.
     actor = Handshake.HandshakeActor.__new__(Handshake.HandshakeActor)
-    actor.task_branches = deisa.handshake.branches
     actor.runtime_arrays = deisa.handshake.runtime_arrays
     actor.legacy_arrays = deisa.handshake.legacy_arrays
     state = actor.get_task_state(ARRAY_NAME)
-    assert state == {"branches": [], "runtime": True, "legacy": True}, state
+    assert state == {"runtime": True, "legacy": True}, state
 
     bridge, wire_client = _make_send_bridge()
     # Start from an empty cache, like a bridge taking its state from the handshake read.
@@ -803,22 +796,16 @@ def test_mixed_array_still_gets_the_full_chunk(fleets, client, monkeypatch):
 
 
 def test_runtime_only_array_ships_its_menu_and_no_data(monkeypatch):
-    """Runtime target with NO legacy reader: no scatter, no branch stage, ``futures: []`` -- the menu is the payload.
+    """Runtime target with NO legacy reader: no scatter, ``futures: []`` -- the menu is the payload.
 
     This is the regression the memory suite measures (``test_runtime_worker_only_sees_partials``): at HEAD every
     ``precompute=True`` callback cost a 32 MB scatter per bridge per timestep for data nothing read. Three things must
-    hold here -- nothing is computed or scattered, the menu is still folded (it is the ENTIRE payload), and no key
-    reaches the scheduler (an empty ``update_data`` + an empty desire list would be pure round trips).
+    hold here -- nothing is scattered, the menu is still folded (it is the ENTIRE payload), and no key reaches the
+    scheduler (an empty ``update_data`` + an empty desire list would be pure round trips).
     """
     bridge, wire_client = _make_send_bridge()
     bridge._legacy_delivery_arrays = set()
-    branch_stage = []
     scattered = []
-
-    def recording_branch_stage(*args, **kwargs):
-        """- ``:param args:`` The chunk and branch set the bridge would reduce on."""
-        branch_stage.append(args)
-        return {}
 
     def recording_scatter(*args, **kwargs):
         """- ``:param args:`` The chunk the bridge would ship.
@@ -829,14 +816,74 @@ def test_runtime_only_array_ships_its_menu_and_no_data(monkeypatch):
         scattered.append(args)
         return {"future": "key-0", "who_has": {"worker-0": ["key-0"]}, "nbytes": {"key-0": int(np.prod(CHUNK_SHAPE))}}
 
-    bridge._execute_operations_on_chunk = recording_branch_stage
     bridge._scatter_full = recording_scatter
 
     bridge.send(ARRAY_NAME, np.zeros(CHUNK_SHAPE, dtype=np.float32), 0)
     bridge._has_close_been_called = True
 
     assert scattered == [], "no scatter may happen for an array no callback reads"
-    assert branch_stage == [], "no branch may run on the chunk either"
+    _, payload = wire_client.events[0]
+    assert payload["futures"] == [], "the event must not name data that was never shipped"
+    assert len(payload["menu"]) == 1, "the menu IS the payload on the data-free path"
+    assert payload["menu"][0]["values"]["sum"]["data"], "the menu must still be folded, not dropped"
+    assert wire_client.updates == [], "an empty key set needs no update_data"
+    assert wire_client.desired_keys == [], "an empty key set needs no client-desires-keys"
+
+
+class _WireHandshake:
+    """The one handshake surface ``_ensure_task_state`` reads on sub-comm rank 0: an array's delivery state."""
+
+    def __init__(self, state):
+        self.state = state
+        self.reads = []
+
+    def get_task_state(self, array_name):
+        """- ``:param array_name:`` Registered array the bridge asks its delivery state for."""
+        self.reads.append(array_name)
+        return dict(self.state)
+
+
+def test_first_send_on_lazy_path_ships_no_data():
+    """K7F-06: the FIRST send on the lazy path (``wait_for_go=False``) must already be data-free.
+
+    ``test_runtime_only_array_ships_its_menu_and_no_data`` starts from a WARM cache -- the state the ``wait_for_go``
+    init-time prefetch leaves behind. A deployment that never prefetches is the memory harness's shape
+    (``test_precompute_memory.py``, which asserts after exactly ONE send), and there the caches are still empty when
+    ``send`` runs. Computing ``data_free_delivery`` before ``_ensure_task_state`` filled them made that first send take
+    the full-chunk scatter while still building the menu from the state it had just fetched -- exactly the acceptance
+    log's signature (full-chunk scatter and a built ``EagerMenu`` in the SAME event). The fetch has to come first, so
+    the decision is taken on the state the send itself read.
+
+    Witness from K7F-06/27f3a68, adapted to the post-K8 surface (no branch machinery left to stub).
+    """
+    bridge, wire_client = _make_send_bridge()
+    # The lazy-path state at the first send: nothing prefetched, so every cache is empty and the handshake is the only
+    # source. Runtime target with no legacy reader -- the data-free shape.
+    bridge._task_state_fetched = set()
+    bridge._runtime_delivery_arrays = set()
+    bridge._legacy_delivery_arrays = set()
+    handshake = _WireHandshake({"runtime": True, "legacy": False})
+    bridge.handshake = handshake
+
+    scattered = []
+
+    def recording_scatter(*args, **kwargs):
+        """- ``:param args:`` The chunk the bridge would ship.
+
+        Returns a plausible scatter result so a mutation that keeps the scatter fails on the assertion below (with the
+        reason in it) instead of on an ``IndexError`` from a ``None`` payload.
+        """
+        scattered.append(args)
+        return {"future": "key-0", "who_has": {"worker-0": ["key-0"]}, "nbytes": {"key-0": int(np.prod(CHUNK_SHAPE))}}
+
+    bridge._scatter_full = recording_scatter
+
+    bridge.send(ARRAY_NAME, np.zeros(CHUNK_SHAPE, dtype=np.float32), 0)
+    bridge._has_close_been_called = True
+
+    assert handshake.reads == [ARRAY_NAME], "the first send must read the array's delivery state"
+    assert scattered == [], "the FIRST send of a runtime-only array must not scatter the chunk"
+    assert bridge._runtime_delivery_arrays == {ARRAY_NAME}, "the fetch must fill the cache the decision needs"
     _, payload = wire_client.events[0]
     assert payload["futures"] == [], "the event must not name data that was never shipped"
     assert len(payload["menu"]) == 1, "the menu IS the payload on the data-free path"
@@ -953,9 +1000,8 @@ class _WireClient:
 def _make_send_bridge():
     """Build the ``Bridge.__new__`` stub the tests below drive: one bridge, one array, no scheduler.
 
-    Only the scatter and the per-branch chunk stage are stubbed -- they are ``test_bridge.py``'s subject and need a
-    scheduler. Everything else (``send``'s runtime-delivery boundary, the eager menu, the plan backlog seam) is the real
-    code.
+    Only the scatter is stubbed -- it is ``test_bridge.py``'s subject and needs a scheduler. Everything else (``send``'s
+    runtime-delivery boundary, the eager menu, the plan backlog seam) is the real code.
     """
     bridge = Bridge.__new__(Bridge)
     wire_client = _WireClient()
@@ -971,8 +1017,10 @@ def _make_send_bridge():
     # ... and declare it a legacy (chunk-reading) array too, so these tests keep measuring the full-chunk payload.
     # The data-free path (runtime target and no legacy reader) has its own test below.
     bridge._legacy_delivery_arrays = {ARRAY_NAME}
-    bridge._task_branches = {ARRAY_NAME: []}
-    bridge._branch_by_key = {}
+    # No handshake: the two facts above are already the cached state, so ``send`` must find the array fetched and
+    # never enter the per-array broadcast (``_task_state_fetched`` membership is the fetch marker).
+    bridge.handshake = None
+    bridge._task_state_fetched = {ARRAY_NAME}
     bridge._runtime_plan_backlog = {}
     bridge._runtime_plan_report_queues = {}
     bridge._runtime_last_chunk = {}
@@ -981,7 +1029,6 @@ def _make_send_bridge():
         "who_has": {"worker-0": ["key-0"]},
         "nbytes": {"key-0": int(np.prod(CHUNK_SHAPE))},
     }
-    bridge._execute_operations_on_chunk = lambda *args, **kwargs: {}
     return bridge, wire_client
 
 

@@ -80,12 +80,8 @@ class _FakeHandshake:
     """Minimal handshake surface used by Deisa._register_callback_impl."""
 
     def __init__(self):
-        self.branches: Dict[str, Any] = {}
         self.runtime_arrays: list = []
         self.legacy_arrays: list = []
-
-    def set_task_branches(self, array_name, hints):  # noqa: D102
-        self.branches[array_name] = hints
 
     def set_runtime_arrays(self, array_names):  # noqa: D102
         self.runtime_arrays = list(array_names)
@@ -105,9 +101,7 @@ def _make_deisa_stub() -> Deisa:
     d._runtime_arrays = set()
     d._legacy_arrays = set()
     d._topic_handlers = {}
-    d._callback_reductions = {}
     d._callback_seq = 0
-    d._branch_groups = {}
     d._tasks = set()
     d._execute_callbacks_called = False
     return d
@@ -184,10 +178,9 @@ class TestDeisaRegistration:
         # Topic subscription happened for the registered array.
         assert "a" in d.client.subscribed
         # The delivery state is filed immediately (a bridge on the wait_for_go=False path fetches it lazily on its
-        # first send(), possibly before the next cycle); nothing is filed as branches, because no analyzer runs.
+        # first send(), possibly before the next cycle).
         assert d._runtime_arrays == {"a"}
         assert d.handshake.runtime_arrays == ["a"]
-        assert d._branch_groups == {}
 
     def test_registration_failure_leaves_no_trace(self):
         """A registration that raises leaks no payload.
@@ -218,7 +211,6 @@ class TestDeisaRegistration:
         cid = d._register_callback_impl(cb, [Window("a", size=1)], exception_handler=None, when="AND", precompute=True)
 
         assert cid in d._callbacks, "with no AST pass nothing refuses a raw read at registration"
-        assert d._branch_groups == {}, "and nothing is filed as branches"
 
         assert _is_run_aborting(RawFieldReadError("raw read")), "a raw read must still abort the run"
         assert _is_run_aborting(UnsupportedReductionError("off-surface")), "an off-surface reduction must still abort"

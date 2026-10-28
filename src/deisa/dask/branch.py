@@ -29,16 +29,10 @@
 """
 Branch-level local compute on the bridge.
 
-A :class:`BranchSpec` describes one chunk-local sub-expression of the user's callback that the bridge can execute on
-its local numpy chunk and whose result the Deisa-side topic handler combines across bridges.
-
-Branch of **length-1** case: each BranchSpec corresponds to one detected reduction (``arr.sum()``,
-``arr.mean(axis=0)``, ...). The branch is a single chunk callable followed by the reduction's combine aggregator. For
-multi-layer chains (length->=2 branches); the data structure below is designed to support that without further changes.
-
-The structure mirrors the prior per-reduction branch metadata (``kind`` / ``finalize`` / ``shape`` / ``dtype`` /
-``chunk_axis``) so the bridge and Deisa-side combine code paths can be refactored to consume :class:`BranchSpec`
-directly without changing semantics.
+Each dispatch unit describes one chunk-local sub-expression of the user's callback that the bridge executes on its local
+numpy chunk and whose result the Deisa-side runtime path combines across bridges. The request types live in
+:mod:`deisa.dask.runtime_expr` (the planner's product-side contract); this module holds the bridge-side and combine-side
+callables that consume them.
 """
 
 from __future__ import annotations
@@ -46,7 +40,7 @@ from __future__ import annotations
 import functools
 import itertools
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -86,91 +80,6 @@ _BRANCH_KIND_PCA = "pca"
 # it takes the same path through ``output_key`` (``{array}-pca``), ``op_name`` and the dispatch signatures as every
 # other op without pretending to be one of ``SUPPORTED_OPS`` in :mod:`deisa.dask.task_branches`.
 _PCA_OP_NAME = "pca"
-
-
-@dataclass
-class BranchSpec:
-    """One chunk-local sub-expression the bridge can execute + combine.
-
-        Attributes
-        ----------
-        output_key : str
-            Stable identifier for this branch (e.g. ``"f-mean"``). The bridge uses it to namespace its scatter key and
-            the Deisa topic handler uses it to route the per-bridge partials back to the same branch.
-        input_name : str
-            Registered array name the branch is rooted at (e.g. ``"a"``). The Deisa side groups branches per array using
-            this field (never by parsing ``output_key``) and files each group with ``set_task_branches`` under its own
-            array name via ``execute_callbacks`` -> ``_flush_branches_to_handshake``.
-        output_kind : str
-            One of ``"scalar"`` / ``"mean"`` / ``"moment"``. Drives the Deisa-side combine graph: ``scalar`` ->
-            ``da.stack`` + dask sum, ``mean`` -> ``mean_agg`` over nested list of dicts, ``moment`` -> ``moment_agg`` (+
-            ``np.sqrt`` for ``finalize == "sqrt"``).
-        branch_func : Callable
-            Python callable that, given a numpy chunk, returns the branch's per-bridge partial value (a scalar /
-            ndarray / dict). Pickled across the bridge process boundary. Currently a length-1 callable (``chunk_func``
-            from the prior branch); This may produce multi-callable composites.
-        chunk_axis : Optional[Tuple[int, ...]]
-            For reductions, the tuple of axes being reduced in the chunk (e.g. ``(0, 1)`` for full reduction on a 2-D
-            chunk). ``None`` for pointwise-only branches.
-        finalize : Optional[str]
-            ``"sqrt"`` for std (apply ``np.sqrt`` after combining), else ``None``.
-        partial_shape : Tuple[int, ...]
-            Shape of the **per-bridge partial** (what the branch_func returns). For ``scalar`` reductions on a 2-D chunk
-            with ``keepdims=False`` this is ``()``; with ``keepdims=True`` it is ``(1, 1)``. For axis reductions the
-            partial keeps the un-reduced axes' full size (e.g. ``mean(axis=0)`` on ``(M, N)`` partial has shape ``(1,
-            N)``). The bridge records this on the topic event so the Deisa side knows what each bridge shipped.
-        partial_dtype : str
-    NumPy dtype string of the per-bridge partial.
-    """
-
-    output_key: str
-    input_name: str
-    output_kind: str
-    branch_func: Callable[[Any], Any]
-    chunk_axis: Optional[Tuple[int, ...]]
-    finalize: Optional[str]
-    partial_shape: Tuple[int, ...]
-    partial_dtype: str
-    op_name: str = ""
-    deliver_direct: bool = True
-    window_read: bool = False
-    reduction_axes: Tuple[int, ...] = ()
-    # For a "pca" branch: the recorded MergeablePCA configuration, applied at the ROOT of the merge tree on the Dask
-    # side and deliberately NOT on the bridge. Empty for every reduction branch. The bridge's payload must stay the
-    # mergeable summary, so ``n_components``/``whiten`` cannot travel inside ``branch_func`` -- truncating per bridge
-    # would destroy exactly the mergeability the branch exists to provide.
-    summary_config: Dict[str, Any] = field(default_factory=dict)
-
-
-def merge_branches(existing: List[BranchSpec], new: List[BranchSpec]) -> List[BranchSpec]:
-    """Merge two branch lists, deduping by ``output_key``.
-
-    Identical signatures (same op, same reduction axes) share one bridge execution; same key with a DIFFERENT
-    reduction-axes signature (e.g. a window read vs. a true axis reduction over the same axis) always raises
-    :class:`PrecomputeRuntimeError` -- the two deliver different shapes and sharing them silently delivers one callback
-    the other one's result.
-    """
-    merged = list(existing)
-    seen: Dict[str, BranchSpec] = {b.output_key: b for b in merged}
-    for b in new:
-        prev = seen.get(b.output_key)
-        if prev is None:
-            merged.append(b)
-            seen[b.output_key] = b
-            continue
-        if prev.reduction_axes != b.reduction_axes or prev.op_name != b.op_name or prev.output_kind != b.output_kind:
-            raise PrecomputeRuntimeError(
-                f"merge_branches: array {b.input_name!r} has two reductions sharing output_key "
-                f"{b.output_key!r} but different runtime signatures: "
-                f"(op={prev.op_name!r}, axes={prev.reduction_axes!r}, kind={prev.output_kind!r}) vs "
-                f"(op={b.op_name!r}, axes={b.reduction_axes!r}, kind={b.output_kind!r}). The precompute "
-                f"delivery path cannot serve both callbacks from one branch; rename one of the reductions "
-                f"or register them on separate arrays."
-            )
-        # Identical signatures: keep the first branch (dedup).
-    return merged
-
-
 
 
 # Scalar-kind (``sum``/``prod``/``max``/``min``) elementwise fold for the first combine stage: scalar-axis partials
