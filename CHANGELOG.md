@@ -20,7 +20,7 @@ Types of changes:
 
 - CI: continuous benchmark using Bencher.
 - Bridge-local precompute: callbacks whose compute operations are chunk-local reductions (`sum`, `mean`, `var`, `std`, 
-  `min`, `max`, `prod`) are analyzed at registration time and shipped to Dask workers as small per-bridge partials 
+  `min`, `max`, `prod`) are planned at registration time and shipped to Dask workers as small per-bridge partials 
   instead of the full array chunk. Branches are registered per array, so a multi-array callback gets one branch set per 
   array. Expressions whose reduction depends on another reduction's output are refused with`UnsupportedReductionError`.
 - `deisa.dask.mergeable_pca`: exact mergeable PCA primitives. A local summary of one data block (`n_samples`, `mean`,
@@ -45,6 +45,31 @@ Types of changes:
 ### Changed
 
 - `mpi4py` is now a required dependency.
+- `Deisa.add_callback(..., precompute=...)` now selects the delivery mode only. `precompute=True` (the default) hands
+  each callback one `DeisaCollection` per array and timestep, carrying the reductions the runtime planner dispatched to
+  the bridges; `precompute=False` keeps the legacy full-chunk scatter. Registration no longer parses the callback
+  source: the reductions are planned from the Dask graph the callback itself builds, so the registration-time refusals
+  for unplannable expressions become run-time refusals raised at the operator that cannot be planned
+  (`UnsupportedReductionError`, `RawFieldReadError`, ...).
+
+### Removed
+
+- `deisa.dask.precompute_analyzer`, the AST analyzer that turned a callback source into branch descriptors, along with
+  its `_WindowProxy` scratch wrapper. Nothing in the package imports it. **Migration:** the refusal classes it defined
+  are unchanged, name for name, in `deisa.dask.precompute_errors` — update an import of
+  `deisa.dask.precompute_analyzer` to that module. Code that called the analyzer to obtain branch specs must use the
+  runtime planner instead (`deisa.dask.runtime_dispatch.PlanDispatcher`).
+- `deisa.dask.utils.make_precomputed_view`, the `_PrecomputedDeisaArray` dispatch view it built, and the
+  `_PrecomputedDeisaArray` / `make_precomputed_view` re-export from `deisa.dask.deisa`. A callback registered with
+  `precompute=True` now receives a `DeisaCollection` whose entries are `DeisaArray`s; **migration:** a callback that
+  read the view's attributes (`_deisa_pca_summary`, the reduction signature routing) should read the collection's
+  arrays and, for PCA, call `MergeablePCA().fit(<collection>)`, which dispatches and merges the summaries itself.
+  `_PrecomputedDeisaArray.std`/`.var` refusing `ddof != 0` and the "second reduction on an already-final array"
+  interception were properties of that view; the runtime path refuses both at the estimator/planner instead.
+- `DEISA_DASK_RUNTIME_REDUCTION` and `deisa.dask.runtime_dispatch.runtime_delivery_enabled()`, the opt-in flag that
+  held runtime delivery behind an environment variable while the analyzer was still the default. The flag has no
+  meaning left: with the analyzer gone there is no third delivery mode, so `precompute` is the only selector. Unset the
+  environment variable; setting it is now inert.
 
 ### Fixed
 

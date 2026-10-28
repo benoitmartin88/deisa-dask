@@ -98,9 +98,8 @@ from deisa.dask.utils import build_deisa_array, get_client
 
 logger = logging.getLogger(__name__)
 
-# The refusal classes the legacy precompute view raises mid-run: ``utils`` raises
-# ``PrecomputeRuntimeError``/``UnsupportedReductionError`` from the per-callback dispatch view, and the analyzer raised
-# ``RawFieldReadError``/``MaterializationError`` for a raw read. They are a separate family from
+# The refusal classes the precompute path raises mid-run: ``UnsupportedReductionError`` from chunk-local planning,
+# ``PrecomputeRuntimeError`` from the runtime transfer/merge steps. They are a separate family from
 # :mod:`deisa.dask.runtime_errors` (which subclasses them, never the other way around), so the abort predicate has to
 # name them explicitly.
 _LEGACY_RUN_ABORTING: Tuple[type, ...] = (

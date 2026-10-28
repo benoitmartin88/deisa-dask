@@ -371,9 +371,11 @@ def _combine_pca_summaries(
 class DeliveredPCA:
     """A merged in-situ PCA summary plus the estimator configuration that should consume it.
 
-    Carried as an attribute (``_deisa_pca_summary``) on the per-callback dispatch view, which is what
-    :meth:`MergeablePCA._fit_delivered` looks for. A frozen dataclass pickles by value: no reconstruction callback, no
-    globals to resolve on a worker, and the ``Delayed`` inside it rebuilds its own graph when it does.
+    Carried as the attribute ``_deisa_pca_summary`` on whatever object hands the merged summary to the estimator;
+    :meth:`MergeablePCA._fit_delivered` reads it. Nothing in this package attaches it: the per-callback dispatch view
+    that did was removed with the analyzer, and the runtime path passes the summary it merged itself to the same
+    fitter. A frozen dataclass pickles by value: no reconstruction callback, no globals to resolve on a worker, and the
+    ``Delayed`` inside it rebuilds its own graph when it does.
 
     - ``:param merged:`` ``Delayed`` (or any object with ``.compute()``) yielding the merged ``PCASummary``.
     - ``:param config:`` Root-only estimator configuration: ``n_components``, ``whiten``, and the axis policy.

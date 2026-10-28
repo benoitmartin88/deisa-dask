@@ -212,13 +212,12 @@ def _window_read_upstream_name(layer) -> Optional[str]:
     return None
 
 
-# Root stub layers created by the analyzer (``_analyze_callback_for_branches`` names the placeholder
-# ``deisa-stub-<array>``).
+# Root stub layers standing for a registered array (the placeholder ``deisa-stub-<array>``).
 _STUB_LAYER_PREFIX = "deisa-stub-"
 
 
 def _is_stub_layer_name(layer_name: str) -> bool:
-    """True when the layer is the analyzer's registered-array root stub."""
+    """True when the layer is a registered-array root stub."""
     return layer_name.startswith(_STUB_LAYER_PREFIX)
 
 

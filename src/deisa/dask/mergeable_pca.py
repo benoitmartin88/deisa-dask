@@ -906,9 +906,10 @@ class MergeablePCA:
         Three paths, all ending in the SAME root state (``_summary_`` plus the materialized public attributes), so
         "in-situ on the bridge" and "standalone on Dask" cannot drift apart:
 
-        - A **delivered** array (one carrying ``_deisa_pca_summary``, i.e. the per-bridge dispatch view deisa-dask
-          hands a callback when the local PCA ran on the MPI bridge) takes :meth:`_fit_delivered`. The merge tree
-          over the per-bridge summaries has already run; this only adopts the root summary.
+        - A **delivered** object (one carrying ``_deisa_pca_summary``) takes :meth:`_fit_delivered`. Nothing in this
+          package attaches that attribute any more -- the per-callback dispatch view that did was removed with the
+          analyzer -- so the branch serves a caller carrying a merged summary from elsewhere; the runtime path reaches
+          the same fitter through :meth:`_fit_runtime_collection`.
         - A **runtime collection** (a DEISA callback's window entry, which carries no data) takes
           :meth:`_fit_runtime_collection`: it dispatches a PCA branch request to the bridges, merges their summaries
           at the root and adopts the result through the same :meth:`_fit_delivered`.
