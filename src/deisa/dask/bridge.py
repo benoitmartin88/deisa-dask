@@ -26,6 +26,22 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 # =============================================================================
+"""The simulation-side half of DEISA: one ``Bridge`` per MPI rank, shipping chunk-local reductions.
+
+Two delivery modes coexist on this side, and only the analytics host decides which one a callback gets:
+
+- the LEGACY analyzer-driven path: ``send`` executes the filed branch funcs on the local chunk and scatters the
+  resulting partials (or, with ``precompute=False``, the full chunk);
+- the RUNTIME reduction path (``RUNTIME_REDUCTION_DELIVERY_ENABLED``): the same bridge also ships an eager scalar menu
+  per timestep and answers on-demand plan requests at its ``send`` boundary.
+
+**The P3 -> P4 coexistence cost, stated once.** While both modes exist, the eager menu's
+``sum``/``min``/``max``/``prod`` entries recompute what ``_execute_operations_on_chunk`` just computed on the SAME
+chunk. That double work is intentional and priced in: P4 deletes the analyzer path and makes the menu the only fold
+site, which removes it. Until then, ``_build_runtime_menu`` is the only place it happens, and it sits after the reduce
+step and before the first scatter so the chunk never travels to convey a menu value.
+"""
+
 import asyncio
 import logging
 import sys
@@ -422,7 +438,9 @@ class Bridge(IBridge):
         # retained chunk is replaced (a request names the timestep that was last sent, so that is the chunk it folds),
         # then retain this timestep's chunk for the next boundary. Both steps only READ or hold a reference to the
         # chunk -- nothing is computed from it here -- so the reduce-before-scatter ordering below is untouched. The
-        # cost is one retained chunk per array per bridge, and only while the runtime delivery flag is on.
+        # cost is one retained chunk reference per array per bridge (replaced, not accumulated) for every array this
+        # rank participates in, flag or no flag: a rank whose own flag is off still has to answer a request its root
+        # broadcast, so neither the collective nor the retention may depend on the per-process flag.
         if array_name in self._runtime_plan_backlog:
             self._serve_pending_plans(array_name, sub_comm)
             self._runtime_last_chunk[array_name] = (int(timestep), chunk)
@@ -575,18 +593,28 @@ class Bridge(IBridge):
         broadcasts a request to its peers at the next send boundary, where every rank of the array is already parked in
         a sub-comm collective.
 
-        Nothing is attached when the runtime delivery flag is off, and nothing is attached for an array this rank does
-        not participate in.
+        Two things are deliberately NOT gated on the flag:
+
+        - the per-array :class:`PlanRequestBacklog`, which every participating rank gets unconditionally, because its
+          presence is what makes ``send`` enter the boundary collective. ``runtime_delivery_enabled()`` is read per
+          process, so gating the backlog on it made the ``send`` boundary a ``bcast`` on a rank with the flag on and a
+          plain scatter on a rank with it off: two different collectives on the same communicator, i.e. a hang instead
+          of a loud refusal. The array's participating set is the same everywhere, so the backlog is too.
+        - the broadcast itself: every rank enters it every timestep, and a rank with no request simply gets an empty
+          list back. The cost is one small collective per array per ``send`` when the flag is off.
+
+        Only the queue pump thread is gated: without the flag nothing ever enqueues a request for this run, so polling
+        the queues would be pure scheduler traffic. An array this rank does not participate in gets neither.
         """
+        for array_name, sub_comm in self._array_comms.items():
+            if sub_comm is None or sub_comm is _COMM_NULL:
+                continue
+            self._runtime_plan_backlog[array_name] = PlanRequestBacklog()
         if not runtime_delivery_enabled():
             return
         for array_name, sub_comm in self._array_comms.items():
             if sub_comm is None or sub_comm is _COMM_NULL:
                 continue
-            # Every participating rank keeps a backlog (the peers receive the requests through the sub-comm broadcast
-            # and need to know the array is served at all); only the root pumps the queues.
-            backlog = PlanRequestBacklog()
-            self._runtime_plan_backlog[array_name] = backlog
             if sub_comm.Get_rank() != 0 or self.client is None:
                 continue
             self._runtime_plan_report_queues[array_name] = Queue(plan_report_queue_name(array_name), client=self.client)
@@ -595,7 +623,7 @@ class Bridge(IBridge):
             self._runtime_plan_stops[array_name] = stop
             thread = threading.Thread(
                 target=serve_plan_queue,
-                args=(request_queue, backlog, stop),
+                args=(request_queue, self._runtime_plan_backlog[array_name], stop),
                 name=f"deisa-plan-{array_name}-{self.id}",
                 daemon=True,
             )

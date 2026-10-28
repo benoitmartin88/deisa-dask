@@ -58,6 +58,21 @@ inside the same sub-comm collective -- folds the retained chunk of the requested
 (:class:`QueuePlanExchange` is the host's half). Nothing is exchanged to agree on the names, and no bridge folds a
 chunk from a thread: a second thread inside an MPI communicator is not a safe place to be.
 
+**The one timing bound of that design.** A request is answered at the array's *next* ``send``, so a request must reach
+the array root before the simulation sends that array again. The host waits ``_PLAN_REPORT_TIMEOUT_SECONDS`` and then
+refuses loudly rather than merging a hole; it cannot do better, because the bridge side has no way to tell "this array
+will never send again" from "this array is mid-timestep". The consequence to know about: a reduction of the FINAL
+delivered timestep -- a callback that computes on the last collection of a finished run, with no further ``send`` for
+that array -- waits the full timeout and then refuses. Reducing any timestep the simulation still has to send is what
+is supported today; failing fast on the last one needs an end-of-run signal the delivery does not carry yet.
+
+**Which window element may be reduced on demand.** The bridges retain ONE chunk per array -- the timestep they last
+sent -- so on-demand plans are served for the LATEST delivered timestep only. A callback's window keeps older
+collections alive (and their menu still answers ``sum``/``min``/``max``/``mean``/``prod``/``std`` on the bare array,
+because the menu travels with the delivery), but an on-demand reduction rooted in an older element is refused at
+compose time by :func:`~deisa.dask.runtime_errors.stale_timestep`, with the remedy in the message. Serving the whole
+window on demand would need one retained chunk per window slot per bridge -- a v2 memory decision, not a v1 one.
+
 :class:`EagerMenu` is the eager half of the transfer strategy: the six tiny scalar full folds a bridge computes once for
 its chunk, so the common scalar reduction costs no round trip. A menu value IS the payload an on-demand request for the
 same operation would return (same composed callable, same chunk) -- **for a reduction of the bare registered array**,
@@ -103,6 +118,7 @@ __all__ = [
     "eager_menu_requests",
     "merge_partials",
     "plan_report_queue_name",
+    "plan_report_timeout",
     "plan_request_queue_name",
     "runtime_delivery_enabled",
     "serve_plan_queue",
@@ -422,9 +438,31 @@ def plan_report_queue_name(array_name: str) -> str:
 
 # How long a bridge waits for another plan request before re-checking its stop flag, and how long the host waits for
 # the reports of one request. The bridge bound is a poll interval (it costs one scheduler round trip); the host bound
-# is the one that must tolerate the simulation taking a timestep to reach its next send boundary.
+# is the one that must tolerate the simulation taking a timestep to reach its next send boundary -- and it is also the
+# bound a request that can never be served pays in full (see "The one timing bound of that design", above: a reduction
+# of the final delivered timestep has no further send to be answered at). That is why it is cycle-tolerable rather than
+# a five-minute stall, and why it is overridable: a simulation whose timestep is longer than the default sets
+# ``DEISA_RUNTIME_PLAN_TIMEOUT`` (seconds) for its whole run, host and bridges alike, since every process builds its
+# exchange from this same value.
 _PLAN_QUEUE_POLL_SECONDS: float = 0.5
-_PLAN_REPORT_TIMEOUT_SECONDS: float = 300.0
+_PLAN_REPORT_TIMEOUT_SECONDS: float = 60.0
+_PLAN_REPORT_TIMEOUT_ENV: str = "DEISA_RUNTIME_PLAN_TIMEOUT"
+
+
+def plan_report_timeout() -> float:
+    """Seconds the host waits for one round of reports: ``DEISA_RUNTIME_PLAN_TIMEOUT``, else the built-in default.
+
+    A malformed value falls back to the default rather than refusing: the timeout is a diagnostic bound, and a typo in
+    an environment variable must not become the reason a run cannot start.
+    """
+    raw = os.getenv(_PLAN_REPORT_TIMEOUT_ENV)
+    if not raw:
+        return _PLAN_REPORT_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return _PLAN_REPORT_TIMEOUT_SECONDS
+    return value if value > 0 else _PLAN_REPORT_TIMEOUT_SECONDS
 
 
 class PlanRequestBacklog:
@@ -457,9 +495,17 @@ class PlanRequestBacklog:
 class QueuePlanExchange:
     """The analytics host's transport: one request/reports round trip over the run's two dask queues.
 
-    This is the production transport: the host puts the same request once per bridge (a dask queue hands every item
-    to exactly ONE consumer, so a broadcast is one item per bridge), then blocks until every bridge answered. It is a
-    plain callable, the shape :class:`PlanDispatcher` takes, so nothing on the host side knows about queues.
+    This is the production transport: the host puts the request ONCE and then blocks until every bridge answered. One
+    put is the whole broadcast, because the array has exactly ONE queue consumer -- the array root bridge's plan pump
+    (:func:`serve_plan_queue`) -- and that root forwards the request to its peers at the send boundary, which is what
+    reaches the other bridges. It is a plain callable, the shape :class:`PlanDispatcher` takes, so nothing on the host
+    side knows about queues.
+
+    Putting the request once PER BRIDGE would be wrong: a dask queue hands every item to exactly one consumer, so the
+    single root consumer would drain all N copies, serve each copy with all N ranks, and post N*N reports into a report
+    queue the host drains N at a time. The first reduction would still look correct (FIFO), and every later one would
+    collect the leftovers of the previous request and be refused by :func:`_validate_reports` -- an aborted run on the
+    second on-demand reduction of any real simulation.
 
     The reports come back in whatever order the bridges answered; :func:`_validate_reports` and the merge both match
     on the request id and sort by chunk position, so the order is not part of the contract.
@@ -467,7 +513,8 @@ class QueuePlanExchange:
     - ``:param request_queue:`` The array's request queue (``put``-capable; in production a ``distributed.Queue``).
     - ``:param report_queue:`` The array's report queue (``get(timeout=...)``-capable).
     - ``:param bridge_count:`` Number of bridges that own a chunk of the array: one report is expected from each.
-    - ``:param timeout:`` Seconds to wait for the full set of reports before refusing.
+    - ``:param timeout:`` Seconds to wait for the full set of reports before refusing; ``None`` takes
+      :func:`plan_report_timeout` (the env-overridable default).
     """
 
     def __init__(
@@ -475,20 +522,20 @@ class QueuePlanExchange:
         request_queue: Any,
         report_queue: Any,
         bridge_count: int,
-        timeout: float = _PLAN_REPORT_TIMEOUT_SECONDS,
+        timeout: Optional[float] = None,
     ) -> None:
         self._request_queue = request_queue
         self._report_queue = report_queue
         self._bridge_count = int(bridge_count)
-        self._timeout = float(timeout)
+        self._timeout = plan_report_timeout() if timeout is None else float(timeout)
 
     def __call__(self, plan: PlanRequest) -> List[PartialReport]:
-        """Broadcast ``plan`` to every bridge and collect one report from each.
+        """Hand ``plan`` to the array's root bridge once and collect one report from each bridge.
 
         - ``:param plan:`` The request to dispatch.
         """
-        for _ in range(self._bridge_count):
-            self._request_queue.put(plan)
+        # One put: the single root consumer forwards it to every bridge at the send boundary (see the class docstring).
+        self._request_queue.put(plan)
         reports: List[PartialReport] = []
         try:
             while len(reports) < self._bridge_count:
@@ -498,7 +545,10 @@ class QueuePlanExchange:
                 "QueuePlanExchange",
                 f"request {plan.request_id!r} for array {plan.array_name!r} at timestep {plan.timestep} collected "
                 f"{len(reports)} of {self._bridge_count} report(s) in {self._timeout}s; no bridge is serving plan "
-                f"requests for that array. Refusing to merge a partial set with a hole in it",
+                f"requests for that array. Refusing to merge a partial set with a hole in it. A request is answered at "
+                f"the array's NEXT send, so this also happens when it names the simulation's final timestep (nothing "
+                f"is sent after it) -- reduce the latest delivered timestep before the run ends, or raise "
+                f"{_PLAN_REPORT_TIMEOUT_ENV} for a simulation whose timestep takes longer than {self._timeout}s",
             ) from exc
         return reports
 
@@ -700,6 +750,12 @@ class PlanDispatcher:
       number of reports is refused: a missing partial would silently shrink the merged value.
     - ``:param menu:`` Optional eager menus already computed for the current timestep. A full fold of a menu operation
       is merged from them without touching ``exchange``.
+    - ``:param latest_timestep:`` Callable returning the newest timestep delivered for the root array, or ``None`` when
+      the delivery does not track it. A collection keeps living in a callback's window after its timestep, but the
+      bridges only retain ONE chunk per array (the one they last sent), so an on-demand reduction of an older window
+      element cannot be served; it is refused at compose time with a named remedy instead of being dispatched into an
+      error report. A callable rather than a value on purpose: the dispatcher of an older delivery must see the
+      timestep that has since become the latest, not the one current when it was built.
     """
 
     def __init__(
@@ -707,9 +763,11 @@ class PlanDispatcher:
         exchange: Optional[Callable[[PlanRequest], Sequence[PartialReport]]] = None,
         bridge_count: Optional[int] = None,
         menu: Optional[Sequence[EagerMenu]] = None,
+        latest_timestep: Optional[Callable[[], Optional[int]]] = None,
     ) -> None:
         self._exchange = exchange
         self._bridge_count = None if bridge_count is None else int(bridge_count)
+        self._latest_timestep = latest_timestep
         self._menus: Dict[Tuple[str, int], List[EagerMenu]] = {}
         for eager in menu or ():
             self._menus.setdefault((eager.array_name, int(eager.timestep)), []).append(eager)
@@ -740,6 +798,7 @@ class PlanDispatcher:
                     f"{len(reports)} bridge(s) but the array has {self._bridge_count}",
                 )
         else:
+            self._refuse_stale(reduction, request)
             plan = PlanRequest(
                 request_id=uuid.uuid4().hex,
                 array_name=request.input_name,
@@ -780,6 +839,7 @@ class PlanDispatcher:
             timestep=int(request.timestep),
             request=request,
         )
+        self._refuse_stale_timestep(int(request.timestep), str(request.input_name), f"the PCA branch {request.key!r}")
         reports = self._reports_for(plan)
         for report in reports:
             if not isinstance(report.partial, PCASummary):
@@ -789,6 +849,35 @@ class PlanDispatcher:
                     f"{type(report.partial).__name__}; only a mergeable summary can be merged",
                 )
         return merge_tree([report.partial for report in reports])
+
+    def _refuse_stale(self, reduction: Any, request: Any) -> None:
+        """Refuse an on-demand reduction whose operand is older than the newest delivered timestep.
+
+        Only the on-demand path is guarded: the menu path is decided before this call and is served from the menus
+        shipped WITH the delivery, so it stays valid for every element of a callback's window.
+
+        - ``:param reduction:`` The :class:`~deisa.dask.runtime_expr.ReductionExpr` being computed.
+        - ``:param request:`` Its composed wire request (read for the root array's name).
+        """
+        self._refuse_stale_timestep(
+            int(reduction.root.timestep),
+            str(request.input_name),
+            f"the reduction {reduction.key!r}",
+        )
+
+    def _refuse_stale_timestep(self, timestep: int, array_name: str, symbol: str) -> None:
+        """Refuse a plan stamped with a timestep older than the newest delivery of ``array_name``.
+
+        - ``:param timestep:`` Timestep of the root collection the request was composed from.
+        - ``:param array_name:`` Registered array the request is rooted in.
+        - ``:param symbol:`` What is being refused, for the message.
+        """
+        if self._latest_timestep is None:
+            return
+        latest = self._latest_timestep()
+        if latest is None or timestep >= int(latest):
+            return
+        raise errors.stale_timestep(symbol, array_name=array_name, requested=timestep, latest=int(latest))
 
     def _reports_for(self, plan: PlanRequest) -> List[PartialReport]:
         """One exchange round for ``plan``, or the no-transport refusal when this delivery carries no way to ask.

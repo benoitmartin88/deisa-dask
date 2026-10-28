@@ -189,6 +189,10 @@ class Deisa(IDeisa):
         # array's sub-comm). Internal, never a user parameter: the delivery attaches the collection's compute boundary
         # from here, and an array without an entry still serves its eager menu and refuses the rest.
         self._runtime_transports: Dict[str, Callable[[Any], Any]] = {}
+        # array_name -> newest timestep the delivery handed to the callbacks. Read by every live dispatcher, including
+        # the ones held by OLDER collections in a callback's window: the bridges retain one chunk per array, so an
+        # on-demand reduction of an older window element is refused at compose time instead of aborting the run.
+        self._runtime_latest_timestep: Dict[str, int] = {}
         # First runtime refusal a callback raised; ``execute_callbacks`` re-raises it so the run fails instead of
         # logging once per timestep. None while the run is healthy.
         self._run_failure: Optional[BaseException] = None
@@ -898,7 +902,11 @@ class Deisa(IDeisa):
         array/timestep AND the retained window history, and every later refusal would name the wrong array/timestep.
         Building one per callback is metadata-only work: no data is copied, and the deliveries of two callbacks are
         independent objects.
+
+        The newest timestep of the array is recorded here, before the views are built, so a dispatcher held by an
+        OLDER collection in a callback's window can tell that its timestep is no longer the one the bridges retain.
         """
+        self._runtime_latest_timestep[array_name] = int(iteration)
         menus = None if payload.get("menu_error") else payload.get("menu")
         return {
             callback_id: self._runtime_collection(array_name, iteration, menus)
@@ -921,6 +929,7 @@ class Deisa(IDeisa):
             self._runtime_transports.get(array_name),
             bridge_count=_grid_size_from_metadata(metadata),
             menu=_as_eager_menus(menus),
+            latest_timestep=lambda: self._runtime_latest_timestep.get(array_name),
         )
         return DeisaCollection.from_metadata(array_name, iteration, metadata, dispatcher=dispatcher)
 
