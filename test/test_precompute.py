@@ -27,39 +27,31 @@
 # POSSIBILITY OF SUCH DAMAGE.
 # =============================================================================
 """
-The reduction planner a callback's ``.compute()`` goes through: the oracle port of the analyzer tests.
+The reduction planner a callback's ``.compute()`` goes through.
 
-This file used to pin the AST precompute analyzer: the source was walked symbolically, dask stubs were evaluated
-without executing the callback, and hints were read off each dask task graph. The v1 runtime path plans nothing from
-the source at all -- the callback RUNS against a lazily-reducible :class:`~deisa.dask.collection.DeisaCollection`, and
-every reduction it computes carries its own ``op_name`` / ``axes`` / ``kind`` / ``finalize``, from which
-:func:`~deisa.dask.runtime_compose.compose_request` builds the slim wire request. This file is that same fixture
-suite rewritten against the planner.
+The retired AST precompute analyzer walked the callback source symbolically, evaluated dask stubs without executing the
+callback, and read hints off each dask task graph. The v1 runtime path plans nothing from the source at all -- the
+callback RUNS against a lazily-reducible :class:`~deisa.dask.collection.DeisaCollection`, and every reduction it
+computes carries its own ``op_name`` / ``axes`` / ``kind`` / ``finalize``, from which
+:func:`~deisa.dask.runtime_compose.compose_request` builds the slim wire request. This file is the fixture suite for
+that planner.
 
-The equivalence contract, asserted fixture by fixture: for every callback the analyzer used to serve, the runtime plan
-is the SAME spec -- same op name, same reduction axes, same payload kind, same finalize, and a numerically identical
-``branch_func`` on a fresh numpy chunk (behavior over metadata, plan §7 P1/P4). The analyzer's ``BranchSpec`` list is
-the oracle for that comparison until it is deleted; the literal expectations asserted next to it are what survives the
-deletion.
-
-The suite keeps the dimensionality the analyzer served, including the 5-D gysela workload that motivated the design
+The suite keeps the dimensionality of the gysela workload that motivated the design
 (``test_gysela_density_helper_plans_the_5d_axis_tuple_and_delivers_the_value`` and
 ``test_gysela_measure_helper_loop_reduces_five_expressions_per_species``): those are the only fixtures that reduce an
 array with ``ndim > 2``, which is why they cannot be dropped as redundant with the 2-D axis fixtures.
 
-Refusals are pinned against the RUNTIME taxonomy (``deisa.dask.runtime_errors``), which is the one a callback now
-meets. One classification is deliberately DIFFERENT from the analyzer's and is pinned as such: a non-associative
-reduction (``argmax``/``argmin``/``median``/``quantile``/``percentile``) is refused as
-``NonAssociativeReductionError``. The analyzer misdiagnosed it -- ``argmax`` as a raw field read, ``median`` as "no
-precomputable reduction" -- which named a cause and a remedy that did not help. Every OTHER divergence the port
-exposed is listed in the "Divergences" section below, each pinned with the analyzer behavior next to the runtime one, so
-none of them is a silent approximation.
+Refusals are pinned against the RUNTIME taxonomy (``deisa.dask.runtime_errors``), which is the one a callback meets.
+A non-associative reduction (``argmax``/``argmin``/``median``/``quantile``/``percentile``) is refused as
+``NonAssociativeReductionError``, and the refusal names the cause (the answer depends on the GLOBAL ordering of the
+data) and the remedy (the associative set). The retired analyzer misdiagnosed it -- ``argmax`` as a raw field read,
+``median`` as "no precomputable reduction" -- which named a cause and a remedy that did not help.
 
 ``_PrecomputedDeisaArray`` role coverage (plan §6, for the deletion card): the class it replaces had four jobs, and
 each is proven here by construction, so nothing depends on the class surviving:
 
 1. **mean/var neutralization** -- the reduction is delivered FINAL, never re-applied to a one-element array:
-   ``test_full_reduction_delivers_the_analyzer_value`` (mean/var/std) and the ``mean``/``var``/``std`` entries of
+   ``test_full_reduction_delivers_the_final_value`` (mean/var/std) and the ``mean``/``var``/``std`` entries of
    ``test_direct_reduction_plan``.
 2. **no double reduce** -- a reduction is a value, not an array: ``test_reduction_is_not_an_array``.
 3. **second-line defense** -- an unplanned consumption of the delivered value cannot reach data:
@@ -77,8 +69,6 @@ import pytest
 from utils import (
     DEFAULT_META,
     RecordingDispatcher,
-    _analyze,
-    _assert_spec_equivalent,
     _collection,
     _dispatched,
     _run_callback,
@@ -88,7 +78,6 @@ from utils import (
 from deisa.dask import runtime_errors as errors
 from deisa.dask.collection import DeisaCollection
 from deisa.dask.deisa import Deisa
-from deisa.dask.runtime_compose import RuntimeRequest
 from deisa.dask.runtime_dispatch import PlanDispatcher, PlanResponder
 
 # The chunk every branch callable is exercised on: mixed signs, so max/min/mean/var distinguish the ops.
@@ -113,78 +102,6 @@ def _two_arrays(body):
         "arr_b": _collection("b", meta=META_AB, dispatcher=boundary),
     }
     return _run_callback(body, params="arr_a, arr_b", meta=META_AB, collections=collections, dispatcher=boundary)
-
-
-# ---------------------------------------------------------------------------------------------------------------------
-# The port contract: every fixture's runtime plan IS the analyzer's spec
-# ---------------------------------------------------------------------------------------------------------------------
-# Every callback fixture the analyzer served, expressed on the runtime surface. The bodies are the analyzer-era bodies;
-# where the closed surface spells an expression differently the runtime spelling is used and the port is noted.
-FIXTURES = [
-    pytest.param("result = arr.sum()\nresult.compute()", "arr", False, id="sum"),
-    pytest.param("result = arr.mean()\nresult.compute()", "arr", False, id="mean"),
-    pytest.param("result = arr.max()\nresult.compute()", "arr", False, id="max"),
-    pytest.param("result = arr.min()\nresult.compute()", "arr", False, id="min"),
-    pytest.param("result = arr.std()\nresult.compute()", "arr", False, id="std"),
-    pytest.param("result = arr.var()\nresult.compute()", "arr", False, id="var"),
-    pytest.param("result = arr.prod()\nresult.compute()", "arr", False, id="prod"),
-    pytest.param("result = arr.sum(axis=0)\nresult.compute()", "arr", False, id="axis_int"),
-    pytest.param("result = arr.sum(axis=(0, 1))\nresult.compute()", "arr", False, id="axis_tuple_full"),
-    pytest.param("result = arr.sum(axis=1)\nresult.compute()", "arr", False, id="axis_int_1"),
-    pytest.param("result = (arr ** 2).sum()\nresult.compute()", "arr", False, id="expression_pow"),
-    pytest.param("result = (arr * 2 - 1).mean()\nresult.compute()", "arr", False, id="expression_pointwise"),
-    pytest.param(
-        "s = arr.sum()\nm = arr.mean()\nmx = arr.max()\ns.compute()\nm.compute()\nmx.compute()",
-        "arr",
-        False,
-        id="multiple_reductions",
-    ),
-    pytest.param(
-        "result = arr.sum()\nresult.compute()\nresult0 = arr.sum(axis=0)\nresult0.compute()",
-        "arr",
-        False,
-        id="same_op_two_axes",
-    ),
-    pytest.param("a = arr.sum()\na.compute()\nb = arr.sum()\nb.compute()", "arr", False, id="same_op_twice"),
-    pytest.param("a = arr.sum().compute()\nb = arr.var().compute()", "arr", False, id="independent_reductions"),
-    pytest.param(
-        "Nsp = 4\nfor isp in range(Nsp):\n    m = arr.sum()\n    m.compute()",
-        "arr",
-        False,
-        id="static_loop",
-    ),
-    pytest.param("y = arr.ndim\ns = arr.sum()\nreturn s.compute(), y", "arr", False, id="attribute_read_then_sum"),
-    pytest.param("result = window[-1].sum()\nresult.compute()", "window", True, id="window_read"),
-    pytest.param("result = window[-1].sum(axis=0)\nresult.compute()", "window", True, id="window_axis_read"),
-]
-
-
-@pytest.mark.parametrize("body,params,windowed", FIXTURES)
-def test_fixture_specs_match_the_analyzer_oracle(body, params, windowed) -> None:
-    """For every fixture, the runtime plan equals the analyzer's spec -- fields AND branch behavior.
-
-    The analyzer (``_analyze``) is the oracle for a callback the analyzer-era delivery served; the runtime never reads
-    the source, it executes the callback. Equivalent spec means same ``op_name`` / ``reduction_axes`` / output kind /
-    ``finalize``, a numerically identical ``branch_func`` on one fresh numpy chunk, and the same probed partial
-    metadata. When the analyzer is deleted, this test's literals (and the per-section tests below) are the contract.
-    """
-    oracle = _analyze(body, params=params)
-    collections, boundary = _window(0) if windowed else ({}, None)
-    _, requests, boundary = _run_callback(body, params=params, collections=collections, dispatcher=boundary)
-
-    assert len(boundary.reductions) == len(oracle), (
-        f"planned {len(boundary.reductions)} reduction(s), oracle {len(oracle)}"
-    )
-    pairs = sorted(
-        zip(
-            sorted(boundary.reductions, key=lambda item: (item.op_name, item.axes)),
-            sorted(oracle, key=lambda item: (item.op_name, item.reduction_axes)),
-        ),
-        key=lambda pair: (pair[0].op_name, pair[0].axes),
-    )
-    for reduction, spec in pairs:
-        _assert_spec_equivalent(reduction, spec, CHUNK)
-    assert all(isinstance(request, RuntimeRequest) for request in requests)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -528,31 +445,26 @@ def test_non_associative_reductions_are_refused_as_such() -> None:
 
 
 def test_non_associative_refusal_is_not_a_raw_read() -> None:
-    """The reclassification is observable: the same source raises the analyzer's raw-read class, the runtime's own."""
-    from deisa.dask import precompute_errors as analyzer_errors
+    """The refusal class is ``NonAssociativeReductionError``, never a raw-read class: the cause is the merge, not data.
 
-    with pytest.raises(analyzer_errors.RawFieldReadError):
-        _analyze("s = arr.argmax()\ns.compute()")
+    ``argmax`` is not a read of the field -- the surface refuses it because the answer needs the GLOBAL ordering -- so
+    the callback is pointed at the associative set instead of at a data-access fix.
+    """
     with pytest.raises(errors.NonAssociativeReductionError) as refusal:
         _run_callback("s = arr.argmax()\ns.compute()")
-    assert not isinstance(refusal.value, analyzer_errors.RawFieldReadError), "argmax is not a raw read"
+    assert not isinstance(refusal.value, errors.RawFieldReadError), "argmax is not a raw read"
     assert "associative reductions" in str(refusal.value), "the remedy must name a working path"
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Divergences from the analyzer, pinned one by one (nothing here is a silent approximation)
+# Off-surface spellings: what the closed surface refuses, and why
 # ---------------------------------------------------------------------------------------------------------------------
 def test_cross_array_expression_is_refused() -> None:
-    """``(arr_a - arr_b).sum()`` is refused as a mixed root; the analyzer refuses it too, one step earlier.
+    """``(arr_a - arr_b).sum()`` is refused as a mixed root: a chunk-local branch cannot descend from two arrays.
 
-    Both paths refuse with ``UnsupportedReductionError``: the analyzer raises during analysis (a chunk-local branch
-    cannot descend from two registered arrays), the runtime raises at the operator with the root pair in the message.
+    The refusal names the root pair, because that is the thing the callback has to change -- the two reductions have to
+    be computed separately and combined on the delivered VALUES.
     """
-    from deisa.dask import precompute_errors as analyzer_errors
-
-    with pytest.raises(analyzer_errors.UnsupportedReductionError) as oracle_refusal:
-        _analyze("result = (arr_a - arr_b).max()\nresult.compute()", params="arr_a, arr_b", meta=META_AB)
-    assert "at least one other registered array" in str(oracle_refusal.value)
     with pytest.raises(errors.UnsupportedReductionError) as refusal:
         _two_arrays("result = (arr_a - arr_b).max()\nresult.compute()")
     assert "two different DEISA roots" in str(refusal.value)
@@ -597,16 +509,13 @@ def test_getattr_resolved_reduction_is_served() -> None:
 
 
 def test_scaled_reduction_is_refused_and_the_delivered_value_scales_instead() -> None:
-    """REGRESSION to escalate: ``arr.sum() * dvx`` is refused, where the analyzer served it as ``f-sum``.
+    """``arr.sum() * dvx`` is refused: a reduction is a VALUE, so the scale is applied AFTER delivery.
 
-    The analyzer composed the scale factor into the branch (a full local fold plus a multiply), so the gysela
-    ``density()``/``measure()`` helpers (``da.sum(f, axis=(0, 3, 4)) * dvx * dvy``) were precomputable. The runtime
-    refuses any reduction used as a pointwise operand and requires the scale to be applied to the DELIVERED value.
-    Same number, one extra callback-side multiply -- but an existing callback must be rewritten, which is why this is
-    pinned explicitly rather than quietly dropped.
+    A reduction used as a pointwise operand would need the aggregate merged before the multiply, which no bridge can
+    do. The closed surface therefore refuses the operand spelling and the callback scales the delivered value instead
+    (``arr.sum().compute() * dvx``) -- the same number with one callback-side multiply. This is the migration rule for
+    the gysela ``density()``/``measure()`` helpers (``da.sum(f, axis=(0, 3, 4)) * dvx * dvy``).
     """
-    oracle = _analyze("s = (arr.sum()) * 2\ns.compute()")
-    assert [(spec.op_name, spec.deliver_direct) for spec in oracle] == [("sum", True)]
     with pytest.raises(errors.UnsupportedReductionError) as refusal:
         _run_callback("s = (arr.sum()) * 2\ns.compute()")
     assert "completed reduction as an operand" in str(refusal.value)
@@ -614,19 +523,10 @@ def test_scaled_reduction_is_refused_and_the_delivered_value_scales_instead() ->
 
 
 def test_no_compute_boundary_plans_nothing() -> None:
-    """A callback that never computes a reduction plans nothing, and the analyzer refuses it at registration.
-
-    Both halves are pinned: the runtime records zero requests (there is nothing to plan), and the registration gate --
-    still the analyzer until the deletion lands -- raises ``NoPrecomputableReductionError``/``NoComputeBoundaryError``
-    for exactly that source.
-    """
-    from deisa.dask import precompute_errors as analyzer_errors
-
+    """A callback that never crosses a compute boundary plans nothing: ``.compute()`` is the only planning site."""
     for body in ("result = arr.sum()", "x = 1 + 2"):
         _, requests, _ = _run_callback(body)
         assert requests == []
-    with pytest.raises(analyzer_errors.NoComputeBoundaryError):
-        _analyze("result = arr.sum()")
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -647,7 +547,7 @@ FIELD = np.random.default_rng(7).normal(size=(8, 8))
         ("prod", np.prod),
     ],
 )
-def test_full_reduction_delivers_the_analyzer_value(op_name, truth) -> None:
+def test_full_reduction_delivers_the_final_value(op_name, truth) -> None:
     """Role 1 of the retired dispatch view: mean/var/std deliver the FINAL global value, never a re-applied op.
 
     Two bridges, real responder, real merge: a callback's ``arr.<op>().compute()`` is the whole-array reduction. For
@@ -676,12 +576,11 @@ def test_axis_reduction_delivers_the_whole_array_slice(op_name, axes, truth) -> 
     assert np.allclose(value, expected, rtol=1e-12, atol=1e-12)
 
 
-def test_derived_reduction_delivers_the_value_the_analyzer_refused() -> None:
-    """``(arr * arr).sum()`` is SERVED by the runtime (the analyzer refused it as non-direct) and is correct.
+def test_derived_reduction_delivers_the_value() -> None:
+    """``(arr * arr).sum()`` / ``(arr * 2).mean()`` are served and correct: the pointwise program runs per chunk.
 
-    The pointwise program is executed on each bridge's own chunk before the fold, which is exactly what the analyzer's
-    ``deliver_direct`` guard was protecting against getting wrong -- the runtime cannot get it wrong, because the
-    composed chain carries the program instead of assuming the bare chunk.
+    The chain carries the program instead of assuming the bare chunk, so the fold applies to the program's output on
+    every bridge and the merge is over the program's partials.
     """
     collection = _dispatched(FIELD)
     assert np.isclose(float((collection * collection).sum().compute()), float(np.sum(FIELD**2)))
@@ -689,13 +588,12 @@ def test_derived_reduction_delivers_the_value_the_analyzer_refused() -> None:
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# The gysela 5-D surface: the workload the redesign was motivated by, restored on the runtime spelling
+# The gysela 5-D surface: the workload the redesign was motivated by, on the runtime closed surface
 # ---------------------------------------------------------------------------------------------------------------------
-# The analyzer-era suite had two fixtures on the gysela shapes (``fdistribu`` is a 5-D distribution function, and
-# ``density()``/``measure()`` reduce velocity and space axes out of it). The port dropped both, which left the suite
-# with no reduction of an array whose ``ndim > 2`` at all -- the axis fixtures it kept are 2-D. These two restore it on
-# the RUNTIME closed surface: no ``da.sum``, no ``client.compute``, and the grid constants (``dvx * dvy``, the velocity
-# weights, ``dV_4D``) scale the DELIVERED value instead of being folded into the branch -- the same rewrite
+# ``fdistribu`` is a 5-D distribution function, and ``density()``/``measure()`` reduce velocity and space axes out of
+# it. These two fixtures keep that dimensionality (the axis fixtures above are 2-D) on the closed surface: no
+# ``da.sum``, no ``client.compute``, and the grid constants (``dvx * dvy``, the velocity weights, ``dV_4D``) scale the
+# DELIVERED value instead of being folded into the branch -- the same rewrite
 # ``test_scaled_reduction_is_refused_and_the_delivered_value_scales_instead`` pins as the migration rule for these very
 # helpers.
 GYSELA_META = {"f": {"global_shape": (4, 5, 10, 10, 10), "chunk_shape": (1, 5, 5, 5, 5)}}
@@ -754,21 +652,13 @@ def _gysela_delivery(field, name="f"):
 def test_gysela_density_helper_plans_the_5d_axis_tuple_and_delivers_the_value() -> None:
     """``density(f, grid) = sum(f, axis=(0, 3, 4)) * dvx * dvy`` on the 5-D gysela grid.
 
-    The analyzer-era ``test_gysela_density_helper`` asserted the hint key. The runtime is strictly better on this body:
-    the analyzer REFUSED it (``axes=()`` with ``deliver_direct=False``, so its callable would have folded the raw chunk
-    and dropped the axis tuple), while the runtime plans ``(0, 3, 4)`` exactly -- which is why the partial is 200 B
-    where the chunk is 5000 B. The literals are therefore the contract here instead of an ``_assert_spec_equivalent``
-    comparison: that harness skips the behavior half for a fixture the analyzer refused, and the axis tuple it would
-    compare against does not exist in the oracle.
+    The published contract of this body: the axis tuple ``(0, 3, 4)`` and its key, the 200 B partial against the
+    5000 B chunk, and the delivered value against numpy. The literals are the contract, so a drift in the axis tuple,
+    the wire key or the partial shape is a test failure rather than a deployment surprise.
     """
     from deisa.dask.runtime_compose import probe_partial
 
     body = "s = arr.sum(axis=(0, 3, 4))\ns.compute()"
-    oracle = _analyze(body, meta=GYSELA_META)
-    assert [(spec.reduction_axes, spec.deliver_direct) for spec in oracle] == [((), False)], (
-        "the analyzer refused the 5-D axis tuple; these literals are what the runtime must keep serving"
-    )
-
     _, requests, _ = _run_callback(body, meta=GYSELA_META)
     assert len(requests) == 1
     request = requests[0]
@@ -875,25 +765,6 @@ def test_each_callback_gets_its_own_collection() -> None:
     views["cb-1"].name = "mutated-by-the-first-callback"
     assert views["cb-2"].name == "f"
     assert views["cb-2"].timestep == 3
-
-
-# ---------------------------------------------------------------------------------------------------------------------
-# The analyzer's own contract, for the record: it never ran the callback
-# ---------------------------------------------------------------------------------------------------------------------
-def test_analyzer_never_executes_the_callback() -> None:
-    """The oracle comparison above relies on the analyzer being AST-only: pin that it never calls the callback."""
-    calls = {"n": 0}
-
-    def callback(arr):
-        calls["n"] += 1
-        arr.sum().compute()
-
-    callback.__source__ = "def callback(arr):\n    arr.sum().compute()\n"
-    from _oracle.branch_specs import _analyze_callback_for_branches
-
-    branches = _analyze_callback_for_branches(callback, DEFAULT_META)
-    assert [branch.output_key for branch in branches] == ["f-sum"]
-    assert calls["n"] == 0
 
 
 # ---------------------------------------------------------------------------------------------------------------------

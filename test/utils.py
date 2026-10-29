@@ -138,19 +138,6 @@ def _make_callback(name: str, body: str, params: str = "arr") -> Callable:
     return fn
 
 
-def _analyze(body: str, params: str = "arr", name: str = "analyze_cb", meta: Dict[str, Any] = None) -> Any:
-    """Build a callback from ``body`` and run ``_analyze_callback_for_branches`` against ``meta``.
-
-    Defaults to a single array ``f`` with an (8, 8) global shape and (4, 4) chunk shape.
-    """
-    from _oracle.branch_specs import _analyze_callback_for_branches
-
-    if meta is None:
-        meta = {"f": {"global_shape": (8, 8), "chunk_shape": (4, 4)}}
-    cb = _make_callback(name, body, params=params)
-    return _analyze_callback_for_branches(cb, meta)
-
-
 def _scalar(value: Any) -> float:
     """Unwrap a (1, 1) keepdims partial (sum chunk layer has keepdims=True) to a scalar."""
     return float(np.asarray(value).reshape(-1)[0])
@@ -244,54 +231,6 @@ def _run_callback(
 
     result = callback(*args)
     return result, [compose_request(reduction) for reduction in boundary.reductions], boundary
-
-
-def _same_partial(left: Any, right: Any) -> bool:
-    """True when two per-bridge partials are the same value AND the same shape (dict partials compared entry-wise)."""
-    if isinstance(left, dict) or isinstance(right, dict):
-        return (
-            isinstance(left, dict)
-            and isinstance(right, dict)
-            and set(left) == set(right)
-            and all(_same_partial(left[key], right[key]) for key in left)
-        )
-    left_array, right_array = np.asarray(left), np.asarray(right)
-    return left_array.shape == right_array.shape and bool(np.allclose(left_array, right_array, equal_nan=True))
-
-
-def _assert_spec_equivalent(reduction: Any, spec: Any, chunk: Any, compare_behavior: Optional[bool] = None) -> None:
-    """Assert the runtime plan for ``reduction`` IS the analyzer's spec for the same callback fixture.
-
-    Compares the four spec fields the wire request is composed from (op name, reduction axes, output kind, finalize),
-    then EXECUTES both branch callables on the same fresh numpy chunk: behavior over metadata, per plan §7. The probed
-    partial metadata is compared too, so a hand-derived shape cannot drift from the callable.
-
-    The behavior comparison is skipped for a spec the analyzer itself refused (``deliver_direct=False``): its callable
-    folds the RAW chunk, dropping the pointwise program (``(arr ** 2).sum()`` came out as ``sum(chunk)``), which is
-    precisely why registration refused it. The runtime's plan for those fixtures is correct and is asserted by value
-    elsewhere; comparing against a callable known to be wrong would only pin the bug.
-
-    - ``:param reduction:`` The :class:`~deisa.dask.runtime_expr.ReductionExpr` the callback computed.
-    - ``:param spec:`` The oracle :class:`~deisa.dask.branch.BranchSpec` for the same source.
-    - ``:param chunk:`` A fresh numpy chunk to run both callables on.
-    - ``:param compare_behavior:`` Force/skip the callable comparison (defaults to ``spec.deliver_direct``).
-    """
-    from deisa.dask.runtime_compose import compose_request, probe_partial
-
-    request = compose_request(reduction)
-    where = f"runtime {reduction.key!r} vs oracle {spec.output_key!r}"
-    assert reduction.op_name == spec.op_name, where
-    assert reduction.axes == spec.reduction_axes, where
-    assert reduction.kind == spec.output_kind, where
-    assert reduction.finalize == spec.finalize, where
-    assert request.input_name == spec.input_name, where
-    if compare_behavior if compare_behavior is not None else spec.deliver_direct:
-        assert _same_partial(request.branch_func(chunk), spec.branch_func(chunk)), (
-            f"{where}: the branch callables disagree on a fresh {chunk.shape} chunk"
-        )
-        shape, dtype = probe_partial(request, chunk.shape, chunk.dtype)
-        assert shape == spec.partial_shape, where
-        assert dtype == spec.partial_dtype, where
 
 
 def _direct_exchange(chunks: Sequence[Any], array_name: str = "f", timestep: int = 0, grid: Sequence[int] = (2, 2)):
