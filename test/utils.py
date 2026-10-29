@@ -127,7 +127,7 @@ def run_on_all_ranks(comm_builder, fn):
 def _make_callback(name: str, body: str, params: str = "arr") -> Callable:
     """Compile ``def <name>(<params>): <body>`` and return the function with ``__source__`` set.
 
-    Shared by analyzer tests so ``analyze_callback`` can walk source via ``inspect.getsource``. The compiled filename is
+    Used by the registration tests (``test_deisa.py``, ``test_mergeable_pca_bridge.py``). The compiled filename is
     generic (``<test-utils:name>``); no test asserts on the filename.
     """
     src = textwrap.dedent(f"def {name}({params}):\n{textwrap.indent(body, '    ')}")

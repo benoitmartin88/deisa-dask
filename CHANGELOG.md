@@ -80,6 +80,10 @@ Types of changes:
   held runtime delivery behind an environment variable while the analyzer was still the default. The flag has no
   meaning left: with the analyzer gone there is no third delivery mode, so `precompute` is the only selector. Unset the
   environment variable; setting it is now inert.
+- The test-only analyzer port under `test/_oracle/` (the AST walker, the chain walkers and `BranchSpec`), dropped by
+  maintainer decision: with the analyzer's delivery path gone from `src/`, a second implementation kept only to diff the
+  runtime against tested a deleted design. The plan is now its own contract -- golden literals for every published
+  fixture plus the per-op value tests -- and no test-only production code remains.
 
 ### Fixed
 

@@ -105,6 +105,172 @@ def _two_arrays(body):
 
 
 # ---------------------------------------------------------------------------------------------------------------------
+# The published contract: one literal per fixture body
+# ---------------------------------------------------------------------------------------------------------------------
+# Every published fixture with the plan it must produce, one tuple per reduction: (key, op, reduced axes, payload kind).
+# The list is compared as a SET, so it pins what is planned without pinning the callback's compute order.
+#
+# ``truth`` is set only for the two pointwise-expression fixtures: their plan folds a composed program into the
+# reduction, which is the one place a silent change would still produce a plausible-looking spec. The plain ops are
+# pinned by value in the per-section tests below and are deliberately NOT re-tested here.
+FIXTURES = [
+    pytest.param(
+        "result = arr.sum()\nresult.compute()", "arr", False, (("f-sum", "sum", (), "scalar"),), None, id="sum"
+    ),
+    pytest.param(
+        "result = arr.mean()\nresult.compute()", "arr", False, (("f-mean", "mean", (), "mean"),), None, id="mean"
+    ),
+    pytest.param(
+        "result = arr.max()\nresult.compute()", "arr", False, (("f-max", "max", (), "scalar"),), None, id="max"
+    ),
+    pytest.param(
+        "result = arr.min()\nresult.compute()", "arr", False, (("f-min", "min", (), "scalar"),), None, id="min"
+    ),
+    pytest.param(
+        "result = arr.std()\nresult.compute()", "arr", False, (("f-std", "std", (), "moment"),), None, id="std"
+    ),
+    pytest.param(
+        "result = arr.var()\nresult.compute()", "arr", False, (("f-var", "var", (), "moment"),), None, id="var"
+    ),
+    pytest.param(
+        "result = arr.prod()\nresult.compute()", "arr", False, (("f-prod", "prod", (), "scalar"),), None, id="prod"
+    ),
+    pytest.param(
+        "result = arr.sum(axis=0)\nresult.compute()",
+        "arr",
+        False,
+        (("f-sum-axis0", "sum", (0,), "scalar"),),
+        None,
+        id="axis_int",
+    ),
+    # A tuple covering every axis IS the full reduction, and normalizes onto the bare-array key.
+    pytest.param(
+        "result = arr.sum(axis=(0, 1))\nresult.compute()",
+        "arr",
+        False,
+        (("f-sum", "sum", (), "scalar"),),
+        None,
+        id="axis_tuple_full",
+    ),
+    pytest.param(
+        "result = arr.sum(axis=1)\nresult.compute()",
+        "arr",
+        False,
+        (("f-sum-axis1", "sum", (1,), "scalar"),),
+        None,
+        id="axis_int_1",
+    ),
+    # A derived operand's full fold carries the ``-axisall`` discriminator, so it can never collide with the bare
+    # array's fold.
+    pytest.param(
+        "result = (arr ** 2).sum()\nresult.compute()",
+        "arr",
+        False,
+        (("f-sum-axisall", "sum", (), "scalar"),),
+        lambda chunk: float(np.sum(chunk**2)),
+        id="expression_pow",
+    ),
+    pytest.param(
+        "result = (arr * 2 - 1).mean()\nresult.compute()",
+        "arr",
+        False,
+        (("f-mean-axisall", "mean", (), "mean"),),
+        lambda chunk: float(np.mean(chunk * 2 - 1)),
+        id="expression_pointwise",
+    ),
+    pytest.param(
+        "s = arr.sum()\nm = arr.mean()\nmx = arr.max()\ns.compute()\nm.compute()\nmx.compute()",
+        "arr",
+        False,
+        (("f-sum", "sum", (), "scalar"), ("f-mean", "mean", (), "mean"), ("f-max", "max", (), "scalar")),
+        None,
+        id="multiple_reductions",
+    ),
+    pytest.param(
+        "result = arr.sum()\nresult.compute()\nresult0 = arr.sum(axis=0)\nresult0.compute()",
+        "arr",
+        False,
+        (("f-sum", "sum", (), "scalar"), ("f-sum-axis0", "sum", (0,), "scalar")),
+        None,
+        id="same_op_two_axes",
+    ),
+    pytest.param(
+        "a = arr.sum()\na.compute()\nb = arr.sum()\nb.compute()",
+        "arr",
+        False,
+        (("f-sum", "sum", (), "scalar"), ("f-sum", "sum", (), "scalar")),
+        None,
+        id="same_op_twice",
+    ),
+    pytest.param(
+        "a = arr.sum().compute()\nb = arr.var().compute()",
+        "arr",
+        False,
+        (("f-sum", "sum", (), "scalar"), ("f-var", "var", (), "moment")),
+        None,
+        id="independent_reductions",
+    ),
+    pytest.param(
+        "Nsp = 4\nfor isp in range(Nsp):\n    m = arr.sum()\n    m.compute()",
+        "arr",
+        False,
+        (("f-sum", "sum", (), "scalar"),) * 4,
+        None,
+        id="static_loop",
+    ),
+    pytest.param(
+        "y = arr.ndim\ns = arr.sum()\nreturn s.compute(), y",
+        "arr",
+        False,
+        (("f-sum", "sum", (), "scalar"),),
+        None,
+        id="attribute_read_then_sum",
+    ),
+    pytest.param(
+        "result = window[-1].sum()\nresult.compute()",
+        "window",
+        True,
+        (("f-sum", "sum", (), "scalar"),),
+        None,
+        id="window_read",
+    ),
+    pytest.param(
+        "result = window[-1].sum(axis=0)\nresult.compute()",
+        "window",
+        True,
+        (("f-sum-axis0", "sum", (0,), "scalar"),),
+        None,
+        id="window_axis_read",
+    ),
+]
+
+
+def _partial_value(partial) -> float:
+    """The number a per-bridge partial stands for: a bare scalar, or a ``mean``/``moment`` ``{n, total}`` dict."""
+    if isinstance(partial, dict):
+        return float(np.asarray(partial["total"]).reshape(-1)[0]) / float(np.asarray(partial["n"]).reshape(-1)[0])
+    return float(np.asarray(partial).reshape(-1)[0])
+
+
+@pytest.mark.parametrize("body,params,windowed,expected,truth", FIXTURES)
+def test_planned_spec_matches_the_published_contract(body, params, windowed, expected, truth) -> None:
+    """A published callback plans a fixed literal set: key, op, reduced axes and payload kind per reduction.
+
+    This is the wire contract, so a change here is a wire-format change: the bridge answers the key, the combine
+    consumes the kind, and the axes drive the merge. It has to be a deliberate edit of this table, not a side effect of
+    a refactor.
+    """
+    collections, boundary = _window(0) if windowed else ({}, None)
+    _, requests, boundary = _run_callback(body, params=params, collections=collections, dispatcher=boundary)
+    planned = sorted(
+        (reduction.key, reduction.op_name, reduction.axes, reduction.kind) for reduction in boundary.reductions
+    )
+    assert planned == sorted(expected)
+    if truth is not None:
+        assert _partial_value(requests[0].branch_func(CHUNK)) == pytest.approx(truth(CHUNK))
+
+
+# ---------------------------------------------------------------------------------------------------------------------
 # Per-reduction support: the plan of each associative reduction
 # ---------------------------------------------------------------------------------------------------------------------
 @pytest.mark.parametrize(
@@ -157,8 +323,8 @@ def test_reduction_axes_and_output_key(body, expected_key, expected_axes) -> Non
 def test_full_fold_ships_one_scalar_per_bridge() -> None:
     """A full fold of a scalar kind composes the minimal-scalar finalizer, so a bridge ships ONE scalar.
 
-    This is the runtime counterpart of the analyzer's ``full_local_fold``: without the finalizer the partial would be
-    dask's ``(1, 4)`` tier shape for a ``(4, 4)`` chunk, which is four times the payload for the same information.
+    Without the finalizer the partial would be dask's ``(1, 4)`` tier shape for a ``(4, 4)`` chunk, which is four times
+    the payload for the same information.
     """
     from deisa.dask.runtime_compose import probe_partial
 
@@ -227,10 +393,8 @@ def test_independent_reductions_are_not_refused() -> None:
 # Structure independence: the plan comes from the run, not from the callback's syntax
 # ---------------------------------------------------------------------------------------------------------------------
 def test_helper_call_plans_the_helper_reduction() -> None:
-    """A reduction built inside a helper is planned like an inline one: the runtime executes the call.
-
-    The analyzer-era fixture needed a hand-written helper for this (``density(f, grid)``); the runtime needs nothing,
-    because the helper RUNS.
+    """A reduction built inside a helper is planned like an inline one: the helper RUNS, so its reduction crosses a
+    compute boundary like any other.
     """
     body = "def measure(f):\n    return f.sum(axis=0)\n\nresult = measure(arr)\nresult.compute()"
     _, requests, _ = _run_callback(body)
@@ -245,7 +409,8 @@ def test_list_and_loop_of_reductions_plan_every_reduction() -> None:
 
 
 def test_dynamic_loop_over_plan_objects_is_plain_python() -> None:
-    """A loop over a non-constant iterable is ordinary Python here: the analyzer's static unrolling is not needed."""
+    """A loop over a non-constant iterable is ordinary Python: nothing has to be unrolled statically."""
+
     boundary = RecordingDispatcher()
     items = [_collection("f", dispatcher=boundary), _collection("f", dispatcher=boundary)]
     _, requests, _ = _run_callback(
@@ -310,8 +475,7 @@ def test_window_cannot_be_combined_across_timesteps() -> None:
 def test_numpy_conversion_is_refused(body) -> None:
     """``np.array(collection)``/``np.asarray(collection)`` MATERIALIZES the field: ``MaterializationError``.
 
-    Same class the analyzer raised for the same source, and the reason it must be caught before any graph exists: a
-    numpy conversion leaves no artifact to analyze.
+    A numpy conversion leaves nothing to plan from, so the gather has to be refused at the coercion itself.
     """
     with pytest.raises(errors.MaterializationError):
         _run_callback(body)
@@ -328,9 +492,8 @@ def test_raw_compute_is_refused() -> None:
 def test_index_read_is_refused() -> None:
     """``arr[2:5]`` / ``arr[:, 0]`` / ``arr[0, 0]`` are raw reads of the field: refused at the item access.
 
-    Port note: the analyzer emitted a ``f-sum`` spec for ``arr[2:5].sum()`` with ``deliver_direct=False``, which
-    registration then refused; the runtime refuses at the access itself, so the end state (refused, never served) is the
-    same and the class (``UnsupportedReductionError``) is the registration-time class of both paths.
+    Indexing is not on the closed operator surface, so the access itself is refused
+    (``UnsupportedReductionError``) and the data is never served.
     """
     for body in (
         "result = arr[2:5].sum()\nresult.compute()",
@@ -360,9 +523,9 @@ def test_iteration_and_truth_are_refused() -> None:
 def test_opaque_callable_cannot_gather_the_field() -> None:
     """Passing the collection to a foreign callable is harmless; the callable's own CONSUMPTION is refused.
 
-    This is ``_PrecomputedDeisaArray``'s second-line defense, re-derived structurally: the analyzer had to refuse
-    ``plot(arr)`` up front because it could not see inside ``plot``. The runtime hands over a lazy operand, so the
-    refusal lands where the data would actually be gathered -- inside the callee -- and is not a guess.
+    This is ``_PrecomputedDeisaArray``'s second-line defense, re-derived structurally: the operand is lazy, so the
+    refusal lands where the data would actually be gathered -- inside the callee -- and is not a guess about what the
+    callee might do.
     """
 
     def plot(value):
@@ -402,7 +565,7 @@ def test_unsupported_reduction_keywords_are_refused(body, expected) -> None:
     ],
 )
 def test_cross_reduction_is_refused(body) -> None:
-    """A reduction that depends on another reduction's aggregate is refused -- the analyzer's refusal class.
+    """A reduction that depends on another reduction's aggregate is refused.
 
     The naive per-reduction plan would ship ``(chunk - chunk.mean()).sum()`` to every bridge, which is always 0: the
     inner aggregate only exists after the merge. The message names the offending reduction and points at the working
@@ -431,11 +594,10 @@ def test_reduction_is_not_an_array() -> None:
 
 
 def test_non_associative_reductions_are_refused_as_such() -> None:
-    """The ONE deliberate reclassification: non-associative reductions get their own refusal class.
+    """Non-associative reductions get their own refusal class, distinct from every data-access refusal.
 
-    The analyzer misdiagnosed these -- ``argmax`` as a raw field read, ``median``/``quantile`` as "no precomputable
-    reduction" -- so the callback was told to change the wrong thing. The true cause is that the answer depends on the
-    GLOBAL ordering of the data, which no bridge can see, and the remedy names the associative set.
+    The answer depends on the GLOBAL ordering of the data, which no bridge can see, so the refusal names that cause and
+    the remedy names the associative set.
     """
     for op_name in ("argmax", "argmin", "median", "quantile", "percentile"):
         with pytest.raises(errors.NonAssociativeReductionError) as refusal:
@@ -473,8 +635,7 @@ def test_cross_array_expression_is_refused() -> None:
 def test_dask_module_call_is_off_surface() -> None:
     """``da.sum(collection)`` is refused: the surface is the object API, and dask cannot coerce a lazy operand.
 
-    The analyzer understood ``da.sum(arr)`` because it inspected the graph; the runtime refuses it (dask's own coercion
-    trips the closed-surface guard) instead of letting a foreign library try to build a graph over the field.
+    Dask's own coercion trips the closed-surface guard, so a foreign library never gets to build a graph over the field.
     """
     with pytest.raises(errors.UnsupportedReductionError) as refusal:
         _run_callback("result = da.sum(arr)\nresult.compute()")
@@ -488,11 +649,10 @@ def test_fft_is_off_surface() -> None:
 
 
 def test_numpy_linalg_on_the_collection_is_refused() -> None:
-    """``np.linalg.norm(collection)`` is refused -- the analyzer's allowance was an unsound hole.
+    """``np.linalg.norm(collection)`` is refused: on the analytics host there is no chunk to consume.
 
-    In the analyzer-era delivery the callback received a dask array, so ``np.linalg.norm(arr)`` built a graph that
-    materialized the WHOLE field on the analytics host while registration saw nothing to refuse. The runtime hands over
-    a lazy operand, so numpy's coercion is refused at the point where the gather would have happened.
+    Numpy's coercion is refused at the point where the gather would have happened, so the whole field never
+    materializes on the analytics host. This closes an unsound hole; it is not a capability the runtime should acquire.
     """
     with pytest.raises(errors.MaterializationError):
         _run_callback("v = np.linalg.norm(arr)\ns = arr.sum()\nreturn s.compute(), v")
@@ -501,8 +661,8 @@ def test_numpy_linalg_on_the_collection_is_refused() -> None:
 def test_getattr_resolved_reduction_is_served() -> None:
     """``getattr(arr, 'sum')()`` is SERVED: the surface is the object, and the attribute really is ``sum``.
 
-    The analyzer refused this as an "unsupported call form" because it could not see WHICH op the string names. That was
-    an analysis limitation, not a semantic refusal: the runtime resolves the method and delivers the correct value.
+    The method is resolved at call time like any other attribute of the collection, so a computed operator name is not
+    an obstacle -- the reduction it produces is planned normally.
     """
     _, requests, _ = _run_callback("op = 'sum'\nresult = getattr(arr, op)()\nresult.compute()")
     assert [request.key for request in requests] == ["f-sum"]
@@ -530,7 +690,7 @@ def test_no_compute_boundary_plans_nothing() -> None:
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Delivered values: the analyzer's answer, computed by the runtime path
+# Delivered values: the whole-array answer, merged across two bridges
 # ---------------------------------------------------------------------------------------------------------------------
 FIELD = np.random.default_rng(7).normal(size=(8, 8))
 
@@ -685,11 +845,10 @@ def test_gysela_density_helper_plans_the_5d_axis_tuple_and_delivers_the_value() 
 def test_gysela_measure_helper_loop_reduces_five_expressions_per_species() -> None:
     """``measure()`` in the runtime spelling: five full reductions per species, on the same 5-D grid.
 
-    The analyzer-era fixture only asserted "at least five ``sum`` hints". This one asserts the VALUE of each quantity,
-    so a program attached to the wrong reduction cannot hide behind a count: ``f``, ``f**2``, ``f*vx``, ``f*vy`` and
-    ``f*v2`` are five separate requests, each folding its own program on every bridge's chunk. The grid constants
-    (``vx``/``vy``/``v2`` here, ``dvx``/``dvy``/``dV_4D`` in gysela) are applied to the DELIVERED value, which is the
-    closed-surface rewrite of ``da.sum(f * vx) * dV``.
+    The fixture asserts the VALUE of each quantity, so a program attached to the wrong reduction cannot hide behind a
+    count: ``f``, ``f**2``, ``f*vx``, ``f*vy`` and ``f*v2`` are five separate requests, each folding its own program on
+    every bridge's chunk. The grid constants (``vx``/``vy``/``v2`` here, ``dvx``/``dvy``/``dV_4D`` in gysela) are
+    applied to the DELIVERED value, which is the closed-surface rewrite of ``da.sum(f * vx) * dV``.
 
     The wire keys do NOT distinguish the five: a key names the array, the operator and the reduced axes, never the
     pointwise program (``ReductionExpr.key``), so the four derived folds share ``-axisall`` and one pass has TWO
