@@ -39,6 +39,7 @@ import numpy as np
 from deisa.core import ICommunicator
 
 from deisa.dask import Bridge
+from deisa.dask.utils import called_from_event_loop, run_coro_on_private_loop
 
 
 def wait_for(predicate, timeout=5.0, interval=0.01, nb_checks=1):
@@ -76,18 +77,34 @@ def dask_array_element_wise_equal(a, b):
     return (a.compute() == b.compute()).all(), "a and b are not equal"
 
 
+def _run_coro(coro):
+    """Run ``coro`` to completion from synchronous code, wherever that code runs.
+
+    ``asyncio.run()`` raises ``RuntimeError: asyncio.run() cannot be called from a running event loop`` -- and the
+    coroutine it was handed is then never awaited, which is what pytest reports as an unraisable exception during
+    teardown. Teardown reaches these helpers from whichever thread dropped the last reference to a simulation (the
+    collector, not the test), so a live loop on that thread is normal and the coroutine has to go to a private loop.
+
+    - ``:param coro:`` The coroutine to run.
+    - ``:return:`` Whatever ``coro`` returns.
+    """
+    if called_from_event_loop():
+        return run_coro_on_private_loop(coro)
+    return asyncio.run(coro)
+
+
 def async_map(iterable, func, *args, **kwargs):
     async def _f():
         return await asyncio.gather(*[asyncio.to_thread(func, item, *args, **kwargs) for item in iterable])
 
-    return asyncio.run(_f())
+    return _run_coro(_f())
 
 
 def async_close_bridges(bridges: List[Bridge], timestep: int):
     async def _close_bridges():
         await asyncio.gather(*[asyncio.to_thread(bridge.close, timestep=timestep) for bridge in bridges])
 
-    asyncio.run(_close_bridges())
+    _run_coro(_close_bridges())
 
 
 def run_on_all_ranks(comm_builder, fn):

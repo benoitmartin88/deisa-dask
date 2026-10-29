@@ -647,7 +647,7 @@ class TestUsingDaskCluster:
                 },
             )
 
-        del sim
+        sim.close()
 
         # del deisa
         deisa.execute_callbacks()

@@ -283,36 +283,32 @@ class Bridge(IBridge):
     def __del__(self):
         """Clean up resources before destruction.
 
-        Never runs a blocking collective at interpreter shutdown
-        (``sys.is_finalizing()``): ``close()`` synchronizes all bridges with an
-        MPI barrier, and at shutdown the peer ranks may already be torn down,
-        so that barrier would hang forever -- a hang is worse than an
-        exception.
+        Releases only what is NOT collective: the runtime plan pumps and the client. ``close()`` also synchronizes with
+        the other ranks (``comm.barrier()``, then the sub-comm ``Free()`` calls, then ``set_bridges_done``), and the
+        collector can never do that:
 
-        Never runs it from an event-loop callback either. The collector runs
-        ``__del__`` on whichever thread dropped the last reference, and for a
-        leaked bridge that is a distributed "IO loop" thread. ``close()``
-        synchronizes with the world (MPI barrier) and with the scheduler
-        (``Handshake.set_bridges_done`` -> ``Client.sync()``), and ``Client.sync()``
-        blocks the calling thread until the client's loop runs the callback: from
-        inside that very loop the callback can never run, so the thread sits out the
-        whole ``sync()`` timeout (60 s measured) and, with an in-process cluster whose
-        scheduler, workers and client share that loop, freezes the whole cluster.
+        - at interpreter shutdown (``sys.is_finalizing()``) the peer ranks may already be torn down;
+        - from an event-loop callback: the collector runs ``__del__`` on whichever thread dropped the last reference,
+          and for a leaked bridge that is a distributed "IO loop" thread. ``close()`` synchronizes with the world (MPI
+          barrier) and with the scheduler (``Handshake.set_bridges_done`` -> ``Client.sync()``), and ``Client.sync()``
+          blocks the calling thread until the client's loop runs the callback: from inside that very loop the callback
+          can never run, so the thread sits out the whole ``sync()`` timeout and, with an in-process cluster whose
+          scheduler, workers and client share that loop, freezes the whole cluster;
+        - during ordinary garbage collection: the collector finalizes unreachable objects ONE AT A TIME on a single
+          thread, so a ``k``-rank bridge finalized on its own waits at the barrier for peers the collector has not
+          reached yet -- a permanent hang of the interpreter (a leaked 4-rank simulation wedged a whole pytest run at
+          the next ``gc.collect()``).
 
-        During normal (non-shutdown) garbage collection from any other thread the
-        full ``close()`` still runs.
+        Deterministic teardown (:meth:`close`) is what frees the sub-comms and tells the host the bridges are done.
         """
-        if sys.is_finalizing():
-            logger.debug(f"[{self.id}] Bridge.__del__ during interpreter shutdown: skipping close()")
-            return
-        if called_from_event_loop():
+        if sys.is_finalizing() or called_from_event_loop():
             logger.debug(
-                f"[{self.id}] Bridge.__del__ from inside an event-loop callback: skipping close(), it would "
-                f"block the loop that has to service its collectives"
+                f"[{self.id}] Bridge.__del__ during interpreter shutdown or in an event-loop callback: skipping close()"
             )
             return
         try:
-            self.close(timestep=sys.maxsize)
+            self._has_close_been_called = True
+            self._release_client()
         except Exception:
             # Never raise from __del__. close() already logs its own errors.
             pass
@@ -348,13 +344,20 @@ class Bridge(IBridge):
                         assert self.client, "client cannot be None for Bridge id 0."
                         self.handshake.set_bridges_done(timestep=timestep)
 
-                if self.client:
-                    # The runtime plan pumps poll a dask queue through this client, so they leave the queue before it
-                    # goes away. A daemon thread, never a reason to fail a teardown.
-                    self._stop_runtime_plan_pumps()
-                    self.client.close()
+                self._release_client()
         except Exception as e:
             logger.error(f"[{self.id}] Could not cleanly close bridge. exception={e}")
+
+    def _release_client(self) -> None:
+        """Release the bridge's non-collective resources: the runtime plan pumps and the client.
+
+        Safe from any thread that is not running the client's own loop: it starts no collective and no ``sync()``.
+        """
+        if self.client:
+            # The runtime plan pumps poll a dask queue through this client, so they leave the queue before it
+            # goes away. A daemon thread, never a reason to fail a teardown.
+            self._stop_runtime_plan_pumps()
+            self.client.close()
 
     def send(self, array_name: str, chunk: np.ndarray, timestep: Union[int, np.ndarray], *args, **kwargs):
         """
