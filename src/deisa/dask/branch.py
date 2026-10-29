@@ -67,7 +67,7 @@ _BRANCH_KIND_PCA = "pca"
 
 # The op name recorded for a PCA branch. It is NOT a dask reduction op: it names the decomposition the bridge runs, so
 # it takes the same path through ``output_key`` (``{array}-pca``), ``op_name`` and the dispatch signatures as every
-# other op without pretending to be one of the analyzer's ``SUPPORTED_OPS`` (now in ``test/_oracle/task_branches.py``).
+# other op without pretending to be one of the dask reductions the runtime tables of this module key on.
 _PCA_OP_NAME = "pca"
 
 
@@ -88,9 +88,9 @@ _SCALAR_FOLDS = {
     "count": lambda entries: np.sum(entries, axis=0),
 }
 
-# Bridge-local finishing step for a FULL local fold (the analyzer that composes it lives in
-# ``test/_oracle/branch_specs.py::_apply_full_local_fold``): reduce dask's tier-shaped
-# chunk-stage output down to the minimal per-bridge partial the operator's combine can consume. Generic by design --
+# Bridge-local finishing step for a FULL local fold (the second chain stage, :func:`_full_fold_layer` paired with a
+# finalizer from ``_FULL_FOLD_FINALIZERS``): reduce dask's tier-shaped chunk-stage output down to the minimal
+# per-bridge partial the operator's combine can consume. Generic by design --
 # the table is keyed by op name and no build path special-cases an operator. ``mean``/``moment`` never reach here:
 # their tier-shaped dict partials are REQUIRED by ``mean_agg`` / ``moment_agg`` (a bare scalar cannot carry
 # ``(n, total[, M])``), which is a mathematical property, not a chunk-func signature accident. The finalizers are

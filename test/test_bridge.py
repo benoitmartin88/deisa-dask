@@ -190,6 +190,7 @@ class TestBridge:
 
         asyncio.run(_bridge_close())
 
+
 class TestPrecomputeRegressions:
     """Regression tests for bridge delivery and interpreter-shutdown teardown."""
 
