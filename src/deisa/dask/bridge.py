@@ -50,6 +50,7 @@ import threading
 import uuid
 import zlib
 from collections import defaultdict, deque
+from dataclasses import dataclass
 from numbers import Number
 from typing import Any, Deque, Dict, Final, Iterator, List, Mapping, Optional, Tuple, Union
 
@@ -85,6 +86,23 @@ try:
 except Exception:
     logger.warning("mpi4py not available.")
     _UNDEFINED = 2147483647
+
+
+@dataclass(frozen=True)
+class TaskState:
+    """One array's delivery state, as the analytics host filed it in the handshake actor.
+
+    PRESENCE of the array name in ``Bridge._task_states`` -- not a value -- is the fetch marker: a state with no flag
+    set is a valid cached result, so an empty state is cached exactly like any other.
+
+    - ``:param runtime:`` The host declared a ``precompute=True`` callback on the array, i.e. the array is a
+      runtime-delivery target: its eager menu and its on-demand plans answer its callbacks.
+    - ``:param legacy:`` The host declared a ``precompute=False`` callback on the array, i.e. something reads the chunk
+      itself.
+    """
+
+    runtime: bool = False
+    legacy: bool = False
 
 
 class Bridge(IBridge):
@@ -130,17 +148,11 @@ class Bridge(IBridge):
         self._array_comms: Dict[str, Any] = {}  # array_name -> sub-comm (from comm.Split)
         self._handshake_metadata = None
 
-        # Arrays this bridge has already read its scheduling state for (one broadcast per array, cached forever: a
-        # state with no flag set is a valid cached result, so membership -- not the value -- is the sentinel).
-        self._task_state_fetched: set[str] = set()
-        # Arrays the analytics host declared as runtime-delivery targets (fetched in the same per-array state read, one
-        # bcast per array). An array outside this set has no callback that can read an eager menu, so ``send`` folds
-        # nothing for it -- the menu of an array nobody subscribes to is pure critical-path cost.
-        self._runtime_delivery_arrays: set[str] = set()
-        # Arrays that still have a LEGACY (``precompute=False``) reader, i.e. a callback that reads the chunk itself.
-        # Fetched in the SAME handshake read as the set above: a runtime-delivery array with no legacy reader needs no
-        # data shipped at all -- its menu and its on-demand plans answer every callback it has.
-        self._legacy_delivery_arrays: set[str] = set()
+        # Each array's delivery state, fetched ONCE per array and cached forever: one broadcast per array on the
+        # handshake read. Membership -- not a stored flag -- is the fetch marker (a state with no flag set is a valid
+        # cached result), so a send after the first never touches the handshake again. An array outside this table has
+        # no known delivery state, so ``send`` ships its chunk.
+        self._task_states: Dict[str, TaskState] = {}
         # Runtime reduction transport: the array's plan queues live only on the rank that owns its dask client, the
         # backlog exists on every rank (the others receive the requests through the sub-comm broadcast), and the
         # retained chunk is the one this bridge last sent -- what an on-demand request for that timestep folds.
@@ -743,7 +755,8 @@ class Bridge(IBridge):
         - ``:param timestep:`` Timestep the chunk belongs to; every menu value is stamped with it, which is what lets
           the analytics side refuse a menu value of an earlier timestep.
         """
-        if array_name not in self._runtime_delivery_arrays:
+        state = self._task_states.get(array_name)
+        if state is None or not state.runtime:
             return None, None
         metadata = self.arrays_metadata[array_name]
         collection = DeisaCollection.from_metadata(array_name, timestep, metadata)
@@ -955,40 +968,6 @@ class Bridge(IBridge):
             out = list(out.values())[0]
         return out
 
-    def _fetch_task_state_bcast(self, array_name: str) -> Optional[dict]:
-        """Mirror of the per-array bcast protocol for an array's scheduling state.
-
-        Sub-comm rank 0 reads ``{"runtime", "legacy"}`` from the handshake actor and broadcasts it; every
-        other participating rank receives via ``bcast(None)``. Every fact travels in ONE collective on purpose: a
-        second broadcast would have to be entered in the same order on every rank of the sub-comm, i.e. one more way to
-        hang the array for one dict entry. Returns None when this bridge does not participate in the array's sub-comm.
-        Callers decide caching (None is NOT a cached result)."""
-        sub_comm = self._array_comms.get(array_name)
-        if sub_comm is None or sub_comm is _COMM_NULL:
-            return None
-        if sub_comm.Get_rank() == 0 and self.handshake is not None:
-            state = self.handshake.get_task_state(array_name)
-            sub_comm.bcast(state, root=0)
-        else:
-            state = sub_comm.bcast(None, root=0)
-        return state
-
-    def _cache_task_state(self, array_name: str, state: dict) -> None:
-        """Store one array's fetched scheduling state in the local caches.
-
-        - ``:param array_name:`` Registered array the state belongs to.
-        - ``:param state:`` The ``{"runtime", "legacy"}`` dict fetched (or broadcast) for it.
-        """
-        self._task_state_fetched.add(array_name)
-        if state.get("runtime"):
-            self._runtime_delivery_arrays.add(array_name)
-        else:
-            self._runtime_delivery_arrays.discard(array_name)
-        if state.get("legacy"):
-            self._legacy_delivery_arrays.add(array_name)
-        else:
-            self._legacy_delivery_arrays.discard(array_name)
-
     def _needs_chunk_delivery(self, array_name: str) -> bool:
         """Whether ``send`` must scatter this array's data at all.
 
@@ -999,23 +978,39 @@ class Bridge(IBridge):
 
         - ``:param array_name:`` Registered array the send is for.
         """
-        return array_name not in self._runtime_delivery_arrays or array_name in self._legacy_delivery_arrays
+        state = self._task_states.get(array_name)
+        if state is None:
+            return True
+        return state.legacy or not state.runtime
 
     def _ensure_task_state(self, array_name: str) -> None:
-        """Fetch this array's per-array scheduling state once and cache its facts.
+        """Fetch this array's delivery state once and cache it in ``_task_states``.
 
         The bridge reads ``{"runtime", "legacy"}`` from the handshake actor on sub-comm rank 0 and broadcasts it to the
-        other participating ranks. After one fetch, sends never touch the handshake: membership in
-        ``_task_state_fetched`` -- not a stored value -- is what marks an array as fetched, so a state with no flag set
-        (the common case) is cached just like any other.
+        other participating ranks. Every fact travels in ONE collective on purpose: a second broadcast would have to be
+        entered in the same order on every rank of the sub-comm, i.e. one more way to hang the array for one dict entry.
+        After one fetch, sends never touch the handshake: membership in ``_task_states`` -- not a stored value -- is
+        what marks an array as fetched, so a state with no flag set (the common case) is cached just like any other.
+        A rank that does not participate in the array's sub-comm leaves it unfetched, and an unfetched read (a ``None``
+        state, which is NOT a cached result) leaves it unfetched too.
 
         - ``:param array_name:`` The array name to fetch state for.
         """
-        if array_name in self._task_state_fetched:
+        if array_name in self._task_states:
             return
-        state = self._fetch_task_state_bcast(array_name)
+        sub_comm = self._array_comms.get(array_name)
+        if sub_comm is None or sub_comm is _COMM_NULL:
+            return
+        if sub_comm.Get_rank() == 0 and self.handshake is not None:
+            state = self.handshake.get_task_state(array_name)
+            sub_comm.bcast(state, root=0)
+        else:
+            state = sub_comm.bcast(None, root=0)
         if state is not None:
-            self._cache_task_state(array_name, state)
+            self._task_states[array_name] = TaskState(
+                runtime=bool(state.get("runtime")),
+                legacy=bool(state.get("legacy")),
+            )
 
     def _prefetch_task_state(self) -> None:
         """Prefetch the per-array scheduling state of every global array into the local cache.

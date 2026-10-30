@@ -52,7 +52,7 @@ from utils import FakeComm
 
 from deisa.dask import deisa as deisa_module
 from deisa.dask import runtime_errors as errors
-from deisa.dask.bridge import Bridge
+from deisa.dask.bridge import Bridge, TaskState
 from deisa.dask.collection import DeisaCollection
 from deisa.dask.deisa import Deisa
 from deisa.dask.handshake import Handshake
@@ -771,9 +771,10 @@ def test_mixed_array_still_gets_the_full_chunk(fleets, client, monkeypatch):
 
     bridge, wire_client = _make_send_bridge()
     # Start from an empty cache, like a bridge taking its state from the handshake read.
-    bridge._runtime_delivery_arrays = set()
-    bridge._legacy_delivery_arrays = set()
-    bridge._cache_task_state(ARRAY_NAME, state)
+    bridge._task_states = {}
+    bridge.handshake = _WireHandshake(state)
+    bridge._ensure_task_state(ARRAY_NAME)
+    assert bridge._task_states[ARRAY_NAME] == TaskState(runtime=True, legacy=True)
     assert bridge._needs_chunk_delivery(ARRAY_NAME), "a legacy reader on the array keeps the chunk delivery"
 
     scattered = []
@@ -804,7 +805,7 @@ def test_runtime_only_array_ships_its_menu_and_no_data(monkeypatch):
     scheduler (an empty ``update_data`` + an empty desire list would be pure round trips).
     """
     bridge, wire_client = _make_send_bridge()
-    bridge._legacy_delivery_arrays = set()
+    bridge._task_states = {ARRAY_NAME: TaskState(runtime=True, legacy=False)}
     scattered = []
 
     def recording_scatter(*args, **kwargs):
@@ -857,11 +858,9 @@ def test_first_send_on_lazy_path_ships_no_data():
     Witness from K7F-06/27f3a68, adapted to the post-K8 surface (no branch machinery left to stub).
     """
     bridge, wire_client = _make_send_bridge()
-    # The lazy-path state at the first send: nothing prefetched, so every cache is empty and the handshake is the only
-    # source. Runtime target with no legacy reader -- the data-free shape.
-    bridge._task_state_fetched = set()
-    bridge._runtime_delivery_arrays = set()
-    bridge._legacy_delivery_arrays = set()
+    # The lazy-path state at the first send: nothing prefetched, so the state cache is empty and the handshake is the
+    # only source. Runtime target with no legacy reader -- the data-free shape.
+    bridge._task_states = {}
     handshake = _WireHandshake({"runtime": True, "legacy": False})
     bridge.handshake = handshake
 
@@ -883,7 +882,9 @@ def test_first_send_on_lazy_path_ships_no_data():
 
     assert handshake.reads == [ARRAY_NAME], "the first send must read the array's delivery state"
     assert scattered == [], "the FIRST send of a runtime-only array must not scatter the chunk"
-    assert bridge._runtime_delivery_arrays == {ARRAY_NAME}, "the fetch must fill the cache the decision needs"
+    assert bridge._task_states[ARRAY_NAME] == TaskState(runtime=True, legacy=False), (
+        "the fetch must fill the cache the decision needs"
+    )
     _, payload = wire_client.events[0]
     assert payload["futures"] == [], "the event must not name data that was never shipped"
     assert len(payload["menu"]) == 1, "the menu IS the payload on the data-free path"
@@ -1059,16 +1060,13 @@ def _make_send_bridge():
     bridge.workers = {"worker-0": {}}
     bridge.arrays_metadata = WIRE_METADATA
     bridge._array_comms = {ARRAY_NAME: FakeComm(FakeComm.State(1), 0)}
-    # The menu is gated on the array being a runtime-delivery target, so declare it; its chunk stage is not this
-    # test's subject.
-    bridge._runtime_delivery_arrays = {ARRAY_NAME}
-    # ... and declare it a legacy (chunk-reading) array too, so these tests keep measuring the full-chunk payload.
-    # The data-free path (runtime target and no legacy reader) has its own test below.
-    bridge._legacy_delivery_arrays = {ARRAY_NAME}
-    # No handshake: the two facts above are already the cached state, so ``send`` must find the array fetched and
-    # never enter the per-array broadcast (``_task_state_fetched`` membership is the fetch marker).
+    # The cached delivery state, as the init-time prefetch leaves it: a runtime-delivery target AND a legacy
+    # (chunk-reading) array, so these tests keep measuring the full-chunk payload. The data-free path (runtime target
+    # and no legacy reader) has its own test below.
+    bridge._task_states = {ARRAY_NAME: TaskState(runtime=True, legacy=True)}
+    # No handshake: the state above is already the cached result, so ``send`` must find the array fetched and never
+    # enter the per-array broadcast (presence in ``_task_states`` is the fetch marker).
     bridge.handshake = None
-    bridge._task_state_fetched = {ARRAY_NAME}
     bridge._runtime_plan_backlog = {}
     bridge._runtime_plan_report_queues = {}
     bridge._runtime_last_chunk = {}
