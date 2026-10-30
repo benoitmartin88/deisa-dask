@@ -105,6 +105,119 @@ class TaskState:
     legacy: bool = False
 
 
+class PlanPump:
+    """The runtime reduction transport of ONE array on ONE bridge: its backlog, its stop flag and its poll thread.
+
+    Every participating rank gets a pump, and the ``backlog`` is unconditional: presence of the array in
+    ``Bridge._plan_pumps`` is what makes ``send`` enter the array's boundary collective. Gating it on a per-process
+    setting made the root issue a ``bcast`` while its peers went straight to the scatter -- two different collectives
+    on one communicator, i.e. a hang instead of a refusal. The array's participating set is the same on every rank, so
+    the pumps are too.
+
+    The queue-polling ``thread`` and the ``report_queue`` exist only on the sub-comm root that owns the array's dask
+    client: one consumer per array fans the requests out through the boundary broadcast, which is enough.
+
+    The pump owns its array identity (name, sub-comm, chunk position), so :meth:`serve` -- the send-boundary half --
+    only needs the chunk ``send`` retained.
+    """
+
+    def __init__(self, array_name: str, sub_comm: Any, chunk_position: Any, bridge_id: int):
+        """
+        - ``:param array_name:`` Registered array this pump transports.
+        - ``:param sub_comm:`` The array's sub-communicator on this rank (never ``None`` / ``_COMM_NULL``).
+        - ``:param chunk_position:`` The array's chunk coordinates on this rank, stamped on every report.
+        - ``:param bridge_id:`` The owning bridge's rank, for the thread name and the logs.
+        """
+        self.array_name = array_name
+        self.sub_comm = sub_comm
+        self.chunk_position = chunk_position
+        self.bridge_id = bridge_id
+        self.backlog = PlanRequestBacklog()
+        self.report_queue: Optional[Any] = None
+        self.stop = threading.Event()
+        self.thread: Optional[threading.Thread] = None
+
+    def start(self, client: Optional[Client]) -> None:
+        """Attach the array's plan-request thread, if this rank is the one that can reach the queues.
+
+        The transport is a pair of dask queues per array, named by convention (``plan_request_queue_name`` /
+        ``plan_report_queue_name``), so the host and the bridges agree without exchanging anything. Only the rank that
+        owns the array's dask client can reach them, which is the array sub-comm's root; a rank without a client starts
+        no queue and no thread (its pump still answers through the boundary broadcast).
+
+        - ``:param client:`` The bridge's dask client, or ``None`` on a rank that has none.
+        """
+        if self.sub_comm.Get_rank() != 0 or client is None:
+            return
+        self.report_queue = Queue(plan_report_queue_name(self.array_name), client=client)
+        request_queue = Queue(plan_request_queue_name(self.array_name), client=client)
+        self.thread = threading.Thread(
+            target=serve_plan_queue,
+            args=(request_queue, self.backlog, self.stop),
+            name=f"deisa-plan-{self.array_name}-{self.bridge_id}",
+            daemon=True,
+        )
+        self.thread.start()
+        logger.debug(f"[{self.bridge_id}] runtime plan pump started for array '{self.array_name}'")
+
+    def stop_and_join(self) -> None:
+        """Stop the plan-request thread and wait briefly for it to leave its queue poll.
+
+        Called before the client goes away: the thread polls a dask queue through that client, so it must be off the
+        queue first. A thread that does not stop within the timeout is left to the daemon flag rather than blocking the
+        teardown of the whole bridge. A pump that never started (no client, or a non-root rank) has no thread: its stop
+        flag is set and nothing waits.
+        """
+        self.stop.set()
+        if self.thread is not None:
+            self.thread.join(timeout=5.0)
+            if self.thread.is_alive():  # pragma: no cover - only reachable on a wedged scheduler
+                logger.warning(
+                    f"[{self.bridge_id}] runtime plan pump {self.thread.name} did not stop within the timeout"
+                )
+        self.thread = None
+        self.report_queue = None
+
+    def serve(self, last_chunk: Tuple[Any, Any]) -> None:
+        """Answer the on-demand reduction requests that arrived since the previous ``send`` for this array.
+
+        Called at the send boundary, where every rank of the array is about to enter the same collectives: the root
+        broadcasts the requests it collected, every rank folds its OWN chunk with the requested program, and the root
+        posts the reports back to the host. The chunk is this rank's last-sent chunk, which is why it is retained --
+        the host's request for timestep N necessarily arrives after ``send`` returned for N.
+
+        A request whose timestep this rank no longer holds is answered with an error report by ``PlanResponder``: the
+        host refuses the set rather than merging a partial from another timestep.
+
+        - ``:param last_chunk:`` The ``(timestep, chunk)`` this bridge last sent for the array, or ``(None, None)``
+          when it has sent nothing yet.
+        """
+        requests = self.backlog.drain()  # only the root has a pump thread; every other rank has an empty backlog
+        if self.sub_comm.Get_size() > 1:
+            requests = self.sub_comm.bcast(requests, root=0)
+        if not requests:
+            return
+        served_timestep, served_chunk = last_chunk
+        rank = self.sub_comm.Get_rank()
+        for plan in requests:
+            responder = PlanResponder(
+                self.array_name,
+                served_timestep,
+                served_chunk,
+                rank=rank,
+                chunk_position=self.chunk_position,
+            )
+            report = responder.respond(plan)
+            reports = self.sub_comm.gather(report, root=0) if self.sub_comm.Get_size() > 1 else [report]
+            if rank == 0 and self.report_queue is not None:
+                for answered in reports or ():
+                    self.report_queue.put(answered)
+            logger.debug(
+                f"[{self.bridge_id}] served plan {plan.request_id} for array '{self.array_name}' "
+                f"at timestep {served_timestep}"
+            )
+
+
 class Bridge(IBridge):
     def __init__(self, comm: ICommunicator, arrays_metadata: Dict[str, Dict], *args, **kwargs):
         """
@@ -153,13 +266,11 @@ class Bridge(IBridge):
         # cached result), so a send after the first never touches the handshake again. An array outside this table has
         # no known delivery state, so ``send`` ships its chunk.
         self._task_states: Dict[str, TaskState] = {}
-        # Runtime reduction transport: the array's plan queues live only on the rank that owns its dask client, the
-        # backlog exists on every rank (the others receive the requests through the sub-comm broadcast), and the
-        # retained chunk is the one this bridge last sent -- what an on-demand request for that timestep folds.
-        self._runtime_plan_backlog: Dict[str, PlanRequestBacklog] = {}
-        self._runtime_plan_report_queues: Dict[str, Any] = {}
-        self._runtime_plan_stops: Dict[str, threading.Event] = {}
-        self._runtime_plan_threads: Dict[str, threading.Thread] = {}
+        # Runtime reduction transport, one PlanPump per participating array: its plan backlog, its stop flag, its
+        # report queue and its polling thread live there. Presence in this table -- not a flag -- is what makes
+        # ``send`` enter the array's boundary collective.
+        self._plan_pumps: Dict[str, PlanPump] = {}
+        # The retained chunk is the one this bridge last sent -- what an on-demand request for that timestep folds.
         self._runtime_last_chunk: Dict[str, Tuple[int, Any]] = {}
 
         if self.id == 0:
@@ -457,8 +568,9 @@ class Bridge(IBridge):
         # cost is one retained chunk reference per array per bridge (replaced, not accumulated) for every array this
         # rank participates in, flag or no flag: a rank whose own flag is off still has to answer a request its root
         # broadcast, so neither the collective nor the retention may depend on the per-process flag.
-        if array_name in self._runtime_plan_backlog:
-            self._serve_pending_plans(array_name, sub_comm)
+        pump = self._plan_pumps.get(array_name)
+        if pump is not None:
+            pump.serve(self._runtime_last_chunk.get(array_name, (None, None)))
             self._runtime_last_chunk[array_name] = (int(timestep), chunk)
 
         # Fetch (and cache) the array's delivery state BEFORE deciding whether data must ship: on the lazy path
@@ -617,114 +729,44 @@ class Bridge(IBridge):
         # TODO: what to do if error ?
 
     def _start_runtime_plan_pumps(self) -> None:
-        """Attach the runtime reduction transport of every array this bridge roots: one plan-request thread each.
+        """Attach the runtime reduction transport of every array this bridge participates in: one PlanPump each.
 
-        The transport is a pair of dask queues per array, named by convention (``plan_request_queue_name`` /
-        ``plan_report_queue_name``), so the host and the bridges agree without exchanging anything. Only the rank that
-        owns the array's dask client can reach them, which is the array sub-comm's root -- and that is enough: the root
-        broadcasts a request to its peers at the next send boundary, where every rank of the array is already parked in
-        a sub-comm collective.
+        Every participating rank gets a pump, and its backlog is unconditional, because presence in ``_plan_pumps`` is
+        what makes ``send`` enter the boundary collective. Gating that on a per-process setting made the ``send``
+        boundary a ``bcast`` on one rank and a plain scatter on another: two different collectives on the same
+        communicator, i.e. a hang instead of a loud refusal. The array's participating set is the same everywhere, so
+        the pumps are too.
 
-        Two things are deliberately NOT gated:
-
-        - the per-array :class:`PlanRequestBacklog`, which every participating rank gets unconditionally, because its
-          presence is what makes ``send`` enter the boundary collective. Gating it on a per-process setting made the
-          ``send`` boundary a ``bcast`` on one rank and a plain scatter on another: two different collectives on the
-          same communicator, i.e. a hang instead of a loud refusal. The array's participating set is the same
-          everywhere, so the backlog is too.
-        - the broadcast itself: every rank enters it every timestep, and a rank with no request simply gets an empty
-          list back. The cost is one small collective per array per ``send`` when nothing is on demand.
-
-        The idle cost is one queue-polling thread per array on the rank that owns the dask client. It runs for the
-        life of the bridge because the first on-demand request can arrive as soon as the first delivered timestep; the
-        thread exists to answer it, not because a callback was registered yet. An array this rank does not participate
-        in gets neither a backlog nor a pump.
+        Two things are deliberately not gated: the broadcast itself (every rank enters it every timestep, and a rank
+        with no request simply gets an empty list back -- one small collective per array per ``send``), and the pump
+        thread's lifetime. The idle cost is one queue-polling thread per array on the rank that owns the dask client;
+        it runs for the life of the bridge because the first on-demand request can arrive as soon as the first
+        delivered timestep, not because a callback was registered yet. An array this rank does not participate in gets
+        neither a backlog nor a pump.
         """
         for array_name, sub_comm in self._array_comms.items():
             if sub_comm is None or sub_comm is _COMM_NULL:
                 continue
-            self._runtime_plan_backlog[array_name] = PlanRequestBacklog()
-        for array_name, sub_comm in self._array_comms.items():
-            if sub_comm is None or sub_comm is _COMM_NULL:
-                continue
-            if sub_comm.Get_rank() != 0 or self.client is None:
-                continue
-            self._runtime_plan_report_queues[array_name] = Queue(plan_report_queue_name(array_name), client=self.client)
-            request_queue = Queue(plan_request_queue_name(array_name), client=self.client)
-            stop = threading.Event()
-            self._runtime_plan_stops[array_name] = stop
-            thread = threading.Thread(
-                target=serve_plan_queue,
-                args=(request_queue, self._runtime_plan_backlog[array_name], stop),
-                name=f"deisa-plan-{array_name}-{self.id}",
-                daemon=True,
+            self._plan_pumps[array_name] = PlanPump(
+                array_name,
+                sub_comm,
+                self.arrays_metadata.get(array_name, {}).get("chunk_position", ()),
+                self.id,
             )
-            thread.start()
-            self._runtime_plan_threads[array_name] = thread
-            logger.debug(f"[{self.id}] runtime plan pump started for array '{array_name}'")
+        for pump in self._plan_pumps.values():
+            pump.start(self.client)
 
     def _stop_runtime_plan_pumps(self) -> None:
-        """Stop the plan-request threads and wait briefly for them to leave their queue poll.
+        """Stop every array's plan pump and wait briefly for its thread to leave the queue poll.
 
         Called from ``close()`` before the client goes away: the threads poll a dask queue through that client, so they
-        must be off the queue first. A thread that does not stop within the timeout is left to the daemon flag rather
-        than blocking the teardown of the whole bridge.
+        must be off the queue first. The defensive ``getattr`` covers ``__del__`` on a half-built bridge, where the pump
+        table may not exist yet.
         """
-        stops = list(getattr(self, "_runtime_plan_stops", {}).values())
-        for stop in stops:
-            stop.set()
-        threads = getattr(self, "_runtime_plan_threads", {})
-        for thread in threads.values():
-            thread.join(timeout=5.0)
-        stale = [thread.name for thread in threads.values() if thread.is_alive()]
-        if stale:  # pragma: no cover - only reachable on a wedged scheduler
-            logger.warning(f"[{self.id}] runtime plan pump(s) {stale} did not stop within the timeout")
-        threads.clear()
-        getattr(self, "_runtime_plan_stops", {}).clear()
-        getattr(self, "_runtime_plan_report_queues", {}).clear()
-
-    def _serve_pending_plans(self, array_name: str, sub_comm: Any) -> None:
-        """Answer the on-demand reduction requests that arrived since the previous ``send`` for ``array_name``.
-
-        Called at the send boundary, where every rank of the array is about to enter the same collectives: the root
-        broadcasts the requests it collected, every rank folds its OWN chunk with the requested program, and the root
-        posts the reports back to the host. The chunk is this rank's last-sent chunk, which is why it is retained --
-        the host's request for timestep N necessarily arrives after ``send`` returned for N.
-
-        A request whose timestep this rank no longer holds is answered with an error report by ``PlanResponder``: the
-        host refuses the set rather than merging a partial from another timestep.
-
-        - ``:param array_name:`` Registered array the send is for.
-        - ``:param sub_comm:`` The array's sub-communicator (this rank is a member).
-        """
-        backlog = self._runtime_plan_backlog.get(array_name)
-        if backlog is None:
-            return
-        requests = backlog.drain()  # only the root has a pump thread; every other rank has an empty backlog
-        if sub_comm.Get_size() > 1:
-            requests = sub_comm.bcast(requests, root=0)
-        if not requests:
-            return
-        served_timestep, served_chunk = self._runtime_last_chunk.get(array_name, (None, None))
-        rank = sub_comm.Get_rank()
-        metadata = self.arrays_metadata.get(array_name, {})
-        report_queue = self._runtime_plan_report_queues.get(array_name)
-        for plan in requests:
-            responder = PlanResponder(
-                array_name,
-                served_timestep,
-                served_chunk,
-                rank=rank,
-                chunk_position=metadata.get("chunk_position", ()),
-            )
-            report = responder.respond(plan)
-            reports = sub_comm.gather(report, root=0) if sub_comm.Get_size() > 1 else [report]
-            if rank == 0 and report_queue is not None:
-                for answered in reports or ():
-                    report_queue.put(answered)
-            logger.debug(
-                f"[{self.id}] served plan {plan.request_id} for array '{array_name}' at timestep {served_timestep}"
-            )
+        pumps = getattr(self, "_plan_pumps", {})
+        for pump in pumps.values():
+            pump.stop_and_join()
+        pumps.clear()
 
     def _build_runtime_menu(
         self,

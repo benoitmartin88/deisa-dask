@@ -32,7 +32,7 @@ The PRODUCTION transport of the runtime reduction path: the host's queue exchang
 Nothing in this file injects a transport. The host half is ``Deisa._attach_runtime_transports`` -- the exact call
 ``Deisa.__init__`` makes -- over real ``distributed.Queue`` objects, and the bridge half is the production SHAPE of the
 array side: exactly ONE queue consumer per array (the root bridge's ``serve_plan_queue`` thread), the requests parked
-in the root's ``PlanRequestBacklog``, and ``Bridge._serve_pending_plans`` doing the folding at the send boundary. One
+in the root's ``PlanRequestBacklog``, and ``PlanPump.serve`` doing the folding at the send boundary. One
 consumer is what production has, and a per-rank pump harness (N consumers) hides the failure mode that matters: one
 request handed to one consumer must produce exactly N reports for N bridges, not N per copy of the request.
 
@@ -61,7 +61,7 @@ from deisa.dask import bridge as bridge_module
 from deisa.dask import deisa as deisa_module
 from deisa.dask import runtime_dispatch as runtime_dispatch_module
 from deisa.dask import runtime_errors as errors
-from deisa.dask.bridge import Bridge
+from deisa.dask.bridge import Bridge, PlanPump
 from deisa.dask.collection import DeisaCollection
 from deisa.dask.deisa import Deisa
 from deisa.dask.runtime_compose import compose_request
@@ -116,19 +116,26 @@ def make_plan(timestep=0, axes=(0,)):
     return PlanRequest(request_id=uuid.uuid4().hex, array_name=ARRAY_NAME, timestep=timestep, request=request)
 
 
-def make_bridge_stub(rank, timestep, chunk, report_queue):
+def make_bridge_stub(rank, timestep, chunk, report_queue, sub_comm):
     """One bridge, with exactly the transport state ``Bridge.__init__`` gives it, and nothing else.
 
-    ``_runtime_plan_backlog`` is the production state (every participating rank has one, flag or no flag);
+    The array's ``PlanPump`` is the production state (every participating rank has one, flag or no flag);
     ``_runtime_last_chunk`` is what the last ``send`` retained; only the array root owns a report queue.
     """
     bridge = Bridge.__new__(Bridge)
     bridge.id = rank
     bridge.arrays_metadata = {ARRAY_NAME: {**METADATA[ARRAY_NAME], "chunk_position": chunk_position(rank)}}
-    bridge._runtime_plan_backlog = {ARRAY_NAME: PlanRequestBacklog()}
+    pump = PlanPump(ARRAY_NAME, sub_comm, chunk_position(rank), rank)
+    if rank == 0:
+        pump.report_queue = report_queue
+    bridge._plan_pumps = {ARRAY_NAME: pump}
     bridge._runtime_last_chunk = {ARRAY_NAME: (timestep, chunk)}
-    bridge._runtime_plan_report_queues = {ARRAY_NAME: report_queue} if rank == 0 else {}
     return bridge
+
+
+def serve_boundary(bridge):
+    """Drive one rank's send boundary: the array's pump folds whatever chunk the last ``send`` retained."""
+    bridge._plan_pumps[ARRAY_NAME].serve(bridge._runtime_last_chunk.get(ARRAY_NAME, (None, None)))
 
 
 def make_deisa_stub(client, monkeypatch, transports=None):
@@ -225,22 +232,24 @@ def test_two_successive_axis_folds_are_served_by_the_production_transport(client
     assert isinstance(deisa._runtime_transports[ARRAY_NAME], QueuePlanExchange)
     deisa._topic_handlers[ARRAY_NAME] = deisa._make_topic_handler(ARRAY_NAME)
 
-    bridges = [make_bridge_stub(rank, 0, per_timestep[0][rank], report_queue) for rank in range(bridge_count)]
     state = FakeComm.State(bridge_count)
     comms = [FakeComm(state, rank) for rank in range(bridge_count)]
+    bridges = [
+        make_bridge_stub(rank, 0, per_timestep[0][rank], report_queue, comms[rank]) for rank in range(bridge_count)
+    ]
     stop = threading.Event()
 
     def boundary(rank):
         """One rank's send boundary, re-entered like the simulation re-enters it: in lockstep with every peer."""
         while not stop.is_set():
-            bridges[rank]._serve_pending_plans(ARRAY_NAME, comms[rank])
+            serve_boundary(bridges[rank])
             time.sleep(0.002)
 
     # ONE consumer for the whole array, exactly as ``Bridge._start_runtime_plan_pumps`` starts it.
     pump_stop = threading.Event()
     pump = threading.Thread(
         target=serve_plan_queue,
-        args=(request_queue, bridges[0]._runtime_plan_backlog[ARRAY_NAME], pump_stop),
+        args=(request_queue, bridges[0]._plan_pumps[ARRAY_NAME].backlog, pump_stop),
         name="plan-pump-root",
         daemon=True,
     )
@@ -332,49 +341,49 @@ def test_backlog_belongs_to_every_participating_array(monkeypatch):
     bridge = Bridge.__new__(Bridge)
     bridge.id = 0
     bridge.client = None  # this rank owns no dask client: nothing to poll a queue through
-    bridge._runtime_plan_backlog = {}
-    bridge._runtime_plan_threads = {}
-    bridge._runtime_plan_stops = {}
-    bridge._runtime_plan_report_queues = {}
+    bridge.arrays_metadata = METADATA
+    bridge._plan_pumps = {}
     bridge._array_comms = {ARRAY_NAME: FakeComm(FakeComm.State(1), 0), "not-mine": bridge_module._COMM_NULL}
 
     bridge._start_runtime_plan_pumps()
 
-    assert set(bridge._runtime_plan_backlog) == {ARRAY_NAME}, (
-        "every participating array needs a backlog, so the send boundary is the same collective on every rank"
+    assert set(bridge._plan_pumps) == {ARRAY_NAME}, (
+        "every participating array needs a pump, so the send boundary is the same collective on every rank"
     )
-    assert bridge._runtime_plan_threads == {}, "the queue pump is what the client gate stops"
-    assert bridge._runtime_plan_report_queues == {}, "no queue is touched without a client"
+    pump = bridge._plan_pumps[ARRAY_NAME]
+    assert pump.thread is None, "the queue pump is what the client gate stops"
+    assert pump.report_queue is None, "no queue is touched without a client"
 
 
 def test_bridge_send_boundary_serves_the_backlog_over_the_sub_comm(client):
-    """``Bridge._serve_pending_plans`` -- the send-boundary half -- broadcasts, folds every chunk and answers."""
+    """``PlanPump.serve`` -- the send-boundary half -- broadcasts, folds every chunk and answers."""
     field = make_field(seed=1)
     chunks = split_chunks(field)
     plan = make_plan(axes=(0,))
 
     state = FakeComm.State(len(chunks))
     report_queue = Queue(plan_report_queue_name(ARRAY_NAME), client=client)
+    comms = [FakeComm(state, rank) for rank in range(len(chunks))]
     bridges = []
-    backlogs = []
+    pumps = []
     for rank, chunk in enumerate(chunks):
         bridge = Bridge.__new__(Bridge)
         bridge.id = rank
         bridge.arrays_metadata = {ARRAY_NAME: {**METADATA[ARRAY_NAME], "chunk_position": chunk_position(rank)}}
-        backlog = PlanRequestBacklog()
-        bridge._runtime_plan_backlog = {ARRAY_NAME: backlog}
+        pump = PlanPump(ARRAY_NAME, comms[rank], chunk_position(rank), rank)
+        if rank == 0:
+            pump.report_queue = report_queue
+        bridge._plan_pumps = {ARRAY_NAME: pump}
         bridge._runtime_last_chunk = {ARRAY_NAME: (0, chunk)}
-        bridge._runtime_plan_report_queues = {ARRAY_NAME: report_queue} if rank == 0 else {}
         bridges.append(bridge)
-        backlogs.append(backlog)
+        pumps.append(pump)
 
     # The root's pump thread would have filled its backlog; the peers receive the request through the bcast.
-    backlogs[0].put(plan)
-    comms = [FakeComm(state, rank) for rank in range(len(chunks))]
+    pumps[0].backlog.put(plan)
 
     def serve(rank):
         """Drive one rank's send boundary (the collectives need every rank, as they do in ``send``)."""
-        bridges[rank]._serve_pending_plans(ARRAY_NAME, comms[rank])
+        serve_boundary(bridges[rank])
 
     peer = threading.Thread(target=serve, args=(1,), daemon=True)
     peer.start()

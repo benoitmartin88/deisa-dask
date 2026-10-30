@@ -416,7 +416,7 @@ class TestRuntimeReductionMemory:
 
         The e2e half of this test cannot run in a one-send harness: an AXIS reduction is not an eager-menu entry, so it
         takes the on-demand path, whose answer the bridge serves at the NEXT send boundary (``send`` ->
-        ``_serve_pending_plans``; the two-send transport behaviour is pinned in ``test_runtime_transport.py``). What the
+        ``PlanPump.serve``; the two-send transport behaviour is pinned in ``test_runtime_transport.py``). What the
         memory invariant needs -- the SIZE of what crosses -- is fully determined by the composed request, so it is
         measured here without a cluster.
 
@@ -516,7 +516,7 @@ class TestRuntimeReductionMemory:
 
         The eager menu covers :data:`EAGER_MENU_OPS` (full folds only), so ``arr.std()`` and every
         ``arr.<op>(axis=...)`` take the on-demand path. The bridge answers those at the NEXT send boundary (``send`` ->
-        ``_serve_pending_plans``), so a one-send worker-store sample cannot observe them; the payload is fully
+        ``PlanPump.serve``), so a one-send worker-store sample cannot observe them; the payload is fully
         determined by the composed request, and it is measured here:
 
         - ``arr.std()`` -> the ``(1, 1)`` moment partial (8 bytes; the moment combine keeps the reduced axes),

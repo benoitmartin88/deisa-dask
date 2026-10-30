@@ -52,7 +52,7 @@ from utils import FakeComm
 
 from deisa.dask import deisa as deisa_module
 from deisa.dask import runtime_errors as errors
-from deisa.dask.bridge import Bridge, TaskState
+from deisa.dask.bridge import Bridge, PlanPump, TaskState
 from deisa.dask.collection import DeisaCollection
 from deisa.dask.deisa import Deisa
 from deisa.dask.handshake import Handshake
@@ -62,7 +62,6 @@ from deisa.dask.runtime_dispatch import (
     EAGER_MENU_OPS,
     EagerMenu,
     PlanRequest,
-    PlanRequestBacklog,
     PlanResponder,
     build_eager_menu,
     dispatch_plan_over_comm,
@@ -1067,8 +1066,7 @@ def _make_send_bridge():
     # No handshake: the state above is already the cached result, so ``send`` must find the array fetched and never
     # enter the per-array broadcast (presence in ``_task_states`` is the fetch marker).
     bridge.handshake = None
-    bridge._runtime_plan_backlog = {}
-    bridge._runtime_plan_report_queues = {}
+    bridge._plan_pumps = {}
     bridge._runtime_last_chunk = {}
     bridge._scatter_full = lambda *args, **kwargs: {
         "future": "key-0",
@@ -1183,7 +1181,7 @@ def test_menu_round_trip_preserves_keys_values_dtypes_and_stamps(fleets, client,
 
 # ---------------------------------------------------------------------------------------------------------------------
 # ``Bridge.send`` <-> the on-demand transport (K5F-18). Two lines inside one ``if`` in ``send()`` are the ONLY link
-# between the plan transport and the simulation loop: the ``_serve_pending_plans`` boundary call and the
+# between the plan transport and the simulation loop: the ``PlanPump.serve`` boundary call and the
 # ``_runtime_last_chunk`` retention. Before this pin, deleting either one left this file at 21 passed -- ``std``, every
 # axis reduction and every menu miss could be disconnected from the run with a green suite.
 # ---------------------------------------------------------------------------------------------------------------------
@@ -1207,52 +1205,53 @@ def test_send_serves_pending_plans_then_retains_the_chunk_by_reference():
       the rank that happens to have nothing queued is a one-sided collective (a hang), not a saved round trip;
     - a request is served from the PREVIOUS chunk: the boundary runs before the retention line replaces it, so a
       request naming timestep N is still answered with timestep N's chunk while ``send`` is already at N+1;
-    - the retained chunk is the object passed in, not a copy: ``_serve_pending_plans`` only reads it, so a copy would
+    - the retained chunk is the object passed in, not a copy: ``PlanPump.serve`` only reads it, so a copy would
       double the bridge's per-array footprint for nothing.
     """
     first = np.random.default_rng(0).normal(size=CHUNK_SHAPE).astype(np.float32)
     second = np.random.default_rng(1).normal(size=CHUNK_SHAPE).astype(np.float32)
     bridge, _ = _make_send_bridge()
-    # The production shape of a participating bridge: a real backlog (its presence is what makes ``send`` enter the
-    # boundary) and the array's report queue.
-    bridge._runtime_plan_backlog = {ARRAY_NAME: PlanRequestBacklog()}
+    # The production shape of a participating bridge: one pump for the array (its presence is what makes ``send`` enter
+    # the boundary), owning the backlog the root's poll thread would fill and the array's report queue.
+    pump = PlanPump(ARRAY_NAME, bridge._array_comms[ARRAY_NAME], chunk_position(0), bridge.id)
     reports = _RecordingReportQueue()
-    bridge._runtime_plan_report_queues = {ARRAY_NAME: reports}
+    pump.report_queue = reports
+    bridge._plan_pumps = {ARRAY_NAME: pump}
 
     boundary_calls = []
-    serve_pending_plans = bridge._serve_pending_plans
+    serve = pump.serve
 
-    def recording_boundary(array_name, sub_comm):
+    def recording_boundary(last_chunk):
         """Record the boundary call, then run the REAL boundary.
 
-        - ``:param array_name:`` Array the send is for.
-        - ``:param sub_comm:`` The array's sub-communicator.
+        - ``:param last_chunk:`` The ``(timestep, chunk)`` the bridge retains for the array when ``send`` enters the
+          boundary.
         """
-        boundary_calls.append((array_name, sub_comm))
-        return serve_pending_plans(array_name, sub_comm)
+        boundary_calls.append(last_chunk)
+        return serve(last_chunk)
 
-    bridge._serve_pending_plans = recording_boundary
+    pump.serve = recording_boundary
 
     # Send 1: nothing on demand yet. The boundary still runs (an empty drain) and the chunk is retained.
     bridge.send(ARRAY_NAME, first, 0)
     assert len(boundary_calls) == 1, "send() must enter the plan boundary on every send, empty backlog or not"
-    assert boundary_calls[0] == (ARRAY_NAME, bridge._array_comms[ARRAY_NAME])
+    assert boundary_calls[0] == (None, None), (
+        "the boundary runs BEFORE the retention: nothing is held on the first send"
+    )
     retained_timestep, retained_chunk = bridge._runtime_last_chunk[ARRAY_NAME]
     assert retained_timestep == 0
     assert retained_chunk is first, "the retained chunk must be the object passed in, not a copy"
 
     # A request for timestep 0 lands between the two sends: the host asks for the chunk the bridges last delivered.
     request = compose_request(DeisaCollection.from_metadata(ARRAY_NAME, 0, WIRE_METADATA[ARRAY_NAME]).sum())
-    bridge._runtime_plan_backlog[ARRAY_NAME].put(
-        PlanRequest(request_id="req-0", array_name=ARRAY_NAME, timestep=0, request=request)
-    )
+    pump.backlog.put(PlanRequest(request_id="req-0", array_name=ARRAY_NAME, timestep=0, request=request))
 
     # Send 2: the boundary answers from the PREVIOUS chunk, then the retention takes this one.
     bridge.send(ARRAY_NAME, second, 1)
     bridge._has_close_been_called = True
 
     assert len(boundary_calls) == 2, "the boundary runs once per send"
-    assert boundary_calls[1] == (ARRAY_NAME, bridge._array_comms[ARRAY_NAME])
+    assert boundary_calls[1] == (0, first), "the boundary must fold the PREVIOUS chunk, entered before the retention"
     retained_timestep, retained_chunk = bridge._runtime_last_chunk[ARRAY_NAME]
     assert retained_timestep == 1
     assert retained_chunk is second, "the retention must follow the boundary, keeping THIS timestep's chunk"
