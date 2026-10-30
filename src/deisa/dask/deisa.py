@@ -840,6 +840,16 @@ class Deisa(IDeisa):
 
     def __update_futures_ownership(self, futures: Collection[Any]):
         keys = [p["future"].key for p in futures]
+        if not keys:
+            # Nothing crossed the boundary, so there is no ownership to transfer: an event whose callbacks are all
+            # served by runtime delivery carries no data future at all. The skip is not an optimization -- the
+            # release below names the pseudo client ``CLIENT_KEY`` ("deisa"), which only a bridge that actually
+            # scattered a chunk ever registers (``Bridge.send`` files that desire next to ``update_data``, on the
+            # non-data-free path only). Releasing keys against a client the scheduler has never seen makes it raise
+            # ``KeyError`` while it replays the host's queued messages at ``register-client``; the comm is aborted,
+            # and the reconnect cancels every future the host client holds -- the HandshakeActor future included, so
+            # the next delivery-state flush dies with "Worker holding Actor was lost".
+            return
         # tell scheduler that my client is using these futures
         self.client._send_to_scheduler({"op": "client-desires-keys", "keys": keys, "client": self.client.id})
         # tell scheduler that deisa client no longer needs the futures

@@ -917,6 +917,54 @@ def test_no_data_event_handed_to_a_legacy_reader_fails_the_run(fleets, client, m
         deisa.execute_callbacks()
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# K10W: future ownership at the delivery boundary. The event that files it is the event that ships data, so an event
+# with no data future must file NOTHING -- the release names the scheduler pseudo client ``CLIENT_KEY``, which only a
+# chunk-scattering bridge ever registers.
+# ---------------------------------------------------------------------------------------------------------------------
+def test_data_free_event_files_no_future_ownership(fleets, client, monkeypatch):
+    """A runtime-only event files NO future ownership: nothing crossed the boundary, so there is nothing to own.
+
+    Filing the release anyway names the pseudo client ``CLIENT_KEY`` ("deisa"), which a bridge creates only when it
+    actually scatters a chunk. The scheduler answers that release with ``KeyError`` while replaying the host's queued
+    messages at ``register-client``, aborts the comm, and the client's reconnect cancels EVERY future it holds -- the
+    HandshakeActor future included, which is why the next ``_flush_delivery_state_to_handshake`` used to die with
+    "Worker holding Actor was lost" (``test_wait_for_tasks``).
+    """
+    deisa = make_deisa(fleets, client, monkeypatch)
+    register(deisa, lambda window: None)
+    deliver(deisa, 0, fleets.menus(0))
+
+    ops = [payload["op"] for payload in client.desired_keys]
+    assert "client-desires-keys" not in ops, f"no key crossed the boundary, so none is desired: {client.desired_keys}"
+    assert "client-releases-keys" not in ops, (
+        f"releasing keys the pseudo client never desired kills the host's scheduler connection: {client.desired_keys}"
+    )
+
+
+def test_full_chunk_event_still_files_future_ownership(fleets, client, monkeypatch):
+    """The legacy scatter keeps the ownership filing: the chunk's keys are desired by the host, then released.
+
+    The guard above must be about "nothing shipped", not about the seam being dead: one event per delivery mode, and
+    this is the one that already worked.
+    """
+    deisa = make_deisa(fleets, client, monkeypatch)
+    monkeypatch.setattr(
+        Deisa,
+        "_Deisa__tile_dask_blocks",
+        lambda self, blocks, global_shape: da.zeros(global_shape, chunks=CHUNK_SHAPE),
+    )
+    register(deisa, lambda window: None, precompute=False)
+    deliver(deisa, 0, fleets.menus(0), futures=full_chunk_futures())
+
+    assert [payload["op"] for payload in client.desired_keys] == ["client-desires-keys", "client-releases-keys"]
+    desires, releases = client.desired_keys
+    assert desires["keys"] == [entry["future"] for entry in full_chunk_futures()]
+    assert desires["client"] == client.id, "the host client is the one that uses these futures"
+    assert releases["client"] == "deisa", "the bridges' own desire is withdrawn under the Deisa pseudo client"
+    assert releases["keys"] == desires["keys"]
+
+
 def test_departed_runtime_callback_flips_the_array_off(fleets, client, monkeypatch, go_event):
     """Unregistering the last ``precompute=True`` callback drops the array from the bridged runtime set."""
     deisa = make_deisa(fleets, client, monkeypatch)
