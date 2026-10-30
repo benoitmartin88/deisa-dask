@@ -32,7 +32,7 @@ import gc
 import logging
 import os.path
 import time
-from collections import deque
+from collections import defaultdict, deque
 from typing import Any, Dict, List
 
 import dask
@@ -54,8 +54,8 @@ from utils import (
 )
 
 from deisa.dask import Bridge, Deisa
-from deisa.dask.deisa import DEFAULT_SLIDING_WINDOW_SIZE
-from deisa.dask.precompute_analyzer import RawFieldReadError, UnsupportedReductionError
+from deisa.dask.deisa import DEFAULT_SLIDING_WINDOW_SIZE, ArrayMode, _is_run_aborting
+from deisa.dask.precompute_errors import RawFieldReadError, UnsupportedReductionError
 from deisa.dask.utils import build_deisa_array
 
 logging.basicConfig(level=logging.DEBUG)
@@ -80,10 +80,19 @@ class _FakeHandshake:
     """Minimal handshake surface used by Deisa._register_callback_impl."""
 
     def __init__(self):
-        self.branches: Dict[str, Any] = {}
+        self.runtime_arrays: list = []
+        self.legacy_arrays: list = []
 
-    def set_task_branches(self, array_name, hints):  # noqa: D102
-        self.branches[array_name] = hints
+    def set_runtime_arrays(self, array_names):  # noqa: D102
+        self.runtime_arrays = list(array_names)
+
+    def set_legacy_arrays(self, array_names):  # noqa: D102
+        self.legacy_arrays = list(array_names)
+
+
+def _runtime_names(d: Deisa) -> set:
+    """The array names ``d`` files as runtime-delivery targets, read off its per-array delivery-mode records."""
+    return {name for name, mode in d._arrays.items() if mode.runtime}
 
 
 def _make_deisa_stub() -> Deisa:
@@ -94,13 +103,17 @@ def _make_deisa_stub() -> Deisa:
     d.arrays_metadata = META_A
     d._callbacks = {}
     d._callbacks_by_array = {}
+    d._arrays = defaultdict(ArrayMode)
     d._topic_handlers = {}
-    d._callback_reductions = {}
     d._callback_seq = 0
-    d._branch_groups = {}
     d._tasks = set()
     d._execute_callbacks_called = False
     return d
+
+
+def _raising_subscribe(name, handler):
+    """A topic subscription that refuses: the one step registration can still fail on without a cluster."""
+    raise RuntimeError(f"subscription refused for {name!r}")
 
 
 @pytest.mark.timeout(10)
@@ -150,10 +163,13 @@ class TestDeisaCtor:
 # ---------------------------------------------------------------------------
 class TestDeisaRegistration:
     def test_registration_success_stores_callback_payload(self):
-        """A successful registration stores the payload in ``_callbacks``.
+        """A successful registration stores the payload in ``_callbacks`` and files its delivery state.
 
         The topic handler can only fire a callback whose payload lives in ``_callbacks``; it must be stored once every
-        step that can raise has succeeded.
+        step that can raise has succeeded. The payload carries the delivery mode the callback registered with (decision
+        F3: the mode is per CALLBACK, not per run), and the array is filed with the handshake actor as a
+        runtime-delivery target -- which is what the bridges gate their eager scalar menu on now that registration no
+        longer files branches.
         """
         d = _make_deisa_stub()
         cb = _make_callback("reg_ok", "s = arr.sum()\nreturn s.compute()")
@@ -161,43 +177,50 @@ class TestDeisaRegistration:
         assert cid in d._callbacks
         assert d._callbacks[cid]["callback"] is cb
         assert d._callbacks[cid]["array_names"] == ["a"]
+        assert d._callbacks[cid]["precompute"] is True
         assert cid in d._callbacks_by_array["a"]
         # Topic subscription happened for the registered array.
         assert "a" in d.client.subscribed
-        # Branches are merged in memory at registration; the handshake actor is
-        # filed only by execute_callbacks (the per-cycle filing boundary).
-        assert d._branch_groups["a"]
-        d._flush_branches_to_handshake()
-        assert d.handshake.branches["a"]
+        # The delivery state is filed immediately (a bridge on the wait_for_go=False path fetches it lazily on its
+        # first send(), possibly before the next cycle).
+        assert _runtime_names(d) == {"a"}
+        assert d.handshake.runtime_arrays == ["a"]
 
     def test_registration_failure_leaves_no_trace(self):
-        """A registration whose analysis raises leaks nothing.
+        """A registration that raises leaks no payload.
 
-        ``_callbacks[callback_id]`` is written only AFTER the analysis; a raising analysis must leave no half-registered
-        entry that ``unregister_callback`` could never reach.
+        ``_callbacks[callback_id]`` is written only AFTER every step that can raise. With the analyzer gone the step
+        that still can is the topic subscription, so that is what fails here; a half-registered payload would be
+        unreachable via ``unregister_callback``.
         """
         d = _make_deisa_stub()
-        cb = _make_callback("reg_fail", "s = (arr - arr.mean()).sum()\nreturn s.compute()")
-        with pytest.raises(UnsupportedReductionError):
-            d._register_callback_impl(cb, [Window("a", size=1)], exception_handler=None, when="AND", precompute=True)
-        assert d._callbacks == {}
-        assert d._callbacks_by_array == {}
-        assert d.client.subscribed == []
+        d.client.subscribe_topic = _raising_subscribe
+        cb = _make_callback("reg_fail", "s = arr.sum()\nreturn s.compute()")
 
-    def test_raw_refusal_does_not_merge_branch_groups(self):
-        """A raw-read refusal must leave no partial branch state behind at registration."""
-        d = _make_deisa_stub()
-        cb = _make_callback("reg_raw_fail", "plot(arr)\ns = arr.sum()\nreturn s.compute()")
-        with pytest.raises(RawFieldReadError):
+        with pytest.raises(RuntimeError, match="subscription refused"):
             d._register_callback_impl(cb, [Window("a", size=1)], exception_handler=None, when="AND", precompute=True)
-        # Same no-trace contract as the UnsupportedReductionError case.
+
         assert d._callbacks == {}
-        assert d._callbacks_by_array == {}
-        assert d._branch_groups == {}
-        assert d.client.subscribed == []
+
+    def test_a_raw_read_registers_and_is_refused_at_the_compute_boundary(self):
+        """A raw read no longer refuses at registration, so the run-abort predicate is what has to hold.
+
+        Registration analyzes nothing (plan P4), so a callback that reads the whole field is accepted and fails at its
+        first compute boundary instead. The refusal classes keep their meaning through ``_is_run_aborting``: a raw read
+        or an off-surface reduction arriving from the compute boundary still stops the run rather than delivering a
+        wrong value on every later timestep.
+        """
+        d = _make_deisa_stub()
+        cb = _make_callback("reg_raw_ok_at_registration", "plot(arr)\ns = arr.sum()\nreturn s.compute()")
+        cid = d._register_callback_impl(cb, [Window("a", size=1)], exception_handler=None, when="AND", precompute=True)
+
+        assert cid in d._callbacks, "with no AST pass nothing refuses a raw read at registration"
+
+        assert _is_run_aborting(RawFieldReadError("raw read")), "a raw read must still abort the run"
+        assert _is_run_aborting(UnsupportedReductionError("off-surface")), "an off-surface reduction must still abort"
 
     def test_precompute_false_allows_raw_reads_with_warning(self, caplog):
-        """``precompute=False`` skips the analysis entirely: raw reads are allowed with a warning."""
+        """``precompute=False`` selects the legacy full-chunk scatter, where a raw read is the sanctioned remedy."""
         d = _make_deisa_stub()
         cb = _make_callback("reg_raw_ok", "plot(arr)\ns = arr.sum()\nreturn s.compute()")
         with caplog.at_level(logging.WARNING):
@@ -628,7 +651,7 @@ class TestUsingDaskCluster:
                 },
             )
 
-        del sim
+        sim.close()
 
         # del deisa
         deisa.execute_callbacks()

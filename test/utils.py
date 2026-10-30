@@ -39,6 +39,7 @@ import numpy as np
 from deisa.core import ICommunicator
 
 from deisa.dask import Bridge
+from deisa.dask.utils import called_from_event_loop, run_coro_on_private_loop
 
 
 def wait_for(predicate, timeout=5.0, interval=0.01, nb_checks=1):
@@ -76,18 +77,34 @@ def dask_array_element_wise_equal(a, b):
     return (a.compute() == b.compute()).all(), "a and b are not equal"
 
 
+def _run_coro(coro):
+    """Run ``coro`` to completion from synchronous code, wherever that code runs.
+
+    ``asyncio.run()`` raises ``RuntimeError: asyncio.run() cannot be called from a running event loop`` -- and the
+    coroutine it was handed is then never awaited, which is what pytest reports as an unraisable exception during
+    teardown. Teardown reaches these helpers from whichever thread dropped the last reference to a simulation (the
+    collector, not the test), so a live loop on that thread is normal and the coroutine has to go to a private loop.
+
+    - ``:param coro:`` The coroutine to run.
+    - ``:return:`` Whatever ``coro`` returns.
+    """
+    if called_from_event_loop():
+        return run_coro_on_private_loop(coro)
+    return asyncio.run(coro)
+
+
 def async_map(iterable, func, *args, **kwargs):
     async def _f():
         return await asyncio.gather(*[asyncio.to_thread(func, item, *args, **kwargs) for item in iterable])
 
-    return asyncio.run(_f())
+    return _run_coro(_f())
 
 
 def async_close_bridges(bridges: List[Bridge], timestep: int):
     async def _close_bridges():
         await asyncio.gather(*[asyncio.to_thread(bridge.close, timestep=timestep) for bridge in bridges])
 
-    asyncio.run(_close_bridges())
+    _run_coro(_close_bridges())
 
 
 def run_on_all_ranks(comm_builder, fn):
@@ -127,7 +144,7 @@ def run_on_all_ranks(comm_builder, fn):
 def _make_callback(name: str, body: str, params: str = "arr") -> Callable:
     """Compile ``def <name>(<params>): <body>`` and return the function with ``__source__`` set.
 
-    Shared by analyzer tests so ``analyze_callback`` can walk source via ``inspect.getsource``. The compiled filename is
+    Used by the registration tests (``test_deisa.py``, ``test_mergeable_pca_bridge.py``). The compiled filename is
     generic (``<test-utils:name>``); no test asserts on the filename.
     """
     src = textwrap.dedent(f"def {name}({params}):\n{textwrap.indent(body, '    ')}")
@@ -138,22 +155,153 @@ def _make_callback(name: str, body: str, params: str = "arr") -> Callable:
     return fn
 
 
-def _analyze(body: str, params: str = "arr", name: str = "analyze_cb", meta: Dict[str, Any] = None) -> Any:
-    """Build a callback from ``body`` and run ``_analyze_callback_for_branches`` against ``meta``.
-
-    Defaults to a single array ``f`` with an (8, 8) global shape and (4, 4) chunk shape.
-    """
-    from deisa.dask.branch import _analyze_callback_for_branches
-
-    if meta is None:
-        meta = {"f": {"global_shape": (8, 8), "chunk_shape": (4, 4)}}
-    cb = _make_callback(name, body, params=params)
-    return _analyze_callback_for_branches(cb, meta)
-
-
 def _scalar(value: Any) -> float:
     """Unwrap a (1, 1) keepdims partial (sum chunk layer has keepdims=True) to a scalar."""
     return float(np.asarray(value).reshape(-1)[0])
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Runtime-planner harness (the delivery path a callback is handed: DeisaCollections, not dask arrays)
+# ---------------------------------------------------------------------------------------------------------------------
+DEFAULT_META: Dict[str, Any] = {"f": {"global_shape": (8, 8), "chunk_shape": (4, 4)}}
+
+
+class RecordingDispatcher:
+    """The compute boundary a harness collection carries: record every reduction, dispatch nothing.
+
+    A planner test is about WHAT a callback asks for (:class:`~deisa.dask.runtime_compose.RuntimeRequest`), not about
+    the merged number, so the boundary returns a sentinel and records the reductions in call order. Value parity with
+    the real :class:`~deisa.dask.runtime_dispatch.PlanDispatcher` is asserted separately, over an in-process exchange.
+    """
+
+    def __init__(self, value: Any = 0.0) -> None:
+        self.value = value
+        self.reductions: List[Any] = []
+
+    def compute(self, reduction: Any) -> Any:
+        """- ``:param reduction:`` The reduction the callback computed."""
+        self.reductions.append(reduction)
+        return self.value
+
+
+def _collection(
+    name: str = "f",
+    meta: Optional[Dict[str, Any]] = None,
+    timestep: int = 0,
+    dispatcher: Any = None,
+) -> Any:
+    """One live :class:`~deisa.dask.collection.DeisaCollection`, i.e. what a callback receives.
+
+    - ``:param name:`` Registered array name.
+    - ``:param meta:`` Registry metadata (defaults to :data:`DEFAULT_META`).
+    - ``:param timestep:`` Timestep the collection was delivered for.
+    - ``:param dispatcher:`` The compute boundary to attach.
+    """
+    from deisa.dask.collection import DeisaCollection
+
+    registry = DEFAULT_META if meta is None else meta
+    return DeisaCollection.from_metadata(name, timestep, registry[name], dispatcher=dispatcher)
+
+
+def _run_callback(
+    body: str,
+    params: str = "arr",
+    name: str = "runtime_cb",
+    meta: Optional[Dict[str, Any]] = None,
+    collections: Optional[Dict[str, Any]] = None,
+    dispatcher: Any = None,
+    extra_globals: Optional[Dict[str, Any]] = None,
+) -> Any:
+    """Compile ``body`` into a callback, run it against live collections, return ``(result, requests, dispatcher)``.
+
+    ``requests`` are the composed wire requests of every reduction the callback computed, in call order. Nothing is
+    dispatched: the collections carry a :class:`RecordingDispatcher` unless the caller supplies its own.
+
+    - ``:param body:`` Dedented callback body (the ``window``/``arr`` parameters are the delivery's collections).
+    - ``:param params:`` Comma-separated callback parameters.
+    - ``:param name:`` Function name of the compiled callback.
+    - ``:param meta:`` Registry metadata, for the default one-collection-per-parameter setup.
+    - ``:param collections:`` Parameter name -> the object(s) to pass (a list for a ``window`` parameter).
+    - ``:param dispatcher:`` The compute boundary to attach to the default collections.
+    - ``:param extra_globals:`` Extra names the callback body may reference (``da``/``np`` are always available).
+    """
+    import dask.array as da
+
+    from deisa.dask.runtime_compose import compose_request
+
+    arg_names = [raw.strip() for raw in params.split(",") if raw.strip()]
+    boundary = dispatcher if dispatcher is not None else RecordingDispatcher()
+    supplied = dict(collections or {})
+    args = []
+    for arg_name in arg_names:
+        if arg_name in supplied:
+            args.append(supplied[arg_name])
+        else:
+            args.append(_collection(arg_name if arg_name != "arr" else "f", meta=meta, dispatcher=boundary))
+
+    scope: Dict[str, Any] = {"np": np, "da": da}
+    scope.update(extra_globals or {})
+    src = textwrap.dedent(f"def {name}({params}):\n{textwrap.indent(body, '    ')}")
+    exec(compile(src, f"<runtime-utils:{name}>", "exec"), scope)
+    callback = scope[name]
+    callback.__source__ = src  # type: ignore[attr-defined]
+
+    result = callback(*args)
+    return result, [compose_request(reduction) for reduction in boundary.reductions], boundary
+
+
+def _direct_exchange(chunks: Sequence[Any], array_name: str = "f", timestep: int = 0, grid: Sequence[int] = (2, 2)):
+    """An in-process bridge exchange: every bridge answers the plan from its own chunk, no communicator, no threads.
+
+    This is the production responder (:class:`~deisa.dask.runtime_dispatch.PlanResponder`) and the production merge,
+    with the transport replaced by a plain function call -- enough to assert DELIVERED VALUES without a cluster.
+
+    - ``:param chunks:`` One numpy chunk per bridge, in rank order.
+    - ``:param array_name:`` Registered array the chunks belong to.
+    - ``:param timestep:`` Timestep the chunks belong to.
+    - ``:param grid:`` Chunk-grid extent (the MPI cart dims) the rank order maps onto.
+    """
+    from deisa.dask.runtime_dispatch import PlanResponder
+
+    positions = [tuple(int(value) for value in np.unravel_index(rank, grid)) for rank in range(len(chunks))]
+
+    def exchange(plan: Any) -> Any:
+        return [
+            PlanResponder(array_name, timestep, chunk, rank=rank, chunk_position=positions[rank]).respond(plan)
+            for rank, chunk in enumerate(chunks)
+        ]
+
+    return exchange
+
+
+def _dispatched(
+    field: Any,
+    name: str = "f",
+    chunk_shape: Optional[Sequence[int]] = None,
+    grid: Sequence[int] = (2, 1),
+    timestep: int = 0,
+) -> Any:
+    """A collection whose reductions are DELIVERED (real dispatcher, real responder, real merge) from ``field``.
+
+    - ``:param field:`` The whole field; only this helper ever holds it, the path sees per-bridge chunks.
+    - ``:param name:`` Registered array name.
+    - ``:param chunk_shape:`` Shape of one bridge's chunk (defaults to half the field on axis 0).
+    - ``:param grid:`` Chunk-grid extent.
+    - ``:param timestep:`` Timestep of the delivery.
+    """
+    from deisa.dask.collection import DeisaCollection
+    from deisa.dask.runtime_dispatch import PlanDispatcher
+
+    field = np.asarray(field)
+    chunk_shape = tuple(chunk_shape or (field.shape[0] // grid[0], field.shape[1] // grid[1]))
+    rows = chunk_shape[0]
+    chunks = [np.array(field[start : start + rows]) for start in range(0, field.shape[0], rows)]
+    dispatcher = PlanDispatcher(
+        _direct_exchange(chunks, array_name=name, timestep=timestep, grid=grid),
+        bridge_count=len(chunks),
+    )
+    meta = {name: {"global_shape": field.shape, "chunk_shape": chunk_shape}}
+    return DeisaCollection.from_metadata(name, timestep, meta[name], dispatcher=dispatcher)
 
 
 class FakeComm(ICommunicator):

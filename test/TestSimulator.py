@@ -30,7 +30,7 @@ import asyncio
 import itertools
 import logging
 import sys
-from typing import Any, Tuple
+from typing import Any, List, Tuple
 
 import numpy as np
 from distributed import Client
@@ -38,6 +38,7 @@ from numpy import dtype, float64, ndarray
 from utils import FakeCartComm, FakeComm, async_close_bridges, async_map
 
 from deisa.dask import Bridge
+from deisa.dask.utils import called_from_event_loop
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,7 @@ class TestSimulation:
         self.client = client
         self.arrays_metadata = arrays_metadata
         self.mpi_parallelism = mpi_parallelism
+        self._closed = False
         nb_mpi_ranks = int(np.prod(mpi_parallelism))
         comm_state = FakeComm.State(nb_mpi_ranks)
 
@@ -64,11 +66,33 @@ class TestSimulation:
                 **kwargs,
             )
 
-        self.bridges = async_map(range(nb_mpi_ranks), _make_bridge)
+        self.bridges: List[Bridge] = async_map(range(nb_mpi_ranks), _make_bridge)
+
+    def close(self, timestep: int = sys.maxsize) -> None:
+        """Close the simulation's bridges, exactly once.
+
+        Teardown is deterministic: a test (or its fixture) calls this, so the bridges are closed on the test's thread
+        while the cluster is still up, instead of being left to the collector.
+
+        - ``:param timestep:`` Timestep handed to ``Bridge.close``; the default sentinel means "shut the run down".
+        """
+        if getattr(self, "_closed", True):
+            return
+        self._closed = True
+        async_close_bridges(self.bridges, timestep=timestep)
+        self.bridges = []
 
     def __del__(self):
+        """Best-effort close for a simulation a test forgot to close.
+
+        Never runs during interpreter shutdown (peer ranks are gone, ``Bridge.close`` synchronizes with them), and never
+        from a thread that is running an event loop: the collector fires ``__del__`` on whichever thread dropped the
+        last reference, and closing there would block a loop that still has to service the close.
+        """
+        if getattr(self, "_closed", True) or sys.is_finalizing() or called_from_event_loop():
+            return
         try:
-            async_close_bridges(self.bridges, timestep=sys.maxsize)
+            self.close()
         except Exception as e:
             logger.error(f"Error while closing bridges: {e}")
 

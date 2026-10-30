@@ -906,9 +906,9 @@ class MergeablePCA:
         Three paths, all ending in the SAME root state (``_summary_`` plus the materialized public attributes), so
         "in-situ on the bridge" and "standalone on Dask" cannot drift apart:
 
-        - A **delivered** array (one carrying ``_deisa_pca_summary``, i.e. the per-bridge dispatch view deisa-dask
-          hands a callback when the local PCA ran on the MPI bridge) takes :meth:`_fit_delivered`. The merge tree
-          over the per-bridge summaries has already run; this only adopts the root summary.
+        - A **runtime collection** (a DEISA callback's window entry, which carries no data) takes
+          :meth:`_fit_runtime_collection`: it dispatches a PCA branch request to the bridges, merges their summaries
+          at the root and adopts the result through :meth:`_fit_delivered`.
         - A **dask array** is fitted through :meth:`_fit_dask_delayed` / :meth:`_fit_dask`.
         - A **numpy array** takes the in-memory path, the single-leaf base case of the same tree.
 
@@ -920,9 +920,8 @@ class MergeablePCA:
           dimensions, ``axis_names`` / ``feature_axes`` / ``sample_axes`` say which axes are which.
         - ``:param y:`` Accepted and ignored, for scikit-learn parity.
         """
-        delivered = getattr(X, "_deisa_pca_summary", None)
-        if delivered is not None:
-            return self._fit_delivered(delivered, X)
+        if self._is_runtime_collection(X):
+            return self._fit_runtime_collection(X)
 
         array = X if isinstance(X, da.Array) else da.asarray(X)
         flat = self._as_2d(array)
@@ -949,6 +948,61 @@ class MergeablePCA:
 
         return self._adopt_summary(summary, n_features)
 
+    @staticmethod
+    def _is_runtime_collection(X) -> bool:
+        """Whether ``X`` is a DEISA runtime collection, i.e. a data-free operand the delivery path handed a callback.
+
+        The import is deferred so this module's import chain does not pull the delivery stack back in: the collection
+        module pulls ``runtime_errors`` and the runtime compose/dispatch modules, and this module sits at the bottom of
+        that chain. The check is an ``isinstance`` against that class rather than a duck
+        check on attributes: ``DeisaCollection`` is the only operand the delivery produces, and a false positive here
+        would dispatch a PCA branch for something a bridge never described.
+
+        - ``:param X:`` The object a callback passed to :meth:`fit`.
+        """
+        from deisa.dask.collection import DeisaCollection
+
+        return isinstance(X, DeisaCollection)
+
+    def _bridge_policy(self) -> dict:
+        """The bridge-side axis policy this estimator summarizes under.
+
+        Only the fields that change the LEAF result belong here. ``n_components`` and ``whiten`` are deliberately
+        absent: they are root-only, and the estimator that dispatches the request is the root, so shipping them would
+        truncate or whiten before the merge and destroy mergeability.
+        """
+        return {
+            "local_rank": self.local_rank,
+            "axis_names": self.axis_names,
+            "feature_axes": self.feature_axes,
+            "sample_axes": self.sample_axes,
+        }
+
+    def _fit_runtime_collection(self, collection) -> MergeablePCA:
+        """Fit on a delivered collection: dispatch the PCA branch, merge the summaries at the root, adopt the result.
+
+        This is the in-situ placement for the runtime reduction path, and it is the only complete route through
+        :meth:`fit` for a collection -- a collection carries no data, so there is no local fallback. Without a bridge
+        transport the fit refuses with the no-transport refusal (the remedy is the legacy ``precompute=False``
+        delivery) instead of gathering anything.
+
+        End to end: the request travels as a module-level ``functools.partial`` (a closure would not survive the
+        bridge process boundary), each bridge summarizes its OWN chunk with the same leaf the standalone estimator
+        uses, and :meth:`PlanDispatcher.compute_pca` merges those summaries with the balanced pairwise tree. Nothing
+        chunk-shaped crosses the boundary.
+
+        - ``:param collection:`` The :class:`~deisa.dask.collection.DeisaCollection` a callback received.
+        """
+        from deisa.dask import runtime_errors as errors
+        from deisa.dask.runtime_compose import compose_pca_request
+
+        dispatcher = collection.dispatcher
+        if dispatcher is None:
+            raise errors.no_dispatch_transport(f"the PCA fit on {collection.name!r} at timestep {collection.timestep}")
+        request = compose_pca_request(collection, self._bridge_policy())
+        summary = dispatcher.compute_pca(request)
+        return self._fit_delivered(summary, collection)
+
     def _adopt_summary(self, summary: PCASummary, n_features: int) -> MergeablePCA:
         """Install a merged root summary as this estimator's state, after the two guards, and return ``self``.
 
@@ -972,10 +1026,10 @@ class MergeablePCA:
         """The feature dimension ``d`` the REGISTERED array declares, under this estimator's axis policy.
 
         Read from the REGISTERED shape, never from the array handed to :meth:`fit`. Those are different things on the
-        bridge path: a PCA-only dispatch view is instantiated from :meth:`Deisa._pca_carrier_array`, whose shape is 1
-        along every axis by construction, because it carries no field data and must never be read as the array the
-        callback asked about. Its ``shape[-1]`` is 1 for every registered array of every dimensionality, which is why
-        cross-checking a summary against it refused EVERY legitimate fit with ``d != 1``.
+        bridge path: a PCA-only delivery carries a merged :class:`PCASummary`, not field data, so the array handed to
+        :meth:`fit` is the callback's own object and must never be read as the array the bridge summarized. Its
+        ``shape[-1]`` is not the declared feature dimension for every registered array of every dimensionality, which
+        is why cross-checking a summary against it refused EVERY legitimate fit with ``d != 1``.
 
         The classification goes through the same :func:`_partition_axes` policy :meth:`_as_2d` applies, so the count
         agrees with the layout the bridge summarized under by construction rather than by coincidence: a multi-axis
@@ -1023,10 +1077,10 @@ class MergeablePCA:
         each leaf's local rank), never the truncated public representation.
 
         The feature-dimension check is the one guard this path adds, and it reads the REGISTERED shape the delivery
-        carries, never the array the callback passed. That distinction is the whole fix: the dispatch view is built
-        from a one-element placeholder carrier (:meth:`Deisa._pca_carrier_array`) whose ``shape[-1]`` is 1 for every
-        registered array, so cross-checking against the carrier's own shape refused every legitimate fit with
-        ``d != 1``. With ``d`` declared by the registered metadata under the same axis policy the bridge summarized
+        carries, never the array the callback passed. That distinction is the whole fix: the delivered collection
+        carries no field data, so cross-checking a summary against the callback's own array refused every legitimate
+        fit with ``d != 1``. With ``d`` declared by the registered metadata under the same axis policy the bridge
+        summarized
         under, the guard still catches a summary describing a DIFFERENT feature basis -- it now compares two real
         counts instead of a real one and a placeholder.
 

@@ -190,37 +190,6 @@ class TestBridge:
 
         asyncio.run(_bridge_close())
 
-    def test_execute_operations_on_chunk_raises_on_failing_branch(self, env_setup):
-        """A branch that raises must NOT be dropped silently.
-
-        A caught-and-continued ``branch_func(chunk)`` exception would ship FEWER partials than bridges, and the combine
-        would silently produce a wrong reduction (scalar stacks get smaller sums; mean/moment aggregators miss a
-        bridge's ``n``). It raises a typed ``PrecomputeRuntimeError`` naming the branch.
-        """
-        from deisa.dask.branch import BranchSpec
-        from deisa.dask.precompute_analyzer import PrecomputeRuntimeError
-
-        bridge, _ = self.get_new_bridge()
-
-        def boom(chunk):
-            raise ValueError("boom")
-
-        branch = BranchSpec(
-            output_key="f-sum",
-            input_name="temperature",
-            output_kind="scalar",
-            branch_func=boom,
-            chunk_axis=None,
-            finalize=None,
-            partial_shape=(),
-            partial_dtype="float64",
-            op_name="sum",
-        )
-        with pytest.raises(PrecomputeRuntimeError) as excinfo:
-            bridge._execute_operations_on_chunk(np.ones((1,)), [branch])
-        assert "f-sum" in str(excinfo.value)
-        assert "boom" in str(excinfo.value)
-
 
 class TestPrecomputeRegressions:
     """Regression tests for bridge delivery and interpreter-shutdown teardown."""
@@ -322,11 +291,12 @@ class TestPrecomputeRegressions:
         assert bridge._has_close_been_called
         assert barriers == [], "close() must skip the world barrier during interpreter shutdown"
 
-    def test_send_non_participating_rank_skips_branch_work(self, env_setup):
-        """A rank whose sub-comm for the array is _COMM_NULL does no branch work.
+    def test_send_non_participating_rank_skips_delivery_work(self, env_setup):
+        """A rank whose sub-comm for the array is _COMM_NULL does no delivery work.
 
-        The ``_COMM_NULL`` early return comes FIRST: such a rank never fetches task branches nor executes branch funcs
-        on the chunk just to discard the result.
+        The ``_COMM_NULL`` early return comes FIRST: such a rank never fetches the array's delivery state, never folds
+        the eager menu on the chunk and never scatters it -- it owns nothing the workers asked for. (The per-rank fold
+        the retired ``_scatter_partials`` used to guard lives on the same early return.)
         """
         client, cluster = env_setup
         state = FakeComm.State(2)
@@ -341,84 +311,28 @@ class TestPrecomputeRegressions:
         # Merged-metadata scenario: the array is known to this bridge but its
         # sub-comm for it is _COMM_NULL (it does not own it).
         b1.arrays_metadata["temperature"] = meta0["temperature"]
-        calls = {"branches": 0, "chunk": 0}
-        orig_get = b1._get_task_branches
-        orig_exec = b1._execute_operations_on_chunk
+        calls = {"state": 0, "menu": 0, "scatter": 0}
+        orig_state = b1._ensure_task_state
+        orig_menu = b1._build_runtime_menu
+        orig_scatter = b1._scatter_full
 
-        def spy_get(array_name):
-            calls["branches"] += 1
-            return orig_get(array_name)
+        def spy_state(array_name):
+            calls["state"] += 1
+            return orig_state(array_name)
 
-        def spy_exec(chunk, branches):
-            calls["chunk"] += 1
-            return orig_exec(chunk, branches)
+        def spy_menu(array_name, chunk, timestep):
+            calls["menu"] += 1
+            return orig_menu(array_name, chunk, timestep)
 
-        b1._get_task_branches = spy_get
-        b1._execute_operations_on_chunk = spy_exec
+        def spy_scatter(data, workers=None, hash=False):
+            calls["scatter"] += 1
+            return orig_scatter(data, workers=workers, hash=hash)
+
+        b1._ensure_task_state = spy_state
+        b1._build_runtime_menu = spy_menu
+        b1._scatter_full = spy_scatter
         b1.send("temperature", np.ones(4), timestep=0)
-        assert calls == {"branches": 0, "chunk": 0}
-
-        async_close_bridges([b0, b1], 0)
-
-    def test_gather_partial_positions_follow_their_bridge(self, env_setup):
-        """A partial's chunk_position comes from its own bridge, not the index.
-
-        Two bridges share array ``temperature``: bridge 0 ships NO partials (legacy i.e. its branch cache is empty) and
-        bridge 1 ships one precomputed partial. The metadata travels with its own entry -- indexing filtered metadata
-        with ``enumerate`` against ``gathered_data`` would misalign and let one bridge's partial inherit another
-        bridge's coordinates. The event must carry bridge 1's ``(1,)`` for its partial.
-        """
-        from deisa.dask.branch import BranchSpec
-
-        client, cluster = env_setup
-        state = FakeComm.State(2)
-        meta0 = self._meta("temperature", (0,))
-        meta1 = self._meta("temperature", (1,))
-        metas = [meta0, meta1]
-
-        def _make(rank):
-            return Bridge(comm=FakeComm(state, rank), arrays_metadata=metas[rank], wait_for_go=False)
-
-        b0, b1 = async_map([0, 1], _make)
-
-        # Bridge 0: branch cache empty -> legacy full-chunk path.
-        b0._task_branches["temperature"] = []
-        # Bridge 1: one precomputed branch (chunk-local sum).
-        branch = BranchSpec(
-            output_key="k1",
-            input_name="temperature",
-            output_kind="scalar",
-            branch_func=lambda c: float(np.asarray(c).sum()),
-            chunk_axis=None,
-            finalize=None,
-            partial_shape=(),
-            partial_dtype="float64",
-            op_name="sum",
-        )
-        b1._task_branches["temperature"] = [branch]
-        # Stub the scatters: no worker/network interaction needed for the guard.
-        b1._scatter_partials = lambda partials, branches, array_name, workers: {
-            "future-info": {"future": ["fut-k1"], "who_has": {}, "nbytes": {}},
-            "precomputed": {
-                "k1": {"future": "fut-k1", "kind": "scalar", "shape": (), "dtype": "float64", "finalize": None}
-            },
-        }
-
-        async def _send():
-            await asyncio.gather(
-                asyncio.to_thread(b0.send, "temperature", np.ones(4), timestep=0),
-                asyncio.to_thread(b1.send, "temperature", np.ones(4), timestep=0),
-            )
-
-        asyncio.run(_send())
-
-        event = client.get_events("temperature")
-        assert len(event) == 1
-        _, info = event[0]
-        assert info["precomputed"]
-        assert len(info["futures"]) == 1
-        assert info["futures"][0]["future"] == "fut-k1"
-        assert info["futures"][0]["chunk_position"] == (1,), info["futures"][0]["chunk_position"]
+        assert calls == {"state": 0, "menu": 0, "scatter": 0}
 
         async_close_bridges([b0, b1], 0)
 
