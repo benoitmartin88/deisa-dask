@@ -61,6 +61,7 @@ dispatcher, which replaces the QUEUE ROUND TRIP and runs the very same composed 
 from __future__ import annotations
 
 import textwrap
+from collections import defaultdict
 from typing import Any, Callable, Optional, Sequence
 
 import numpy as np
@@ -69,7 +70,7 @@ from deisa.core.types import Window
 from utils import _make_callback
 
 from deisa.dask.collection import DeisaCollection
-from deisa.dask.deisa import Deisa
+from deisa.dask.deisa import ArrayMode, Deisa
 from deisa.dask.mergeable_pca import MergeablePCA, PCASummary, local_pca, merge_tree
 from deisa.dask.runtime_compose import compose_pca_request
 
@@ -163,6 +164,11 @@ class _FakeHandshake:
         self.legacy_arrays = list(array_names)
 
 
+def _runtime_names(d: Deisa) -> set:
+    """The array names ``d`` files as runtime-delivery targets, read off its per-array delivery-mode records."""
+    return {name for name, mode in d._arrays.items() if mode.runtime}
+
+
 def _deisa_stub() -> Deisa:
     """A ``Deisa`` with the registration surfaces stubbed, so registration runs for real without a cluster."""
     d = Deisa.__new__(Deisa)
@@ -171,8 +177,7 @@ def _deisa_stub() -> Deisa:
     d.arrays_metadata = META
     d._callbacks = {}
     d._callbacks_by_array = {}
-    d._runtime_arrays = set()
-    d._legacy_arrays = set()
+    d._arrays = defaultdict(ArrayMode)
     d._topic_handlers = {}
     d._callback_seq = 0
     d._tasks = set()
@@ -218,7 +223,7 @@ def test_registration_accepts_the_documented_motivating_example():
 
     assert cid in d._callbacks, "the callback must be registered, not refused"
     assert d._callbacks[cid]["precompute"] is True, "the payload must carry the delivery mode selected per callback"
-    assert d._runtime_arrays == {"f"}, f"the array must be filed as a runtime-delivery target, got {d._runtime_arrays}"
+    assert _runtime_names(d) == {"f"}, f"the array must be filed as a runtime-delivery target, got {_runtime_names(d)}"
     assert d.handshake.runtime_arrays == ["f"], "registration files the runtime arrays with the handshake actor"
 
 
@@ -344,7 +349,7 @@ def test_explicit_invalid_configuration_is_refused_by_the_estimator(kwargs, cons
         _pca_callback(constructor), [Window("f", size=1)], exception_handler=None, when="AND", precompute=True
     )
     assert cid in d._callbacks, "with no AST pass nothing is left to refuse an invalid constructor at registration"
-    assert d._runtime_arrays == {"f"}
+    assert _runtime_names(d) == {"f"}
 
 
 def test_constructor_rejects_non_bool_whiten_outside_the_bridge_path():

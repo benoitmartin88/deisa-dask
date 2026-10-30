@@ -61,6 +61,8 @@ import logging
 import threading
 import time
 import weakref
+from collections import defaultdict
+from dataclasses import dataclass
 from typing import Any, Callable, Collection, Dict, List, Literal, Mapping, Optional, Set, Tuple
 
 import numpy as np
@@ -131,6 +133,29 @@ def _is_run_aborting(ex: BaseException) -> bool:
     return isinstance(ex, (RuntimeRefusal, *_LEGACY_RUN_ABORTING))
 
 
+@dataclass
+class ArrayMode:
+    """One array's delivery mode on the HOST side: one record per registered array, in ``Deisa._arrays``.
+
+    The three facts used to live in three parallel containers (``_runtime_arrays``, ``_legacy_arrays``,
+    ``_runtime_latest_timestep``) that only ever agreed on their key set; they are the same array's answer to three
+    questions, so they travel together.
+
+    - ``:param runtime:`` At least one ``precompute=True`` callback reads the array, i.e. the bridges must build its
+      eager scalar menu (and may skip the chunk once no legacy reader shares the array).
+    - ``:param legacy:`` At least one ``precompute=False`` callback reads the array, so the bridges must keep
+      scattering its chunk -- decision F3's escape hatch.
+    - ``:param latest_timestep:`` The newest timestep this host delivered for the array, or ``None`` before the first
+      delivery. Read by every live dispatcher, including the ones held by OLDER collections in a callback's window:
+      the bridges retain one chunk per array, so an on-demand reduction of an older window element is refused at
+      compose time instead of aborting the run.
+    """
+
+    runtime: bool = False
+    legacy: bool = False
+    latest_timestep: Optional[int] = None
+
+
 class Deisa(IDeisa):
     Callback_id = str
 
@@ -173,19 +198,15 @@ class Deisa(IDeisa):
         # array's sub-comm). Internal, never a user parameter: the delivery attaches the collection's compute boundary
         # from here, and an array without an entry still serves its eager menu and refuses the rest.
         self._runtime_transports: Dict[str, Callable[[Any], Any]] = {}
-        # Arrays that at least one ``precompute=True`` callback reads. Declared to the bridges over the handshake
-        # (``_flush_delivery_state_to_handshake``), because an eager scalar menu for an array no callback subscribes to
-        # is six chunk folds per bridge per timestep of pure critical-path cost.
-        self._runtime_arrays: Set[str] = set()
-        # Arrays that at least one ``precompute=False`` callback reads, i.e. that still need the LEGACY full-chunk
-        # scatter. Filed in the same handshake read as the two facts above: a runtime-delivery array WITHOUT a legacy
-        # reader needs no data shipped at all (its menu and its on-demand plans answer every callback), while one WITH
-        # a legacy reader must keep the chunk -- that is decision F3's escape hatch.
-        self._legacy_arrays: Set[str] = set()
-        # array_name -> newest timestep the delivery handed to the callbacks. Read by every live dispatcher, including
-        # the ones held by OLDER collections in a callback's window: the bridges retain one chunk per array, so an
-        # on-demand reduction of an older window element is refused at compose time instead of aborting the run.
-        self._runtime_latest_timestep: Dict[str, int] = {}
+        # One record per array for BOTH delivery facts and the newest delivered timestep. A ``precompute=True``
+        # callback files ``runtime`` (declared to the bridges over the handshake by
+        # ``_flush_delivery_state_to_handshake``, because an eager scalar menu for an array no callback subscribes to is
+        # six chunk folds per bridge per timestep of pure critical-path cost); a ``precompute=False`` callback files
+        # ``legacy``, i.e. the array that still needs the LEGACY full-chunk scatter. A runtime-delivery array WITHOUT a
+        # legacy reader needs no data shipped at all (its menu and its on-demand plans answer every callback), while
+        # one WITH a legacy reader must keep the chunk -- that is decision F3's escape hatch. Default-constructed on
+        # first touch: only registered arrays ever reach this table.
+        self._arrays: Dict[str, ArrayMode] = defaultdict(ArrayMode)
         # First runtime refusal a callback raised; ``execute_callbacks`` re-raises it so the run fails instead of
         # logging once per timestep. None while the run is healthy.
         self._run_failure: Optional[BaseException] = None
@@ -385,12 +406,14 @@ class Deisa(IDeisa):
             )
             # A legacy reader means this array's chunk really is read: the bridges must keep scattering it even when a
             # ``precompute=True`` callback on the same array needs no data at all.
-            self._legacy_arrays.update(array_names)
+            for array_name in array_names:
+                self._arrays[array_name].legacy = True
         else:
             # These arrays are runtime-delivery targets: the bridges need to know, because an eager scalar menu for an
             # array no callback reads is six chunk folds per bridge per timestep of pure critical-path cost. Filed
             # with the handshake actor here and at the per-cycle boundary, like the rest of the delivery state.
-            self._runtime_arrays.update(array_names)
+            for array_name in array_names:
+                self._arrays[array_name].runtime = True
 
         # Both per-array facts travel in ONE handshake read, so they are filed together whatever the mode.
         self._flush_delivery_state_to_handshake()
@@ -434,14 +457,9 @@ class Deisa(IDeisa):
         - ``:param array_name:`` Registered array the removed callback was registered on.
         """
         surviving = [self._callbacks.get(cid, {}) for cid in self._callbacks_by_array.get(array_name, ())]
-        if any(payload.get("precompute", True) for payload in surviving):
-            self._runtime_arrays.add(array_name)
-        else:
-            self._runtime_arrays.discard(array_name)
-        if any(not payload.get("precompute", True) for payload in surviving):
-            self._legacy_arrays.add(array_name)
-        else:
-            self._legacy_arrays.discard(array_name)
+        mode = self._arrays[array_name]
+        mode.runtime = any(payload.get("precompute", True) for payload in surviving)
+        mode.legacy = any(not payload.get("precompute", True) for payload in surviving)
 
     def unregister_callback(self, callback_id: Callback_id) -> None:
         # also accept a decorated callback function, which stores its id in .callback_id
@@ -495,8 +513,8 @@ class Deisa(IDeisa):
         ``unregister_callback`` never files: an actor call inside the async topic handler stalls the handler loop. The
         pruned state is filed at the next flush point.
         """
-        self.handshake.set_runtime_arrays(sorted(self._runtime_arrays))
-        self.handshake.set_legacy_arrays(sorted(self._legacy_arrays))
+        self.handshake.set_runtime_arrays(sorted(name for name, mode in self._arrays.items() if mode.runtime))
+        self.handshake.set_legacy_arrays(sorted(name for name, mode in self._arrays.items() if mode.legacy))
 
     def execute_callbacks(self) -> None:
         """
@@ -710,7 +728,7 @@ class Deisa(IDeisa):
         ``precompute=False`` callbacks are skipped: they read the full-chunk scatter, so a collection for them would
         be a delivery nobody consumes.
         """
-        self._runtime_latest_timestep[array_name] = int(iteration)
+        self._arrays[array_name].latest_timestep = int(iteration)
         menus = None if payload.get("menu_error") else payload.get("menu")
         return {
             callback_id: self._runtime_collection(array_name, iteration, menus)
@@ -734,7 +752,7 @@ class Deisa(IDeisa):
             self._runtime_transports.get(array_name),
             bridge_count=_grid_size_from_metadata(metadata),
             menu=_as_eager_menus(menus),
-            latest_timestep=lambda: self._runtime_latest_timestep.get(array_name),
+            latest_timestep=lambda: self._arrays[array_name].latest_timestep,
         )
         return DeisaCollection.from_metadata(array_name, iteration, metadata, dispatcher=dispatcher)
 

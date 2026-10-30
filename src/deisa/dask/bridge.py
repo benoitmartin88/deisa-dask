@@ -88,21 +88,31 @@ except Exception:
     _UNDEFINED = 2147483647
 
 
-@dataclass(frozen=True)
-class TaskState:
-    """One array's delivery state, as the analytics host filed it in the handshake actor.
+@dataclass
+class DeliveryState:
+    """One array's delivery state on the BRIDGE side: one record per participating array, in ``Bridge._delivery``.
 
-    PRESENCE of the array name in ``Bridge._task_states`` -- not a value -- is the fetch marker: a state with no flag
-    set is a valid cached result, so an empty state is cached exactly like any other.
+    Everything ``send`` knows about the array's delivery lives here, so the three facts that used to sit in three
+    parallel dicts (the fetched ``{runtime, legacy}`` pair and the retained chunk) can never disagree about their key
+    set.
 
     - ``:param runtime:`` The host declared a ``precompute=True`` callback on the array, i.e. the array is a
       runtime-delivery target: its eager menu and its on-demand plans answer its callbacks.
     - ``:param legacy:`` The host declared a ``precompute=False`` callback on the array, i.e. something reads the chunk
       itself.
+    - ``:param fetched:`` Whether ``runtime``/``legacy`` have been read out of the handshake actor yet -- THE fetch
+      marker. It cannot be presence in the dict: ``send`` records ``last_chunk`` on the same record BEFORE it fetches
+      the state (the K7F-06 order), so a record may exist while nothing has been fetched. An unfetched record is
+      therefore NOT a cached result, and its empty flags must never be read as one.
+    - ``:param last_chunk:`` The ``(timestep, chunk)`` this bridge last sent for the array, or ``(None, None)`` when it
+      has sent nothing yet. Retained by reference (the pump only reads it) so an on-demand request for timestep N
+      folds the chunk the host is asking about.
     """
 
     runtime: bool = False
     legacy: bool = False
+    fetched: bool = False
+    last_chunk: Tuple[Optional[int], Any] = (None, None)
 
 
 class PlanPump:
@@ -261,17 +271,16 @@ class Bridge(IBridge):
         self._array_comms: Dict[str, Any] = {}  # array_name -> sub-comm (from comm.Split)
         self._handshake_metadata = None
 
-        # Each array's delivery state, fetched ONCE per array and cached forever: one broadcast per array on the
-        # handshake read. Membership -- not a stored flag -- is the fetch marker (a state with no flag set is a valid
-        # cached result), so a send after the first never touches the handshake again. An array outside this table has
-        # no known delivery state, so ``send`` ships its chunk.
-        self._task_states: Dict[str, TaskState] = {}
+        # Each array's delivery state, in ONE record per array: the fetched `{runtime, legacy}` pair and the chunk this
+        # bridge retains for on-demand plans. Fetched ONCE per array and cached forever -- ``DeliveryState.fetched``
+        # (not membership: ``send`` retains a chunk before it fetches) marks a real cached result, so a send after the
+        # first never touches the handshake again. An array outside this table has no known delivery state, so ``send``
+        # ships its chunk.
+        self._delivery: Dict[str, DeliveryState] = {}
         # Runtime reduction transport, one PlanPump per participating array: its plan backlog, its stop flag, its
         # report queue and its polling thread live there. Presence in this table -- not a flag -- is what makes
         # ``send`` enter the array's boundary collective.
         self._plan_pumps: Dict[str, PlanPump] = {}
-        # The retained chunk is the one this bridge last sent -- what an on-demand request for that timestep folds.
-        self._runtime_last_chunk: Dict[str, Tuple[int, Any]] = {}
 
         if self.id == 0:
             # only id 0 has a real dask client
@@ -570,8 +579,9 @@ class Bridge(IBridge):
         # broadcast, so neither the collective nor the retention may depend on the per-process flag.
         pump = self._plan_pumps.get(array_name)
         if pump is not None:
-            pump.serve(self._runtime_last_chunk.get(array_name, (None, None)))
-            self._runtime_last_chunk[array_name] = (int(timestep), chunk)
+            state = self._delivery.setdefault(array_name, DeliveryState())  # unfetched: only ``last_chunk`` is used
+            pump.serve(state.last_chunk)
+            state.last_chunk = (int(timestep), chunk)
 
         # Fetch (and cache) the array's delivery state BEFORE deciding whether data must ship: on the lazy path
         # (wait_for_go=False) this call is what fills the caches, and computing the data-free decision before the fetch
@@ -797,7 +807,7 @@ class Bridge(IBridge):
         - ``:param timestep:`` Timestep the chunk belongs to; every menu value is stamped with it, which is what lets
           the analytics side refuse a menu value of an earlier timestep.
         """
-        state = self._task_states.get(array_name)
+        state = self._delivery.get(array_name)
         if state is None or not state.runtime:
             return None, None
         metadata = self.arrays_metadata[array_name]
@@ -1016,29 +1026,31 @@ class Bridge(IBridge):
         Only a runtime-delivery target can skip it, and only while nothing reads the chunk: every callback on such an
         array either reads the eager menu, dispatches an on-demand plan, or both. An array with a legacy
         (``precompute=False``) reader always needs the chunk -- that is decision F3's escape hatch -- and so does an
-        array nobody declared, whose delivery mode this bridge cannot know.
+        array nobody declared, whose delivery mode this bridge cannot know. A record that exists but has never been
+        fetched (``last_chunk`` was retained on it) is NOT a declared state either: it serves the chunk.
 
         - ``:param array_name:`` Registered array the send is for.
         """
-        state = self._task_states.get(array_name)
-        if state is None:
+        state = self._delivery.get(array_name)
+        if state is None or not state.fetched:
             return True
         return state.legacy or not state.runtime
 
     def _ensure_task_state(self, array_name: str) -> None:
-        """Fetch this array's delivery state once and cache it in ``_task_states``.
+        """Fetch this array's delivery state once and cache it in ``_delivery``.
 
         The bridge reads ``{"runtime", "legacy"}`` from the handshake actor on sub-comm rank 0 and broadcasts it to the
         other participating ranks. Every fact travels in ONE collective on purpose: a second broadcast would have to be
         entered in the same order on every rank of the sub-comm, i.e. one more way to hang the array for one dict entry.
-        After one fetch, sends never touch the handshake: membership in ``_task_states`` -- not a stored value -- is
-        what marks an array as fetched, so a state with no flag set (the common case) is cached just like any other.
-        A rank that does not participate in the array's sub-comm leaves it unfetched, and an unfetched read (a ``None``
-        state, which is NOT a cached result) leaves it unfetched too.
+        After one fetch, sends never touch the handshake: the explicit ``DeliveryState.fetched`` flag -- not the arrival
+        of a delivery flag -- marks a real cached result, so a state with no flag set (the common case) is cached just
+        like any other. A rank that does not participate in the array's sub-comm leaves it unfetched, and an unfetched
+        read (a ``None`` state, which is NOT a cached result) leaves it unfetched too.
 
         - ``:param array_name:`` The array name to fetch state for.
         """
-        if array_name in self._task_states:
+        record = self._delivery.get(array_name)
+        if record is not None and record.fetched:
             return
         sub_comm = self._array_comms.get(array_name)
         if sub_comm is None or sub_comm is _COMM_NULL:
@@ -1049,10 +1061,10 @@ class Bridge(IBridge):
         else:
             state = sub_comm.bcast(None, root=0)
         if state is not None:
-            self._task_states[array_name] = TaskState(
-                runtime=bool(state.get("runtime")),
-                legacy=bool(state.get("legacy")),
-            )
+            record = self._delivery.setdefault(array_name, DeliveryState())
+            record.runtime = bool(state.get("runtime"))
+            record.legacy = bool(state.get("legacy"))
+            record.fetched = True
 
     def _prefetch_task_state(self) -> None:
         """Prefetch the per-array scheduling state of every global array into the local cache.

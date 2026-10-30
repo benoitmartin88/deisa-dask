@@ -61,9 +61,9 @@ from deisa.dask import bridge as bridge_module
 from deisa.dask import deisa as deisa_module
 from deisa.dask import runtime_dispatch as runtime_dispatch_module
 from deisa.dask import runtime_errors as errors
-from deisa.dask.bridge import Bridge, PlanPump
+from deisa.dask.bridge import Bridge, DeliveryState, PlanPump
 from deisa.dask.collection import DeisaCollection
-from deisa.dask.deisa import Deisa
+from deisa.dask.deisa import ArrayMode, Deisa
 from deisa.dask.runtime_compose import compose_request
 from deisa.dask.runtime_dispatch import (
     PlanRequest,
@@ -120,7 +120,7 @@ def make_bridge_stub(rank, timestep, chunk, report_queue, sub_comm):
     """One bridge, with exactly the transport state ``Bridge.__init__`` gives it, and nothing else.
 
     The array's ``PlanPump`` is the production state (every participating rank has one, flag or no flag);
-    ``_runtime_last_chunk`` is what the last ``send`` retained; only the array root owns a report queue.
+    ``DeliveryState.last_chunk`` is what the last ``send`` retained; only the array root owns a report queue.
     """
     bridge = Bridge.__new__(Bridge)
     bridge.id = rank
@@ -129,13 +129,13 @@ def make_bridge_stub(rank, timestep, chunk, report_queue, sub_comm):
     if rank == 0:
         pump.report_queue = report_queue
     bridge._plan_pumps = {ARRAY_NAME: pump}
-    bridge._runtime_last_chunk = {ARRAY_NAME: (timestep, chunk)}
+    bridge._delivery = {ARRAY_NAME: DeliveryState(fetched=True, last_chunk=(timestep, chunk))}
     return bridge
 
 
 def serve_boundary(bridge):
     """Drive one rank's send boundary: the array's pump folds whatever chunk the last ``send`` retained."""
-    bridge._plan_pumps[ARRAY_NAME].serve(bridge._runtime_last_chunk.get(ARRAY_NAME, (None, None)))
+    bridge._plan_pumps[ARRAY_NAME].serve(bridge._delivery[ARRAY_NAME].last_chunk)
 
 
 def make_deisa_stub(client, monkeypatch, transports=None):
@@ -154,8 +154,7 @@ def make_deisa_stub(client, monkeypatch, transports=None):
     deisa._execute_callbacks_called = False
     deisa._run_failure = None
     deisa._runtime_transports = {} if transports is None else transports
-    deisa._runtime_latest_timestep = {}
-    deisa._runtime_arrays = set()
+    deisa._arrays = collections.defaultdict(ArrayMode)
     return deisa
 
 
@@ -173,7 +172,7 @@ def register_callback(deisa, callback, window_size=1):
         },
     }
     deisa._callbacks_by_array.setdefault(ARRAY_NAME, set()).add(callback_id)
-    deisa._runtime_arrays.add(ARRAY_NAME)
+    deisa._arrays[ARRAY_NAME].runtime = True
     return callback_id
 
 
@@ -271,7 +270,7 @@ def test_two_successive_axis_folds_are_served_by_the_production_transport(client
         for timestep in (0, 1):
             for rank in range(bridge_count):
                 # The simulation has just SENT this timestep: the bridge retains it, so that is what the boundary folds.
-                bridges[rank]._runtime_last_chunk[ARRAY_NAME] = (timestep, per_timestep[timestep][rank])
+                bridges[rank]._delivery[ARRAY_NAME].last_chunk = (timestep, per_timestep[timestep][rank])
             deliver(deisa, timestep)
     finally:
         stop.set()
@@ -374,7 +373,7 @@ def test_bridge_send_boundary_serves_the_backlog_over_the_sub_comm(client):
         if rank == 0:
             pump.report_queue = report_queue
         bridge._plan_pumps = {ARRAY_NAME: pump}
-        bridge._runtime_last_chunk = {ARRAY_NAME: (0, chunk)}
+        bridge._delivery = {ARRAY_NAME: DeliveryState(fetched=True, last_chunk=(0, chunk))}
         bridges.append(bridge)
         pumps.append(pump)
 

@@ -52,9 +52,9 @@ from utils import FakeComm
 
 from deisa.dask import deisa as deisa_module
 from deisa.dask import runtime_errors as errors
-from deisa.dask.bridge import Bridge, PlanPump, TaskState
+from deisa.dask.bridge import Bridge, DeliveryState, PlanPump
 from deisa.dask.collection import DeisaCollection
-from deisa.dask.deisa import Deisa
+from deisa.dask.deisa import ArrayMode, Deisa
 from deisa.dask.handshake import Handshake
 from deisa.dask.mergeable_pca import MergeablePCA, PCASummary
 from deisa.dask.runtime_compose import PCARequest, compose_request
@@ -310,12 +310,10 @@ def make_deisa(fleets, client, monkeypatch):
     deisa._callbacks_by_array = {}
     deisa._topic_handlers = {}
     deisa._callback_seq = 0
-    deisa._runtime_arrays = set()
-    deisa._legacy_arrays = set()
+    deisa._arrays = collections.defaultdict(ArrayMode)
     deisa._tasks = set()
     deisa._execute_callbacks_called = False
     deisa._runtime_transports = {ARRAY_NAME: fleets.exchange}
-    deisa._runtime_latest_timestep = {}
     deisa._run_failure = None
     deisa._topic_handlers[ARRAY_NAME] = deisa._make_topic_handler(ARRAY_NAME)
     return deisa
@@ -336,9 +334,9 @@ def register(deisa, callback, window_size=2, when="OR", exception_handler=None, 
     }
     deisa._callbacks_by_array.setdefault(ARRAY_NAME, set()).add(callback_id)
     if precompute:
-        deisa._runtime_arrays.add(ARRAY_NAME)
+        deisa._arrays[ARRAY_NAME].runtime = True
     else:
-        deisa._legacy_arrays.add(ARRAY_NAME)
+        deisa._arrays[ARRAY_NAME].legacy = True
     return callback_id
 
 
@@ -704,7 +702,7 @@ def test_precompute_false_still_receives_the_full_chunk(fleets, client, monkeypa
         received.append(window[-1])
 
     register(deisa, callback, precompute=False)
-    assert deisa._runtime_arrays == set(), "a full-chunk callback declares no runtime-delivery array"
+    assert not deisa._arrays[ARRAY_NAME].runtime, "a full-chunk callback declares no runtime-delivery array"
     deliver(deisa, 0, fleets.menus(0), futures=full_chunk_futures())
 
     assert len(received) == 1
@@ -770,10 +768,10 @@ def test_mixed_array_still_gets_the_full_chunk(fleets, client, monkeypatch):
 
     bridge, wire_client = _make_send_bridge()
     # Start from an empty cache, like a bridge taking its state from the handshake read.
-    bridge._task_states = {}
+    bridge._delivery = {}
     bridge.handshake = _WireHandshake(state)
     bridge._ensure_task_state(ARRAY_NAME)
-    assert bridge._task_states[ARRAY_NAME] == TaskState(runtime=True, legacy=True)
+    assert bridge._delivery[ARRAY_NAME] == DeliveryState(runtime=True, legacy=True, fetched=True)
     assert bridge._needs_chunk_delivery(ARRAY_NAME), "a legacy reader on the array keeps the chunk delivery"
 
     scattered = []
@@ -804,7 +802,7 @@ def test_runtime_only_array_ships_its_menu_and_no_data(monkeypatch):
     scheduler (an empty ``update_data`` + an empty desire list would be pure round trips).
     """
     bridge, wire_client = _make_send_bridge()
-    bridge._task_states = {ARRAY_NAME: TaskState(runtime=True, legacy=False)}
+    bridge._delivery = {ARRAY_NAME: DeliveryState(runtime=True, legacy=False, fetched=True)}
     scattered = []
 
     def recording_scatter(*args, **kwargs):
@@ -859,7 +857,7 @@ def test_first_send_on_lazy_path_ships_no_data():
     bridge, wire_client = _make_send_bridge()
     # The lazy-path state at the first send: nothing prefetched, so the state cache is empty and the handshake is the
     # only source. Runtime target with no legacy reader -- the data-free shape.
-    bridge._task_states = {}
+    bridge._delivery = {}
     handshake = _WireHandshake({"runtime": True, "legacy": False})
     bridge.handshake = handshake
 
@@ -881,7 +879,7 @@ def test_first_send_on_lazy_path_ships_no_data():
 
     assert handshake.reads == [ARRAY_NAME], "the first send must read the array's delivery state"
     assert scattered == [], "the FIRST send of a runtime-only array must not scatter the chunk"
-    assert bridge._task_states[ARRAY_NAME] == TaskState(runtime=True, legacy=False), (
+    assert bridge._delivery[ARRAY_NAME] == DeliveryState(runtime=True, legacy=False, fetched=True), (
         "the fetch must fill the cache the decision needs"
     )
     _, payload = wire_client.events[0]
@@ -970,14 +968,14 @@ def test_departed_runtime_callback_flips_the_array_off(fleets, client, monkeypat
     deisa = make_deisa(fleets, client, monkeypatch)
 
     runtime_id = register(deisa, lambda window: None)
-    assert deisa._runtime_arrays == {ARRAY_NAME}
+    assert deisa._arrays[ARRAY_NAME].runtime
     deisa._flush_delivery_state_to_handshake()
     assert deisa.handshake.runtime_arrays == {ARRAY_NAME}
 
     register(deisa, lambda window: None, precompute=False)
     deisa.unregister_callback(runtime_id)
 
-    assert deisa._runtime_arrays == set(), "no runtime callback is left on the array"
+    assert not deisa._arrays[ARRAY_NAME].runtime, "no runtime callback is left on the array"
     deisa.execute_callbacks()
     assert deisa.handshake.runtime_arrays == set(), "the pruned set is re-filed at the cycle boundary"
 
@@ -1062,12 +1060,11 @@ def _make_send_bridge():
     # The cached delivery state, as the init-time prefetch leaves it: a runtime-delivery target AND a legacy
     # (chunk-reading) array, so these tests keep measuring the full-chunk payload. The data-free path (runtime target
     # and no legacy reader) has its own test below.
-    bridge._task_states = {ARRAY_NAME: TaskState(runtime=True, legacy=True)}
+    bridge._delivery = {ARRAY_NAME: DeliveryState(runtime=True, legacy=True, fetched=True)}
     # No handshake: the state above is already the cached result, so ``send`` must find the array fetched and never
-    # enter the per-array broadcast (presence in ``_task_states`` is the fetch marker).
+    # enter the per-array broadcast (``DeliveryState.fetched`` is the fetch marker).
     bridge.handshake = None
     bridge._plan_pumps = {}
-    bridge._runtime_last_chunk = {}
     bridge._scatter_full = lambda *args, **kwargs: {
         "future": "key-0",
         "who_has": {"worker-0": ["key-0"]},
@@ -1182,8 +1179,8 @@ def test_menu_round_trip_preserves_keys_values_dtypes_and_stamps(fleets, client,
 # ---------------------------------------------------------------------------------------------------------------------
 # ``Bridge.send`` <-> the on-demand transport (K5F-18). Two lines inside one ``if`` in ``send()`` are the ONLY link
 # between the plan transport and the simulation loop: the ``PlanPump.serve`` boundary call and the
-# ``_runtime_last_chunk`` retention. Before this pin, deleting either one left this file at 21 passed -- ``std``, every
-# axis reduction and every menu miss could be disconnected from the run with a green suite.
+# ``DeliveryState.last_chunk`` retention. Before this pin, deleting either one left this file at 21 passed -- ``std``,
+# every axis reduction and every menu miss could be disconnected from the run with a green suite.
 # ---------------------------------------------------------------------------------------------------------------------
 class _RecordingReportQueue:
     """The array's plan report queue, recording what the bridge posts instead of handing it to the host."""
@@ -1238,7 +1235,7 @@ def test_send_serves_pending_plans_then_retains_the_chunk_by_reference():
     assert boundary_calls[0] == (None, None), (
         "the boundary runs BEFORE the retention: nothing is held on the first send"
     )
-    retained_timestep, retained_chunk = bridge._runtime_last_chunk[ARRAY_NAME]
+    retained_timestep, retained_chunk = bridge._delivery[ARRAY_NAME].last_chunk
     assert retained_timestep == 0
     assert retained_chunk is first, "the retained chunk must be the object passed in, not a copy"
 
@@ -1252,7 +1249,7 @@ def test_send_serves_pending_plans_then_retains_the_chunk_by_reference():
 
     assert len(boundary_calls) == 2, "the boundary runs once per send"
     assert boundary_calls[1] == (0, first), "the boundary must fold the PREVIOUS chunk, entered before the retention"
-    retained_timestep, retained_chunk = bridge._runtime_last_chunk[ARRAY_NAME]
+    retained_timestep, retained_chunk = bridge._delivery[ARRAY_NAME].last_chunk
     assert retained_timestep == 1
     assert retained_chunk is second, "the retention must follow the boundary, keeping THIS timestep's chunk"
     # The answer belongs to timestep 0: ``first`` was still the retained chunk when the plan was served.

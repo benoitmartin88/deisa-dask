@@ -32,7 +32,7 @@ import gc
 import logging
 import os.path
 import time
-from collections import deque
+from collections import defaultdict, deque
 from typing import Any, Dict, List
 
 import dask
@@ -54,7 +54,7 @@ from utils import (
 )
 
 from deisa.dask import Bridge, Deisa
-from deisa.dask.deisa import DEFAULT_SLIDING_WINDOW_SIZE, _is_run_aborting
+from deisa.dask.deisa import DEFAULT_SLIDING_WINDOW_SIZE, ArrayMode, _is_run_aborting
 from deisa.dask.precompute_errors import RawFieldReadError, UnsupportedReductionError
 from deisa.dask.utils import build_deisa_array
 
@@ -90,6 +90,11 @@ class _FakeHandshake:
         self.legacy_arrays = list(array_names)
 
 
+def _runtime_names(d: Deisa) -> set:
+    """The array names ``d`` files as runtime-delivery targets, read off its per-array delivery-mode records."""
+    return {name for name, mode in d._arrays.items() if mode.runtime}
+
+
 def _make_deisa_stub() -> Deisa:
     """A Deisa instance with the registration surfaces stubbed (no cluster)."""
     d = Deisa.__new__(Deisa)
@@ -98,8 +103,7 @@ def _make_deisa_stub() -> Deisa:
     d.arrays_metadata = META_A
     d._callbacks = {}
     d._callbacks_by_array = {}
-    d._runtime_arrays = set()
-    d._legacy_arrays = set()
+    d._arrays = defaultdict(ArrayMode)
     d._topic_handlers = {}
     d._callback_seq = 0
     d._tasks = set()
@@ -179,7 +183,7 @@ class TestDeisaRegistration:
         assert "a" in d.client.subscribed
         # The delivery state is filed immediately (a bridge on the wait_for_go=False path fetches it lazily on its
         # first send(), possibly before the next cycle).
-        assert d._runtime_arrays == {"a"}
+        assert _runtime_names(d) == {"a"}
         assert d.handshake.runtime_arrays == ["a"]
 
     def test_registration_failure_leaves_no_trace(self):

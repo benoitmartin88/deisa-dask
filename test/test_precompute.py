@@ -63,6 +63,7 @@ each is proven here by construction, so nothing depends on the class surviving:
 """
 
 import functools
+from collections import defaultdict
 
 import numpy as np
 import pytest
@@ -77,7 +78,7 @@ from utils import (
 
 from deisa.dask import runtime_errors as errors
 from deisa.dask.collection import DeisaCollection
-from deisa.dask.deisa import Deisa
+from deisa.dask.deisa import ArrayMode, Deisa
 from deisa.dask.runtime_dispatch import PlanDispatcher, PlanResponder
 
 # The chunk every branch callable is exercised on: mixed signs, so max/min/mean/var distinguish the ops.
@@ -911,7 +912,7 @@ def test_each_callback_gets_its_own_collection() -> None:
     deisa = Deisa.__new__(Deisa)
     deisa.arrays_metadata = DEFAULT_META
     deisa._runtime_transports = {}
-    deisa._runtime_latest_timestep = {}
+    deisa._arrays = defaultdict(ArrayMode)
     deisa._callbacks_by_array = {"f": {"cb-1", "cb-2"}}
     # Delivery mode is per CALLBACK (decision F3): the view builder reads each payload's ``precompute`` flag, so the
     # stubbed registrations must carry one like a real one does.
