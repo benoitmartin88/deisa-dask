@@ -501,6 +501,13 @@ class Bridge(IBridge):
         For single-bridge arrays (sub_comm_size == 1), skips the gather entirely
         and updates the scheduler directly.
 
+        The delivery is dispatched to ONE of three regimes, chosen from the array's own delivery state right
+        after the boundary: ``_send_data_free`` (a runtime target nothing reads the data of: the eager menu
+        is the whole payload), ``_send_runtime`` (a runtime target that still has a chunk reader: menu AND
+        chunk) and ``_send_legacy`` (no runtime reader: the chunk alone). The boundary above the dispatch --
+        the plan-pump collective and the K7F-06 fetch-before-decide -- stays HERE: every rank of the array
+        enters the same collectives in the same order before any regime is entered.
+
         - ``:param array_name:`` The name of the data array being sent as a string.
         - ``:param chunk:`` A numpy ndarray containing the data chunk to be sent to the workers.
         - ``:param timestep:`` The current timestep associated to the sent data chunk.
@@ -524,6 +531,62 @@ class Bridge(IBridge):
                 raise ValueError("timestep must be a scalar, a 0D array or a 1D array of size 1.")
         assert isinstance(timestep, int)
 
+        workers = self._select_workers(array_name, timestep, **kwargs)
+
+        # Determine communicator from cached sub-comms (from comm.Split())
+        sub_comm = self._array_comms.get(array_name)
+
+        if sub_comm == _COMM_NULL:
+            # This rank doesn't participate in this array
+            logger.debug(f"[{self.id}] send() rank not in participating set for '{array_name}', skipping")
+            return
+
+        # Runtime reduction transport: answer the on-demand requests that arrived since the previous send BEFORE the
+        # retained chunk is replaced (a request names the timestep that was last sent, so that is the chunk it folds),
+        # then retain this timestep's chunk for the next boundary. Both steps only READ or hold a reference to the
+        # chunk -- nothing is computed from it here -- so the reduce-before-scatter ordering below is untouched. The
+        # cost is one retained chunk reference per array per bridge (replaced, not accumulated) for every array this
+        # rank participates in, flag or no flag: a rank whose own flag is off still has to answer a request its root
+        # broadcast, so neither the collective nor the retention may depend on the per-process flag.
+        pump = self._plan_pumps.get(array_name)
+        if pump is not None:
+            state = self._delivery.setdefault(array_name, DeliveryState())  # unfetched: only ``last_chunk`` is used
+            pump.serve(state.last_chunk)
+            state.last_chunk = (int(timestep), chunk)
+
+        # Fetch (and cache) the array's delivery state BEFORE deciding whether data must ship: on the lazy path
+        # (wait_for_go=False) this call is what fills the caches, and computing the data-free decision before the fetch
+        # made the FIRST send of every runtime-delivery array take the full-chunk scatter (exposed by the worker-memory
+        # harness, which asserts after exactly one send). The fetch is a local cache read on every send but the first,
+        # and the per-array broadcast it enters on a miss is in the same collective order either way -- every rank of
+        # the sub-comm runs these lines in this order.
+        self._ensure_task_state(array_name)
+
+        state = self._delivery.get(array_name)
+        runtime_delivery = state is not None and state.runtime
+
+        # Whether the chunk has to be shipped at all: a runtime-delivery array with no legacy reader is answered
+        # entirely by the menu and by the on-demand plans served above, so nothing on the workers ever reads its data.
+        # Everything else keeps the previous behaviour.
+        if not self._needs_chunk_delivery(array_name):
+            self._send_data_free(array_name, chunk, timestep, sub_comm)
+        elif runtime_delivery:
+            self._send_runtime(array_name, chunk, timestep, sub_comm, workers)
+        else:
+            self._send_legacy(array_name, chunk, timestep, sub_comm, workers)
+
+    def _select_workers(self, array_name: str, timestep: int, **kwargs) -> List[str]:
+        """Pick the ONE worker this bridge's chunk goes to: round-robin over the sorted worker list.
+
+        This is ``send``'s whole worker axis, called at its original position -- before the delivery boundary -- so
+        the optional ``update_workers`` refresh (one sub-comm broadcast, entered by every rank of the array) keeps its
+        place in the collective order. The caller's ``filter_workers`` keeps its validation contract: a filter that
+        does not return a non-empty list of strings raises ``TypeError``.
+
+        - ``:param array_name:`` Registered array the send is for; its sub-comm carries the refresh broadcast.
+        - ``:param timestep:`` The current timestep, which picks the worker together with the bridge id.
+        - ``:param kwargs:`` ``send()``'s optional kwargs: ``update_workers`` (bool), ``filter_workers`` (callable).
+        """
         assert isinstance(self.workers, dict)
         workers = dict(self.workers)  # make a copy so that the user-defined function does not modify self
 
@@ -561,61 +624,103 @@ class Bridge(IBridge):
         workers = [workers[index]]
 
         assert len(workers) == 1, "worker list should be of length 1."
+        return workers
 
-        # Determine communicator from cached sub-comms (from comm.Split())
-        sub_comm = self._array_comms.get(array_name)
+    def _send_data_free(self, array_name: str, chunk: np.ndarray, timestep: int, sub_comm: Any) -> None:
+        """Runtime-only delivery: the eager menu IS the payload and no data leaves the bridge.
 
-        if sub_comm == _COMM_NULL:
-            # This rank doesn't participate in this array
-            logger.debug(f"[{self.id}] send() rank not in participating set for '{array_name}', skipping")
-            return
+        Every callback on this array reads the menu or dispatches an on-demand plan, and the plans were served from
+        the retained chunk at the boundary above, so nothing on the workers ever reads the data.
 
-        # Runtime reduction transport: answer the on-demand requests that arrived since the previous send BEFORE the
-        # retained chunk is replaced (a request names the timestep that was last sent, so that is the chunk it folds),
-        # then retain this timestep's chunk for the next boundary. Both steps only READ or hold a reference to the
-        # chunk -- nothing is computed from it here -- so the reduce-before-scatter ordering below is untouched. The
-        # cost is one retained chunk reference per array per bridge (replaced, not accumulated) for every array this
-        # rank participates in, flag or no flag: a rank whose own flag is off still has to answer a request its root
-        # broadcast, so neither the collective nor the retention may depend on the per-process flag.
-        pump = self._plan_pumps.get(array_name)
-        if pump is not None:
-            state = self._delivery.setdefault(array_name, DeliveryState())  # unfetched: only ``last_chunk`` is used
-            pump.serve(state.last_chunk)
-            state.last_chunk = (int(timestep), chunk)
+        - ``:param array_name:`` Registered array the send is for.
+        - ``:param chunk:`` This bridge's own numpy chunk, which stays here.
+        - ``:param timestep:`` The current timestep.
+        - ``:param sub_comm:`` The array's sub-communicator on this rank.
+        """
+        # The menu is folded HERE, on the local numpy chunk and before ANY scatter, for the reason spelled out in
+        # ``_send_runtime``: on this path it is the ENTIRE payload, so it must still be built.
+        menu, menu_error = self._build_runtime_menu(array_name, chunk, timestep)
 
-        # Fetch (and cache) the array's delivery state BEFORE deciding whether data must ship: on the lazy path
-        # (wait_for_go=False) this call is what fills the caches, and computing the data-free decision before the fetch
-        # made the FIRST send of every runtime-delivery array take the full-chunk scatter (exposed by the worker-memory
-        # harness, which asserts after exactly one send). The fetch is a local cache read on every send but the first,
-        # and the per-array broadcast it enters on a miss is in the same collective order either way -- every rank of
-        # the sub-comm runs these lines in this order.
-        self._ensure_task_state(array_name)
+        logger.debug(
+            f"[{self.id}] send() runtime-only delivery: no data shipped for array={array_name}, "
+            f"chunk shape={chunk.shape} stays on the bridge"
+        )
+        res = {"future": [], "who_has": {}, "nbytes": {}}
+        self._publish(array_name, res, chunk, timestep, sub_comm, menu, menu_error, data_free=True)
 
-        # Whether the chunk has to be shipped at all: a runtime-delivery array with no legacy reader is answered
-        # entirely by the menu below and by the on-demand plans served above, so nothing on the workers ever reads its
-        # data. Everything else keeps the previous behaviour.
-        data_free_delivery = not self._needs_chunk_delivery(array_name)
+    def _send_runtime(
+        self, array_name: str, chunk: np.ndarray, timestep: int, sub_comm: Any, workers: List[str]
+    ) -> None:
+        """Runtime delivery that still needs the chunk: the eager menu AND the full-chunk scatter.
 
+        A ``precompute=False`` callback shares the array with a ``precompute=True`` one, so the chunk has to cross the
+        boundary for that reader while the menu answers the runtime callback -- decision F3's escape hatch. The menu is
+        still folded first, on the local chunk and before the scatter.
+
+        - ``:param array_name:`` Registered array the send is for.
+        - ``:param chunk:`` This bridge's own numpy chunk.
+        - ``:param timestep:`` The current timestep.
+        - ``:param sub_comm:`` The array's sub-communicator on this rank.
+        - ``:param workers:`` The single worker the chunk is scattered to.
+        """
         # Eager scalar menu (the zero-round-trip half of the transfer strategy): computed HERE, on the local numpy
         # chunk and before ANY scatter, so the menu values are chunk-local reductions and the chunk itself is never
         # shipped to convey them. Nothing below may run before this line without breaking the ordering invariant.
-        # Gated on the array being a runtime-delivery target: with no callback reading it, the folds would be pure
-        # critical-path cost. On the data-free path the menu is the ENTIRE payload, so it must still be built.
         menu, menu_error = self._build_runtime_menu(array_name, chunk, timestep)
 
-        # The only scatter site left: the full chunk (the legacy ``precompute=False`` delivery path). On the data-free
-        # path: nothing at all. ``precomputed_meta`` stays in the payload contract but is empty by construction -- no
-        # branch is ever filed, so nothing but the chunk can cross the boundary.
+        # The only scatter site left: the full chunk (the legacy ``precompute=False`` delivery path).
+        logger.debug(f"[{self.id}] send() scattering full chunk shape={chunk.shape}")
+        res = self._scatter_full(chunk, workers=workers, hash=False)
+        self._publish(array_name, res, chunk, timestep, sub_comm, menu, menu_error, data_free=False)
+
+    def _send_legacy(
+        self, array_name: str, chunk: np.ndarray, timestep: int, sub_comm: Any, workers: List[str]
+    ) -> None:
+        """Full-chunk delivery with NO menu: the chunk alone crosses the boundary.
+
+        This is the ``precompute=False`` path, and the fallback for an array whose delivery state this bridge cannot
+        know. No callback declared a ``precompute=True`` reader on the array, so the eager menu would have no
+        consumer: its folds are skipped entirely rather than computed and dropped.
+
+        - ``:param array_name:`` Registered array the send is for.
+        - ``:param chunk:`` This bridge's own numpy chunk.
+        - ``:param timestep:`` The current timestep.
+        - ``:param sub_comm:`` The array's sub-communicator on this rank.
+        - ``:param workers:`` The single worker the chunk is scattered to.
+        """
+        logger.debug(f"[{self.id}] send() scattering full chunk shape={chunk.shape}")
+        res = self._scatter_full(chunk, workers=workers, hash=False)
+        self._publish(array_name, res, chunk, timestep, sub_comm, None, None, data_free=False)
+
+    def _publish(
+        self,
+        array_name: str,
+        res: dict,
+        chunk: np.ndarray,
+        timestep: int,
+        sub_comm: Any,
+        menu: Optional[EagerMenu],
+        menu_error: Optional[str],
+        data_free: bool,
+    ) -> None:
+        """Publish one timestep's topic event: the single-bridge fast path, or the sub-comm gather and rank-0 merge.
+
+        Shared by the three regimes -- the ONLY thing they differ in is what they scattered and whether they built a
+        menu, so the payload assembly (and the ``futures``/``menu``/``menu_error`` contract) lives in exactly one place.
+
+        - ``:param array_name:`` Registered array the event is for.
+        - ``:param res:`` The scatter result (``{"future", "who_has", "nbytes"}``); on the data-free path an empty one.
+        - ``:param chunk:`` This bridge's own numpy chunk, read for the payload's shape/dtype.
+        - ``:param timestep:`` The current timestep, carried as the event's ``iteration``.
+        - ``:param sub_comm:`` The array's sub-communicator on this rank; the gather runs on it when it has peers.
+        - ``:param menu:`` This bridge's eager menu for ``timestep``, or ``None`` when no menu was built.
+        - ``:param menu_error:`` The cause of a failed menu build, or ``None``.
+        - ``:param data_free:`` True when nothing was scattered: nothing to register, nothing to desire, no future to
+          name.
+        """
+        # ``precomputed_meta`` stays in the payload contract but is empty by construction -- no branch is ever filed,
+        # so nothing but the chunk can cross the boundary.
         precomputed_meta: Dict[str, Dict[str, Any]] = {}
-        if data_free_delivery:
-            logger.debug(
-                f"[{self.id}] send() runtime-only delivery: no data shipped for array={array_name}, "
-                f"chunk shape={chunk.shape} stays on the bridge"
-            )
-            res = {"future": [], "who_has": {}, "nbytes": {}}
-        else:
-            logger.debug(f"[{self.id}] send() scattering full chunk shape={chunk.shape}")
-            res = self._scatter_full(chunk, workers=workers, hash=False)
 
         # Single-bridge fast-path: no collective needed
         if sub_comm.Get_size() == 1:
@@ -627,7 +732,7 @@ class Bridge(IBridge):
                 precomputed_meta=precomputed_meta,
                 menu=menu,
                 menu_error=menu_error,
-                data_free=data_free_delivery,
+                data_free=data_free,
             )
             return
 
@@ -674,7 +779,7 @@ class Bridge(IBridge):
 
             # only update the scheduler with who has what and register the futures once. Skipped on the data-free
             # path: an empty update + an empty desire list are pure scheduler round trips.
-            if not data_free_delivery:
+            if not data_free:
                 self.client.sync(self.client.scheduler.update_data, who_has=who_has, nbytes=nbytes)
 
                 # mimic mechanism from Queue. Keep a reference on keys until reception in topic handler. TODO: id=0 can
@@ -684,7 +789,7 @@ class Bridge(IBridge):
             # Topic event: with precompute, ``futures`` lists one entry per (bridge, reduction) pair with the partial's
             # reduced shape/dtype; the Deisa side rebuilds the graph from these small partials.
             futures_payload: List[Dict[str, Any]]
-            if data_free_delivery:
+            if data_free:
                 # No key crossed the boundary, so there is nothing to register, nothing to desire and no future to
                 # name: the menus ARE the payload (an ``update_data({})`` would be an empty scheduler round trip).
                 futures_payload = []
