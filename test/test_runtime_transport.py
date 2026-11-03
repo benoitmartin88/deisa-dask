@@ -31,10 +31,14 @@ The PRODUCTION transport of the runtime reduction path: the host's queue exchang
 
 Nothing in this file injects a transport. The host half is ``Deisa._attach_runtime_transports`` -- the exact call
 ``Deisa.__init__`` makes -- over real ``distributed.Queue`` objects, and the bridge half is the production SHAPE of the
-array side: exactly ONE queue consumer per array (the root bridge's ``serve_plan_queue`` thread), the requests parked
-in the root's ``PlanRequestBacklog``, and ``PlanPump.serve`` doing the folding at the send boundary. One
+array side: exactly ONE queue consumer per array (the root bridge's poll inside ``PlanPump.serve``), the requests it
+takes parked in the root's ``PlanRequestBacklog``, and ``PlanPump.serve`` doing the folding at the send boundary. One
 consumer is what production has, and a per-rank pump harness (N consumers) hides the failure mode that matters: one
 request handed to one consumer must produce exactly N reports for N bridges, not N per copy of the request.
+
+Nothing polls the request queue between boundaries either: the pickup is one short poll at the boundary itself, so a
+request is answered at the first send AFTER it reached the queue. One test pins that contract directly (an empty queue
+folds nothing; a request queued before the boundary is served by it; nothing is served twice).
 
 Only MPI itself is out of scope: the multi-bridge collective runs over ``FakeComm`` (the same stand-in
 ``test_runtime_dispatch`` uses), because a two-rank mpi4py run is not something a unit suite can host. Everything that
@@ -55,7 +59,7 @@ import uuid
 import numpy as np
 import pytest
 from distributed import Client, LocalCluster, Queue
-from utils import FakeComm
+from utils import FakeComm, wait_for
 
 from deisa.dask import bridge as bridge_module
 from deisa.dask import deisa as deisa_module
@@ -67,11 +71,9 @@ from deisa.dask.deisa import ArrayMode, Deisa
 from deisa.dask.runtime_compose import compose_request
 from deisa.dask.runtime_dispatch import (
     PlanRequest,
-    PlanRequestBacklog,
     QueuePlanExchange,
     plan_report_queue_name,
     plan_request_queue_name,
-    serve_plan_queue,
 )
 
 ARRAY_NAME = "f"
@@ -116,17 +118,19 @@ def make_plan(timestep=0, axes=(0,)):
     return PlanRequest(request_id=uuid.uuid4().hex, array_name=ARRAY_NAME, timestep=timestep, request=request)
 
 
-def make_bridge_stub(rank, timestep, chunk, report_queue, sub_comm):
+def make_bridge_stub(rank, timestep, chunk, request_queue, report_queue, sub_comm):
     """One bridge, with exactly the transport state ``Bridge.__init__`` gives it, and nothing else.
 
-    The array's ``PlanPump`` is the production state (every participating rank has one, flag or no flag);
-    ``DeliveryState.last_chunk`` is what the last ``send`` retained; only the array root owns a report queue.
+    The array's ``PlanPump`` is the production state (every participating rank has one, flag or no flag); the root
+    holds the array's pair of queues, because it is the array's ONE queue consumer; ``DeliveryState.last_chunk`` is
+    what the last ``send`` retained.
     """
     bridge = Bridge.__new__(Bridge)
     bridge.id = rank
     bridge.arrays_metadata = {ARRAY_NAME: {**METADATA[ARRAY_NAME], "chunk_position": chunk_position(rank)}}
     pump = PlanPump(ARRAY_NAME, sub_comm, chunk_position(rank), rank)
     if rank == 0:
+        pump.request_queue = request_queue
         pump.report_queue = report_queue
     bridge._plan_pumps = {ARRAY_NAME: pump}
     bridge._delivery = {ARRAY_NAME: DeliveryState(fetched=True, last_chunk=(timestep, chunk))}
@@ -184,36 +188,47 @@ def deliver(deisa, timestep):
     deisa.client.sync(lambda: _drain(deisa._tasks))
 
 
-def test_serve_plan_queue_moves_requests_into_the_backlog(client):
-    """The bridge-side loop is `serve_plan_queue`, unchanged, over a real dask queue."""
-    request_queue = Queue(plan_request_queue_name("unit-test-array"), client=client)
-    backlog = PlanRequestBacklog()
-    stop = threading.Event()
-    thread = threading.Thread(target=serve_plan_queue, args=(request_queue, backlog, stop), daemon=True)
-    thread.start()
-    try:
-        plan = make_plan()
-        request_queue.put(plan)
-        drained = []
-        deadline = time.monotonic() + 20.0
-        while not drained and time.monotonic() < deadline:
-            time.sleep(0.01)
-            drained = backlog.drain()
-        assert [entry.request_id for entry in drained] == [plan.request_id]
-    finally:
-        stop.set()
-        thread.join(timeout=10)
-        assert not thread.is_alive()
+def test_the_boundary_poll_is_the_pickup(client):
+    """``PlanPump.serve`` polls the host's queue itself: no thread, no stop flag, and exactly one boundary's work.
+
+    Three phases, the whole contract the removed polling thread used to carry:
+
+    - an empty queue folds nothing and posts nothing;
+    - a request queued BEFORE the boundary is answered by that boundary -- and a request that arrives after one
+      boundary's poll is therefore answered by the NEXT one, because it simply stays in the queue;
+    - a request is served ONCE: the boundary after that has nothing left to drain.
+    """
+    field = make_field(seed=2)
+    plan = make_plan(axes=(0,))
+    pump = PlanPump(ARRAY_NAME, FakeComm(FakeComm.State(1), 0), chunk_position(0), 0)
+    pump.open_queues(client)  # the production root: it derives its own pair of queues from the array name
+    host_requests = Queue(plan_request_queue_name(ARRAY_NAME), client=client)
+    host_reports = Queue(plan_report_queue_name(ARRAY_NAME), client=client)
+
+    pump.serve((0, field))  # nothing queued: this boundary folds nothing
+    with pytest.raises(TimeoutError):
+        host_reports.get(timeout=0.2)
+
+    host_requests.put(plan)  # the host asks between two boundaries
+    pump.serve((0, field))  # the NEXT boundary serves it
+    report = host_reports.get(timeout=20)
+    assert report.request_id == plan.request_id
+    assert report.error is None, f"no bridge may answer with an error report: {report.error!r}"
+    assert np.allclose(report.partial, field.sum(axis=0))
+
+    pump.serve((0, field))  # and only once
+    with pytest.raises(TimeoutError):
+        host_reports.get(timeout=0.2)
 
 
 def test_two_successive_axis_folds_are_served_by_the_production_transport(client, monkeypatch):
-    """``sum(axis=0)`` twice, over the wiring production has: ONE root pump, the send boundary, no injected exchange.
+    """``sum(axis=0)`` twice, over the wiring production has: ONE root poll, the send boundary, no injected exchange.
 
-    The production shape is the point. Exactly one queue consumer per array (the root bridge's ``serve_plan_queue``)
-    parks requests in the root's backlog, and the array's send boundary broadcasts them to the peers, folds every
-    chunk and posts one report per bridge. A harness with one straight-through pump per rank models N consumers, which
-    production does not have: it hides the failure this test exists for -- one request answered N times per copy, so
-    that the second request collects the first one's leftovers and the run aborts on its second reduction.
+    The production shape is the point. Exactly one queue consumer per array (the root bridge's poll inside ``serve``)
+    takes the requests at the boundary and broadcasts them to the peers, and every rank folds its chunk and posts one
+    report per bridge. A harness with one straight-through pump per rank models N consumers, which production does not
+    have: it hides the failure this test exists for -- one request answered N times per copy, so that the second
+    request collects the first one's leftovers and the run aborts on its second reduction.
     """
     fields = [make_field(seed=0), make_field(seed=1)]
     per_timestep = [split_chunks(field) for field in fields]
@@ -234,28 +249,56 @@ def test_two_successive_axis_folds_are_served_by_the_production_transport(client
     state = FakeComm.State(bridge_count)
     comms = [FakeComm(state, rank) for rank in range(bridge_count)]
     bridges = [
-        make_bridge_stub(rank, 0, per_timestep[0][rank], report_queue, comms[rank]) for rank in range(bridge_count)
-    ]
-    stop = threading.Event()
-
-    def boundary(rank):
-        """One rank's send boundary, re-entered like the simulation re-enters it: in lockstep with every peer."""
-        while not stop.is_set():
-            serve_boundary(bridges[rank])
-            time.sleep(0.002)
-
-    # ONE consumer for the whole array, exactly as ``Bridge._start_runtime_plan_pumps`` starts it.
-    pump_stop = threading.Event()
-    pump = threading.Thread(
-        target=serve_plan_queue,
-        args=(request_queue, bridges[0]._plan_pumps[ARRAY_NAME].backlog, pump_stop),
-        name="plan-pump-root",
-        daemon=True,
-    )
-    threads = [
-        threading.Thread(target=boundary, args=(rank,), name=f"send-boundary-{rank}", daemon=True)
+        make_bridge_stub(rank, 0, per_timestep[0][rank], request_queue, report_queue, comms[rank])
         for rank in range(bridge_count)
     ]
+    stop = threading.Event()
+    # One counter per rank: completed boundary entries. The test retains a timestep's chunk and then waits until every
+    # rank has been through the boundary once WITH it, so no rank can still be parked in a collective holding the
+    # PREVIOUS timestep's chunk when the host asks -- the production invariant that ``send`` retains the chunk before a
+    # request can name that timestep.
+    served = [0] * bridge_count
+
+    def serve_rank(rank):
+        """Drive one rank's send boundary once.
+
+        - ``:param rank:`` The bridge rank entering the boundary.
+        """
+        serve_boundary(bridges[rank])
+        served[rank] += 1
+
+    def one_round():
+        """One full send boundary, every rank in lockstep -- so no rank is ever left inside a collective."""
+        peers = [
+            threading.Thread(target=serve_rank, args=(rank,), name=f"send-boundary-{rank}", daemon=True)
+            for rank in range(1, bridge_count)
+        ]
+        for peer in peers:
+            peer.start()
+        serve_rank(0)  # the root polls the host's queue here, exactly as production does
+        for peer in peers:
+            peer.join(timeout=20)
+        assert not any(peer.is_alive() for peer in peers), "a peer rank never left the send boundary"
+
+    def boundary():
+        """Re-enter the boundary the way the simulation does, one lockstep round at a time, until the test is done."""
+        while not stop.is_set():
+            one_round()
+            time.sleep(0.002)
+
+    def retain(timestep):
+        """Retain the timestep's chunk on every rank, then wait until every boundary has run with it.
+
+        - ``:param timestep:`` The timestep the simulation has just sent.
+        """
+        for rank in range(bridge_count):
+            bridges[rank]._delivery[ARRAY_NAME].last_chunk = (timestep, per_timestep[timestep][rank])
+        before = list(served)
+        assert wait_for(lambda: all(served[rank] > before[rank] for rank in range(bridge_count)), timeout=20.0), (
+            "a rank never re-entered its send boundary after the chunk was retained"
+        )
+
+    driver = threading.Thread(target=boundary, name="send-boundary", daemon=True)
 
     seen = []
 
@@ -263,21 +306,16 @@ def test_two_successive_axis_folds_are_served_by_the_production_transport(client
         seen.append(window[-1].sum(axis=0).compute())
 
     register_callback(deisa, callback)
-    pump.start()
-    for thread in threads:
-        thread.start()
+    driver.start()
     try:
         for timestep in (0, 1):
-            for rank in range(bridge_count):
-                # The simulation has just SENT this timestep: the bridge retains it, so that is what the boundary folds.
-                bridges[rank]._delivery[ARRAY_NAME].last_chunk = (timestep, per_timestep[timestep][rank])
+            # The simulation has just SENT this timestep: the bridge retains it, so that is what the boundary folds.
+            retain(timestep)
             deliver(deisa, timestep)
     finally:
         stop.set()
-        pump_stop.set()
-        for thread in threads:
-            thread.join(timeout=20)
-        pump.join(timeout=20)
+        driver.join(timeout=20)
+        assert not driver.is_alive(), "the send-boundary driver never left its round"
         # ``Deisa.__del__`` closes ``self.client``; this stub borrows the module-scoped one.
         deisa.client = None
 
@@ -330,12 +368,12 @@ def test_window_reduction_older_than_the_delivery_is_refused_at_compose_time(cli
 
 
 def test_backlog_belongs_to_every_participating_array(monkeypatch):
-    """The send-boundary collective is decided by PARTICIPATION, and only the QUEUE PUMP needs a dask client.
+    """The send-boundary collective is decided by PARTICIPATION, and only the QUEUE PAIR needs a dask client.
 
     A rank still enters the boundary collective the array root broadcasts in. Gating the backlog on a per-process
     setting (the pre-fix shape) made the root issue a ``bcast`` while its peers went straight to the scatter: two
-    different collectives on one communicator, i.e. a hang instead of a refusal. The pump, by contrast, is reachable
-    only through a dask client, so a rank without one cannot start it.
+    different collectives on one communicator, i.e. a hang instead of a refusal. The queues, by contrast, are
+    reachable only through a dask client, so a rank without one cannot open them.
     """
     bridge = Bridge.__new__(Bridge)
     bridge.id = 0
@@ -350,35 +388,35 @@ def test_backlog_belongs_to_every_participating_array(monkeypatch):
         "every participating array needs a pump, so the send boundary is the same collective on every rank"
     )
     pump = bridge._plan_pumps[ARRAY_NAME]
-    assert pump.thread is None, "the queue pump is what the client gate stops"
+    assert pump.request_queue is None, "the queue poll is what the client gate stops"
     assert pump.report_queue is None, "no queue is touched without a client"
 
 
-def test_bridge_send_boundary_serves_the_backlog_over_the_sub_comm(client):
-    """``PlanPump.serve`` -- the send-boundary half -- broadcasts, folds every chunk and answers."""
+def test_bridge_send_boundary_serves_the_queued_request_over_the_sub_comm(client):
+    """``PlanPump.serve`` -- the send-boundary half -- polls, broadcasts, folds every chunk and answers."""
     field = make_field(seed=1)
     chunks = split_chunks(field)
     plan = make_plan(axes=(0,))
 
     state = FakeComm.State(len(chunks))
     report_queue = Queue(plan_report_queue_name(ARRAY_NAME), client=client)
+    host_requests = Queue(plan_request_queue_name(ARRAY_NAME), client=client)
     comms = [FakeComm(state, rank) for rank in range(len(chunks))]
     bridges = []
-    pumps = []
     for rank, chunk in enumerate(chunks):
         bridge = Bridge.__new__(Bridge)
         bridge.id = rank
         bridge.arrays_metadata = {ARRAY_NAME: {**METADATA[ARRAY_NAME], "chunk_position": chunk_position(rank)}}
         pump = PlanPump(ARRAY_NAME, comms[rank], chunk_position(rank), rank)
         if rank == 0:
+            pump.request_queue = host_requests
             pump.report_queue = report_queue
         bridge._plan_pumps = {ARRAY_NAME: pump}
         bridge._delivery = {ARRAY_NAME: DeliveryState(fetched=True, last_chunk=(0, chunk))}
         bridges.append(bridge)
-        pumps.append(pump)
 
-    # The root's pump thread would have filled its backlog; the peers receive the request through the bcast.
-    pumps[0].backlog.put(plan)
+    # The host puts the request ONCE; the root's boundary poll takes it, the peers receive it through the bcast.
+    host_requests.put(plan)
 
     def serve(rank):
         """Drive one rank's send boundary (the collectives need every rank, as they do in ``send``)."""

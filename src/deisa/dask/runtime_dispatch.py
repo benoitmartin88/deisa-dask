@@ -52,11 +52,11 @@ because merging it would silently mix two timesteps of one field.
 
 **How the two messages travel in production.** Over a pair of dask queues per array, named by convention
 (:func:`plan_request_queue_name` / :func:`plan_report_queue_name`), which is the reverse channel the run already has:
-the bridge side is a daemon thread per array's root bridge (:func:`serve_plan_queue`) that moves requests into a
-:class:`PlanRequestBacklog`, and the array's next ``send`` boundary -- the one place where every rank of the array is
-inside the same sub-comm collective -- folds the retained chunk of the requested timestep and posts the reports back
-(:class:`QueuePlanExchange` is the host's half). Nothing is exchanged to agree on the names, and no bridge folds a
-chunk from a thread: a second thread inside an MPI communicator is not a safe place to be.
+the array root bridge polls its request queue once at each ``send`` boundary -- the one place where every rank of the
+array is inside the same sub-comm collective -- broadcasts what it collected, folds the retained chunk of the requested
+timestep and posts the reports back (:class:`QueuePlanExchange` is the host's half). Nothing is exchanged to agree on
+the names, and no bridge folds a chunk off its main thread: a second thread inside an MPI communicator is not a safe
+place to be.
 
 **The one timing bound of that design.** A request is answered at the array's *next* ``send``, so a request must reach
 the array root before the simulation sends that array again. The host waits ``_PLAN_REPORT_TIMEOUT_SECONDS`` and then
@@ -89,7 +89,6 @@ the reduction algebra, which is why it has its own request type and its own merg
 from __future__ import annotations
 
 import os
-import threading
 import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
@@ -119,7 +118,6 @@ __all__ = [
     "plan_report_queue_name",
     "plan_report_timeout",
     "plan_request_queue_name",
-    "serve_plan_queue",
     "serve_plan_requests",
 ]
 
@@ -476,16 +474,17 @@ def plan_report_queue_name(array_name: str) -> str:
     return f"{RUNTIME_REPORT_QUEUE_PREFIX}{array_name}"
 
 
-# How long a bridge waits for another plan request before re-checking its stop flag, and how long the host waits for
-# the reports of one request. The bridge bound is a poll interval (it costs one scheduler round trip); the host bound
-# is the one that must tolerate the simulation taking a timestep to reach its next send boundary -- and it is also the
-# bound a request that can never be served pays in full (see "The one timing bound of that design", above: a reduction
-# of the final delivered timestep has no further send to be answered at). That is why it is cycle-tolerable rather than
-# a five-minute stall, and why it is overridable. ``DEISA_RUNTIME_PLAN_TIMEOUT`` is read by the HOST only: it bounds
-# ``QueuePlanExchange.reports``' wait, and no bridge waits on it. The bridge half is a blocking ``get`` with a
-# ``_PLAN_QUEUE_POLL_SECONDS`` re-check of the stop flag, so a simulation whose timestep is longer than the host
-# default needs the variable set in the analytics host's environment alone.
-_PLAN_QUEUE_POLL_SECONDS: float = 0.5
+# How long the array root bridge waits for a plan request at one send boundary, and how long the host waits for the
+# reports of one request. The bridge bound is the cost a boundary pays for a request already in flight (one scheduler
+# round trip); a request that has not landed by then stays queued and is served at the NEXT boundary, which is why it is
+# a short bound and not a wait. The host bound is the one that must tolerate the simulation taking a timestep to reach
+# its next send boundary -- and it is also the bound a request that can never be served pays in full (see "The one
+# timing bound of that design", above: a reduction of the final delivered timestep has no further send to be answered
+# at). That is why it is cycle-tolerable rather than a five-minute stall, and why it is overridable.
+# ``DEISA_RUNTIME_PLAN_TIMEOUT`` is read by the HOST only: it bounds ``QueuePlanExchange``'s wait, and no bridge waits
+# on it, so a simulation whose timestep is longer than the host default needs the variable set in the analytics host's
+# environment alone.
+_PLAN_BOUNDARY_POLL_SECONDS: float = 0.02
 _PLAN_REPORT_TIMEOUT_SECONDS: float = 60.0
 _PLAN_REPORT_TIMEOUT_ENV: str = "DEISA_RUNTIME_PLAN_TIMEOUT"
 
@@ -507,29 +506,30 @@ def plan_report_timeout() -> float:
 
 
 class PlanRequestBacklog:
-    """The hand-off between a bridge's plan-queue thread and its per-timestep ``send`` boundary.
+    """The array root bridge's plan requests, parked between the queue poll and the boundary broadcast.
 
-    The queue thread appends, the send boundary drains, and the two never hold the lock at the same time as they touch
-    a chunk. Plans are accumulated rather than answered on the spot because answering needs the array's other bridges:
-    only the send boundary is a place where every rank of the array is parked in the same collective.
+    Only the root ever puts: it polls the host's request queue at the send boundary (``PlanPump.serve``) and drains the
+    backlog in the same call, because answering a request needs every rank of the array and only the send boundary is a
+    place where they are all parked in the same collective. Every other rank's backlog stays empty -- it receives the
+    requests through the boundary broadcast.
+
+    Nothing here is locked: the poll and the drain are two statements of one ``serve`` call on one thread, and no other
+    thread ever touches a backlog.
     """
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
         self._plans: List[PlanRequest] = []
 
     def put(self, plan: PlanRequest) -> None:
-        """Append one request for the next send boundary.
+        """Park one request for the fold that follows the poll.
 
         - ``:param plan:`` The request the host's queue delivered.
         """
-        with self._lock:
-            self._plans.append(plan)
+        self._plans.append(plan)
 
     def drain(self) -> List[PlanRequest]:
-        """Take every request received so far, oldest first (an empty list when none arrived)."""
-        with self._lock:
-            plans, self._plans = self._plans, []
+        """Take every parked request, oldest first (an empty list when the poll found none)."""
+        plans, self._plans = self._plans, []
         return plans
 
 
@@ -537,10 +537,10 @@ class QueuePlanExchange:
     """The analytics host's transport: one request/reports round trip over the run's two dask queues.
 
     This is the production transport: the host puts the request ONCE and then blocks until every bridge answered. One
-    put is the whole broadcast, because the array has exactly ONE queue consumer -- the array root bridge's plan pump
-    (:func:`serve_plan_queue`) -- and that root forwards the request to its peers at the send boundary, which is what
-    reaches the other bridges. It is a plain callable, the shape :class:`PlanDispatcher` takes, so nothing on the host
-    side knows about queues.
+    put is the whole broadcast, because the array has exactly ONE queue consumer -- the array root bridge, which polls
+    the queue at each ``send`` boundary (``PlanPump.serve``) -- and that root forwards the request to its peers inside
+    the boundary collective, which is what reaches the other bridges. It is a plain callable, the shape
+    :class:`PlanDispatcher` takes, so nothing on the host side knows about queues.
 
     Putting the request once PER BRIDGE would be wrong: a dask queue hands every item to exactly one consumer, so the
     single root consumer would drain all N copies, serve each copy with all N ranks, and post N*N reports into a report
@@ -592,34 +592,6 @@ class QueuePlanExchange:
                 f"{_PLAN_REPORT_TIMEOUT_ENV} for a simulation whose timestep takes longer than {self._timeout}s",
             ) from exc
         return reports
-
-
-def serve_plan_queue(
-    request_queue: Any,
-    backlog: PlanRequestBacklog,
-    stop: Optional[threading.Event] = None,
-    poll_seconds: float = _PLAN_QUEUE_POLL_SECONDS,
-) -> None:
-    """The bridge half of the transport: move plan requests off the host's queue into ``backlog``.
-
-    Runs in a daemon thread on the array's root bridge and touches nothing but the queue and the backlog: no
-    communicator call and no chunk. That is deliberate -- the chunk is folded by the bridge's MAIN thread at the next
-    ``send`` boundary, because that is the only point where every rank of the array is inside the same collective, and
-    because a second thread inside an MPI communicator is not a safe place to be.
-
-    - ``:param request_queue:`` The array's request queue (``get(timeout=...)``-capable).
-    - ``:param backlog:`` Where the requests are parked until the next send boundary.
-    - ``:param stop:`` Set to end the loop; a ``None`` request on the queue also ends it.
-    - ``:param poll_seconds:`` How long one ``get`` waits before the stop flag is re-checked.
-    """
-    while stop is None or not stop.is_set():
-        try:
-            plan = request_queue.get(timeout=poll_seconds)
-        except TimeoutError:
-            continue
-        if plan is None:  # stop sentinel
-            return
-        backlog.put(plan)
 
 
 # ---------------------------------------------------------------------------------------------------------------------

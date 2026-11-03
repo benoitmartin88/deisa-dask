@@ -1209,7 +1209,7 @@ def test_send_serves_pending_plans_then_retains_the_chunk_by_reference():
     second = np.random.default_rng(1).normal(size=CHUNK_SHAPE).astype(np.float32)
     bridge, _ = _make_send_bridge()
     # The production shape of a participating bridge: one pump for the array (its presence is what makes ``send`` enter
-    # the boundary), owning the backlog the root's poll thread would fill and the array's report queue.
+    # the boundary), owning the backlog the root's boundary poll fills and the array's report queue.
     pump = PlanPump(ARRAY_NAME, bridge._array_comms[ARRAY_NAME], chunk_position(0), bridge.id)
     reports = _RecordingReportQueue()
     pump.report_queue = reports

@@ -46,7 +46,6 @@ on-demand plan requests answered at the next ``send`` boundary by :class:`~deisa
 import asyncio
 import logging
 import sys
-import threading
 import uuid
 import zlib
 from collections import defaultdict, deque
@@ -66,13 +65,13 @@ from deisa.dask.collection import DeisaCollection
 from deisa.dask.constants import CLIENT_KEY, FEEDBACK_QUEUE_PREFIX, KEY_PREFIX, WAIT_FOR_EXECUTE_CB_EVENT
 from deisa.dask.handshake import Handshake
 from deisa.dask.runtime_dispatch import (
+    _PLAN_BOUNDARY_POLL_SECONDS,
     EagerMenu,
     PlanRequestBacklog,
     PlanResponder,
     build_eager_menu,
     plan_report_queue_name,
     plan_request_queue_name,
-    serve_plan_queue,
 )
 from deisa.dask.utils import called_from_event_loop, get_client, run_coro_on_private_loop
 
@@ -116,7 +115,7 @@ class DeliveryState:
 
 
 class PlanPump:
-    """The runtime reduction transport of ONE array on ONE bridge: its backlog, its stop flag and its poll thread.
+    """The runtime reduction transport of ONE array on ONE bridge: its backlog and its pair of dask queues.
 
     Every participating rank gets a pump, and the ``backlog`` is unconditional: presence of the array in
     ``Bridge._plan_pumps`` is what makes ``send`` enter the array's boundary collective. Gating it on a per-process
@@ -124,8 +123,9 @@ class PlanPump:
     on one communicator, i.e. a hang instead of a refusal. The array's participating set is the same on every rank, so
     the pumps are too.
 
-    The queue-polling ``thread`` and the ``report_queue`` exist only on the sub-comm root that owns the array's dask
-    client: one consumer per array fans the requests out through the boundary broadcast, which is enough.
+    The pair of queues exists only on the sub-comm root that owns the array's dask client: that rank is the array's ONE
+    queue consumer, and it fans the requests out through the boundary broadcast, which is enough. Nothing polls them
+    between boundaries -- the pickup is one short poll inside :meth:`serve`, at the send boundary itself.
 
     The pump owns its array identity (name, sub-comm, chunk position), so :meth:`serve` -- the send-boundary half --
     only needs the chunk ``send`` retained.
@@ -136,65 +136,56 @@ class PlanPump:
         - ``:param array_name:`` Registered array this pump transports.
         - ``:param sub_comm:`` The array's sub-communicator on this rank (never ``None`` / ``_COMM_NULL``).
         - ``:param chunk_position:`` The array's chunk coordinates on this rank, stamped on every report.
-        - ``:param bridge_id:`` The owning bridge's rank, for the thread name and the logs.
+        - ``:param bridge_id:`` The owning bridge's rank, for the logs.
         """
         self.array_name = array_name
         self.sub_comm = sub_comm
         self.chunk_position = chunk_position
         self.bridge_id = bridge_id
         self.backlog = PlanRequestBacklog()
+        self.request_queue: Optional[Any] = None
         self.report_queue: Optional[Any] = None
-        self.stop = threading.Event()
-        self.thread: Optional[threading.Thread] = None
 
-    def start(self, client: Optional[Client]) -> None:
-        """Attach the array's plan-request thread, if this rank is the one that can reach the queues.
+    def open_queues(self, client: Optional[Client]) -> None:
+        """Create the array's pair of plan queues, if this rank is the one that can reach them.
 
         The transport is a pair of dask queues per array, named by convention (``plan_request_queue_name`` /
         ``plan_report_queue_name``), so the host and the bridges agree without exchanging anything. Only the rank that
-        owns the array's dask client can reach them, which is the array sub-comm's root; a rank without a client starts
-        no queue and no thread (its pump still answers through the boundary broadcast).
+        owns the array's dask client can reach them, which is the array sub-comm's root; a rank without a client opens
+        no queue (its pump still answers through the boundary broadcast).
 
         - ``:param client:`` The bridge's dask client, or ``None`` on a rank that has none.
         """
         if self.sub_comm.Get_rank() != 0 or client is None:
             return
         self.report_queue = Queue(plan_report_queue_name(self.array_name), client=client)
-        request_queue = Queue(plan_request_queue_name(self.array_name), client=client)
-        self.thread = threading.Thread(
-            target=serve_plan_queue,
-            args=(request_queue, self.backlog, self.stop),
-            name=f"deisa-plan-{self.array_name}-{self.bridge_id}",
-            daemon=True,
-        )
-        self.thread.start()
-        logger.debug(f"[{self.bridge_id}] runtime plan pump started for array '{self.array_name}'")
+        self.request_queue = Queue(plan_request_queue_name(self.array_name), client=client)
+        logger.debug(f"[{self.bridge_id}] plan queues open for array '{self.array_name}'")
 
-    def stop_and_join(self) -> None:
-        """Stop the plan-request thread and wait briefly for it to leave its queue poll.
+    def close(self) -> None:
+        """Drop the pump's queue handles, before the client they belong to goes away.
 
-        Called before the client goes away: the thread polls a dask queue through that client, so it must be off the
-        queue first. A thread that does not stop within the timeout is left to the daemon flag rather than blocking the
-        teardown of the whole bridge. A pump that never started (no client, or a non-root rank) has no thread: its stop
-        flag is set and nothing waits.
+        A pump that never opened a queue (no client, or a non-root rank) has nothing to drop.
         """
-        self.stop.set()
-        if self.thread is not None:
-            self.thread.join(timeout=5.0)
-            if self.thread.is_alive():  # pragma: no cover - only reachable on a wedged scheduler
-                logger.warning(
-                    f"[{self.bridge_id}] runtime plan pump {self.thread.name} did not stop within the timeout"
-                )
-        self.thread = None
+        self.request_queue = None
         self.report_queue = None
 
     def serve(self, last_chunk: Tuple[Any, Any]) -> None:
-        """Answer the on-demand reduction requests that arrived since the previous ``send`` for this array.
+        """Answer the on-demand reduction requests that reached the queue before this ``send`` for the array.
 
         Called at the send boundary, where every rank of the array is about to enter the same collectives: the root
-        broadcasts the requests it collected, every rank folds its OWN chunk with the requested program, and the root
-        posts the reports back to the host. The chunk is this rank's last-sent chunk, which is why it is retained --
-        the host's request for timestep N necessarily arrives after ``send`` returned for N.
+        polls the host's request queue, broadcasts what it collected, every rank folds its OWN chunk with the requested
+        program, and the root posts the reports back to the host. The chunk is this rank's last-sent chunk, which is
+        why it is retained -- the host's request for timestep N necessarily arrives after ``send`` returned for N.
+
+        THE PICKUP INVARIANT: the queue is polled exactly once per boundary, by the root, with a short timeout. A
+        request that is already queued is served here; a request that arrives AFTER that poll stays in the queue and is
+        served at the NEXT boundary -- it is never dropped and never served twice. That is the guarantee the dedicated
+        polling thread gave: a request is answered at the first send boundary after it reached the queue, and
+        ``QueuePlanExchange``'s timeout is what tolerates the wait.
+
+        The poll costs one scheduler round trip, and every other rank enters the broadcast with the root, so all ranks
+        issue the same collectives in the same order whether or not a request is in flight.
 
         A request whose timestep this rank no longer holds is answered with an error report by ``PlanResponder``: the
         host refuses the set rather than merging a partial from another timestep.
@@ -202,7 +193,17 @@ class PlanPump:
         - ``:param last_chunk:`` The ``(timestep, chunk)`` this bridge last sent for the array, or ``(None, None)``
           when it has sent nothing yet.
         """
-        requests = self.backlog.drain()  # only the root has a pump thread; every other rank has an empty backlog
+        if self.request_queue is not None:  # only the array root holds one, and only when it owns a dask client
+            try:
+                first = self.request_queue.get(timeout=_PLAN_BOUNDARY_POLL_SECONDS)
+            except TimeoutError:
+                first = None  # nothing reached the queue before this boundary: this boundary folds nothing
+            if first is not None:
+                self.backlog.put(first)
+                # Whatever else is already queued is served by THIS boundary too, in one more scheduler round trip.
+                for extra in self.request_queue.get(batch=True):
+                    self.backlog.put(extra)
+        requests = self.backlog.drain()  # every other rank's backlog is empty: it gets the requests by broadcast
         if self.sub_comm.Get_size() > 1:
             requests = self.sub_comm.bcast(requests, root=0)
         if not requests:
@@ -277,9 +278,9 @@ class Bridge(IBridge):
         # first never touches the handshake again. An array outside this table has no known delivery state, so ``send``
         # ships its chunk.
         self._delivery: Dict[str, DeliveryState] = {}
-        # Runtime reduction transport, one PlanPump per participating array: its plan backlog, its stop flag, its
-        # report queue and its polling thread live there. Presence in this table -- not a flag -- is what makes
-        # ``send`` enter the array's boundary collective.
+        # Runtime reduction transport, one PlanPump per participating array: its plan backlog and the pair of dask
+        # queues the array root polls at each boundary live there. Presence in this table -- not a flag -- is what
+        # makes ``send`` enter the array's boundary collective.
         self._plan_pumps: Dict[str, PlanPump] = {}
 
         if self.id == 0:
@@ -481,13 +482,12 @@ class Bridge(IBridge):
             logger.error(f"[{self.id}] Could not cleanly close bridge. exception={e}")
 
     def _release_client(self) -> None:
-        """Release the bridge's non-collective resources: the runtime plan pumps and the client.
+        """Release the bridge's non-collective resources: the runtime plan queues and the client.
 
         Safe from any thread that is not running the client's own loop: it starts no collective and no ``sync()``.
         """
         if self.client:
-            # The runtime plan pumps poll a dask queue through this client, so they leave the queue before it
-            # goes away. A daemon thread, never a reason to fail a teardown.
+            # The plan queues belong to this client, so their handles are dropped before it goes away.
             self._stop_runtime_plan_pumps()
             self.client.close()
 
@@ -853,11 +853,11 @@ class Bridge(IBridge):
         the pumps are too.
 
         Two things are deliberately not gated: the broadcast itself (every rank enters it every timestep, and a rank
-        with no request simply gets an empty list back -- one small collective per array per ``send``), and the pump
-        thread's lifetime. The idle cost is one queue-polling thread per array on the rank that owns the dask client;
-        it runs for the life of the bridge because the first on-demand request can arrive as soon as the first
-        delivered timestep, not because a callback was registered yet. An array this rank does not participate in gets
-        neither a backlog nor a pump.
+        with no request simply gets an empty list back -- one small collective per array per ``send``), and the queue
+        pair's lifetime. The idle cost is two queue handles per array on the rank that owns the dask client; they are
+        opened for the life of the bridge because the first on-demand request can arrive as soon as the first delivered
+        timestep, not because a callback was registered yet. An array this rank does not participate in gets neither a
+        backlog nor a pump.
         """
         for array_name, sub_comm in self._array_comms.items():
             if sub_comm is None or sub_comm is _COMM_NULL:
@@ -869,18 +869,18 @@ class Bridge(IBridge):
                 self.id,
             )
         for pump in self._plan_pumps.values():
-            pump.start(self.client)
+            pump.open_queues(self.client)
 
     def _stop_runtime_plan_pumps(self) -> None:
-        """Stop every array's plan pump and wait briefly for its thread to leave the queue poll.
+        """Drop every array's plan queue handles.
 
-        Called from ``close()`` before the client goes away: the threads poll a dask queue through that client, so they
-        must be off the queue first. The defensive ``getattr`` covers ``__del__`` on a half-built bridge, where the pump
-        table may not exist yet.
+        Called from ``close()`` before the client goes away: the queues belong to that client. Nothing is polled
+        between boundaries, so there is no poller to stop. The defensive ``getattr`` covers ``__del__`` on a
+        half-built bridge, where the pump table may not exist yet.
         """
         pumps = getattr(self, "_plan_pumps", {})
         for pump in pumps.values():
-            pump.stop_and_join()
+            pump.close()
         pumps.clear()
 
     def _build_runtime_menu(
