@@ -68,7 +68,7 @@ Types of changes:
   its `_WindowProxy` scratch wrapper. Nothing in the package imports it. **Migration:** the refusal classes it defined
   are unchanged, name for name, in `deisa.dask.precompute_errors` — update an import of
   `deisa.dask.precompute_analyzer` to that module. Code that called the analyzer to obtain branch specs must use the
-  runtime planner instead (`deisa.dask.runtime_dispatch.PlanDispatcher`).
+  runtime planner instead (`deisa.dask.ondemand_dispatch.PlanDispatcher`).
 - `deisa.dask.utils.make_precomputed_view`, the `_PrecomputedDeisaArray` dispatch view it built, and the
   `_PrecomputedDeisaArray` / `make_precomputed_view` re-export from `deisa.dask.deisa`. A callback registered with
   `precompute=True` now receives a `DeisaCollection` whose entries are `DeisaArray`s; **migration:** a callback that
@@ -76,7 +76,7 @@ Types of changes:
   arrays and, for PCA, call `MergeablePCA().fit(<collection>)`, which dispatches and merges the summaries itself.
   `_PrecomputedDeisaArray.std`/`.var` refusing `ddof != 0` and the "second reduction on an already-final array"
   interception were properties of that view; the runtime path refuses both at the estimator/planner instead.
-- `DEISA_DASK_RUNTIME_REDUCTION` and `deisa.dask.runtime_dispatch.runtime_delivery_enabled()`, the opt-in flag that
+- `DEISA_DASK_RUNTIME_REDUCTION` and `deisa.dask.ondemand_dispatch.runtime_delivery_enabled()`, the opt-in flag that
   held runtime delivery behind an environment variable while the analyzer was still the default. The flag has no
   meaning left: with the analyzer gone there is no third delivery mode, so `precompute` is the only selector. Unset the
   environment variable; setting it is now inert.

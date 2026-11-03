@@ -472,17 +472,16 @@ def plan_report_queue_name(array_name: str) -> str:
     return f"{ONDEMAND_REPORT_QUEUE_PREFIX}{array_name}"
 
 
-# How long the array root bridge waits for a plan request at one send boundary, and how long the host waits for the
-# reports of one request. The bridge bound is the cost a boundary pays for a request already in flight (one scheduler
-# round trip); a request that has not landed by then stays queued and is served at the NEXT boundary, which is why it is
-# a short bound and not a wait. The host bound is the one that must tolerate the simulation taking a timestep to reach
-# its next send boundary -- and it is also the bound a request that can never be served pays in full (see "The one
-# timing bound of that design", above: a reduction of the final delivered timestep has no further send to be answered
-# at). That is why it is cycle-tolerable rather than a five-minute stall, and why it is overridable.
+# How long the HOST waits for the reports of one plan request. There is no bridge-side bound any more: the array root
+# drains its request queue with a non-blocking batch ``get`` at each send boundary, so a boundary pays one scheduler
+# round trip (~0.2 ms) whatever is queued, and a request that has not landed by then simply stays queued and is served
+# at the NEXT boundary. The host bound is the one that must tolerate the simulation taking a timestep to reach its next
+# send boundary -- and it is also the bound a request that can never be served pays in full (see "The one timing bound
+# of that design", above: a reduction of the final delivered timestep has no further send to be answered at). That is
+# why it is cycle-tolerable rather than a five-minute stall, and why it is overridable.
 # ``DEISA_ONDEMAND_PLAN_TIMEOUT`` is read by the HOST only: it bounds ``QueuePlanExchange``'s wait, and no bridge waits
 # on it, so a simulation whose timestep is longer than the host default needs the variable set in the analytics host's
 # environment alone.
-_PLAN_BOUNDARY_POLL_SECONDS: float = 0.02
 _PLAN_REPORT_TIMEOUT_SECONDS: float = 60.0
 _PLAN_REPORT_TIMEOUT_ENV: str = "DEISA_ONDEMAND_PLAN_TIMEOUT"
 

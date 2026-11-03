@@ -65,7 +65,6 @@ from deisa.dask.collection import DeisaCollection
 from deisa.dask.constants import CLIENT_KEY, FEEDBACK_QUEUE_PREFIX, KEY_PREFIX, WAIT_FOR_EXECUTE_CB_EVENT
 from deisa.dask.handshake import Handshake
 from deisa.dask.ondemand_dispatch import (
-    _PLAN_BOUNDARY_POLL_SECONDS,
     EagerMenu,
     PlanRequestBacklog,
     PlanResponder,
@@ -125,7 +124,7 @@ class PlanPump:
 
     The pair of queues exists only on the sub-comm root that owns the array's dask client: that rank is the array's ONE
     queue consumer, and it fans the requests out through the boundary broadcast, which is enough. Nothing polls them
-    between boundaries -- the pickup is one short poll inside :meth:`serve`, at the send boundary itself.
+    between boundaries -- the pickup is one non-blocking drain inside :meth:`serve`, at the send boundary itself.
 
     The pump owns its array identity (name, sub-comm, chunk position), so :meth:`serve` -- the send-boundary half --
     only needs the chunk ``send`` retained.
@@ -178,14 +177,18 @@ class PlanPump:
         program, and the root posts the reports back to the host. The chunk is this rank's last-sent chunk, which is
         why it is retained -- the host's request for timestep N necessarily arrives after ``send`` returned for N.
 
-        THE PICKUP INVARIANT: the queue is polled exactly once per boundary, by the root, with a short timeout. A
-        request that is already queued is served here; a request that arrives AFTER that poll stays in the queue and is
+        THE PICKUP INVARIANT: the queue is drained exactly once per boundary, by the root, without waiting. A
+        request that is already queued is served here; a request that arrives AFTER that drain stays in the queue and is
         served at the NEXT boundary -- it is never dropped and never served twice. That is the guarantee the dedicated
         polling thread gave: a request is answered at the first send boundary after it reached the queue, and
         ``QueuePlanExchange``'s timeout is what tolerates the wait.
 
-        The poll costs one scheduler round trip, and every other rank enters the broadcast with the root, so all ranks
-        issue the same collectives in the same order whether or not a request is in flight.
+        THE PER-BOUNDARY COST is ONE non-blocking scheduler round trip (~0.2 ms measured on a local cluster), and every
+        other rank enters the broadcast with the root, so all ranks issue the same collectives in the same order whether
+        or not a request is in flight. The drain must NOT be a ``get(timeout=...)`` poll: the scheduler handler is
+        ``wait_for(queue.get(), timeout=timeout)``, so an EMPTY queue answers only when that timeout expires (~25 ms
+        measured, ~100x the drain) -- and this call is on the send critical path of EVERY participating array, with the
+        array's peers parked in the boundary broadcast.
 
         A request whose timestep this rank no longer holds is answered with an error report by ``PlanResponder``: the
         host refuses the set rather than merging a partial from another timestep.
@@ -194,15 +197,10 @@ class PlanPump:
           when it has sent nothing yet.
         """
         if self.request_queue is not None:  # only the array root holds one, and only when it owns a dask client
-            try:
-                first = self.request_queue.get(timeout=_PLAN_BOUNDARY_POLL_SECONDS)
-            except TimeoutError:
-                first = None  # nothing reached the queue before this boundary: this boundary folds nothing
-            if first is not None:
-                self.backlog.put(first)
-                # Whatever else is already queued is served by THIS boundary too, in one more scheduler round trip.
-                for extra in self.request_queue.get(batch=True):
-                    self.backlog.put(extra)
+            # Non-blocking scheduler-side drain: whatever is already queued is served by THIS boundary, and an empty
+            # queue answers at once instead of waiting out a timeout (see the per-boundary cost above).
+            for plan in self.request_queue.get(batch=True):
+                self.backlog.put(plan)
         requests = self.backlog.drain()  # every other rank's backlog is empty: it gets the requests by broadcast
         if self.sub_comm.Get_size() > 1:
             requests = self.sub_comm.bcast(requests, root=0)
@@ -855,10 +853,11 @@ class Bridge(IBridge):
 
         Two things are deliberately not gated: the broadcast itself (every rank enters it every timestep, and a rank
         with no request simply gets an empty list back -- one small collective per array per ``send``), and the queue
-        pair's lifetime. The idle cost is two queue handles per array on the rank that owns the dask client; they are
-        opened for the life of the bridge because the first on-demand request can arrive as soon as the first delivered
-        timestep, not because a callback was registered yet. An array this rank does not participate in gets neither a
-        backlog nor a pump.
+        pair's lifetime. The idle cost is two queue handles per array, plus one non-blocking batch drain per boundary,
+        on the rank that owns the dask client: one scheduler round trip (~0.2 ms), never a wait, so a legacy array that
+        can never receive a request pays a round trip and nothing more. They are opened for the life of the bridge
+        because the first on-demand request can arrive as soon as the first delivered timestep, not because a callback
+        was registered yet. An array this rank does not participate in gets neither a backlog nor a pump.
         """
         for array_name, sub_comm in self._array_comms.items():
             if sub_comm is None or sub_comm is _COMM_NULL:

@@ -36,9 +36,10 @@ takes parked in the root's ``PlanRequestBacklog``, and ``PlanPump.serve`` doing 
 consumer is what production has, and a per-rank pump harness (N consumers) hides the failure mode that matters: one
 request handed to one consumer must produce exactly N reports for N bridges, not N per copy of the request.
 
-Nothing polls the request queue between boundaries either: the pickup is one short poll at the boundary itself, so a
-request is answered at the first send AFTER it reached the queue. One test pins that contract directly (an empty queue
-folds nothing; a request queued before the boundary is served by it; nothing is served twice).
+Nothing polls the request queue between boundaries either: the pickup is one non-blocking drain at the boundary itself,
+so a request is answered at the first send AFTER it reached the queue. One test pins that contract directly (an empty
+queue folds nothing; a request queued before the boundary is served by it; nothing is served twice) and one pins its
+cost (an idle boundary answers in one round trip, not after a grace window).
 
 Only MPI itself is out of scope: the multi-bridge collective runs over ``FakeComm`` (the same stand-in
 ``test_ondemand_dispatch`` uses), because a two-rank mpi4py run is not something a unit suite can host. Everything that
@@ -219,6 +220,31 @@ def test_the_boundary_poll_is_the_pickup(client):
     pump.serve((0, field))  # and only once
     with pytest.raises(TimeoutError):
         host_reports.get(timeout=0.2)
+
+
+def test_an_idle_boundary_answers_in_a_round_trip_not_a_grace_window(client):
+    """The pickup is a non-blocking drain: an empty queue answers at once, it does not wait out a timeout.
+
+    ``distributed.Queue.get(timeout=t)`` is NOT a probe -- the scheduler handler is
+    ``wait_for(queue.get(), timeout=t)``, so an EMPTY queue answers only when the timeout expires (~25 ms measured,
+    against ~0.2 ms for the batch drain, i.e. ~100x). A ``get(timeout=0.02)`` at this boundary would stall EVERY
+    participating array's ``send`` by that much, with the array's peers parked in the boundary ``broadcast`` -- and
+    would hand a 20 ms grace window nobody asked for. The bound is deliberately loose (median of 20 idle boundaries,
+    10 ms) so a busy box cannot make it flake, while a return to the timeout poll fails it by a wide margin.
+    """
+    field = make_field(seed=4)
+    pump = PlanPump(ARRAY_NAME, FakeComm(FakeComm.State(1), 0), chunk_position(0), 0)
+    pump.open_queues(client)  # the production root: it derives its own pair of queues from the array name
+    pump.serve((0, field))  # warm-up: the first call pays the queue's first round trip, which is not the cost asserted
+
+    samples = []
+    for _ in range(20):
+        start = time.perf_counter()
+        pump.serve((0, field))  # nothing queued: the idle shape production pays once per array per timestep
+        samples.append(time.perf_counter() - start)
+
+    median_ms = 1000.0 * sorted(samples)[len(samples) // 2]
+    assert median_ms < 10.0, f"an idle boundary took {median_ms:.2f} ms: the drain is waiting out a timeout"
 
 
 def test_two_successive_axis_folds_are_served_by_the_production_transport(client, monkeypatch):
