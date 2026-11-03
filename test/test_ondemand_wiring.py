@@ -26,7 +26,7 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 # =============================================================================
 """
-The delivery boundary of the runtime reduction path: topic handler, eager menu, run abort and the PCA hook.
+The delivery boundary of the on-demand reduction path: topic handler, eager menu, run abort and the PCA hook.
 
 Every test here runs the real pieces without a cluster: the callbacks are handed over by the real
 ``Deisa._make_topic_handler``, their reductions run through the real ``PlanDispatcher`` over a ``FakeComm`` fleet whose
@@ -51,14 +51,14 @@ from deisa.core.types import DeisaArray
 from utils import FakeComm
 
 from deisa.dask import deisa as deisa_module
-from deisa.dask import runtime_errors as errors
+from deisa.dask import ondemand_errors as errors
 from deisa.dask.bridge import Bridge, DeliveryState, PlanPump
 from deisa.dask.collection import DeisaCollection
 from deisa.dask.deisa import ArrayMode, Deisa
 from deisa.dask.handshake import Handshake
 from deisa.dask.mergeable_pca import MergeablePCA, PCASummary
-from deisa.dask.runtime_compose import PCARequest, compose_request
-from deisa.dask.runtime_dispatch import (
+from deisa.dask.ondemand_compose import PCARequest, compose_request
+from deisa.dask.ondemand_dispatch import (
     EAGER_MENU_OPS,
     EagerMenu,
     PlanRequest,
@@ -258,12 +258,12 @@ class _FakeHandshake:
     """The handshake surface ``execute_callbacks`` touches."""
 
     def __init__(self):
-        self.runtime_arrays = set()
+        self.ondemand_arrays = set()
         self.legacy_arrays = set()
         self.finished = 0
 
-    def set_runtime_arrays(self, array_names):  # noqa: D102
-        self.runtime_arrays = set(array_names)
+    def set_ondemand_arrays(self, array_names):  # noqa: D102
+        self.ondemand_arrays = set(array_names)
 
     def set_legacy_arrays(self, array_names):  # noqa: D102
         self.legacy_arrays = set(array_names)
@@ -301,7 +301,7 @@ def go_event(monkeypatch):
 
 
 def make_deisa(fleets, client, monkeypatch):
-    """A Deisa stub wired for runtime delivery: registration surfaces stubbed, transports attached."""
+    """A Deisa stub wired for on-demand delivery: registration surfaces stubbed, transports attached."""
     deisa = Deisa.__new__(Deisa)
     deisa.client = client
     deisa.handshake = _FakeHandshake()
@@ -313,7 +313,7 @@ def make_deisa(fleets, client, monkeypatch):
     deisa._arrays = collections.defaultdict(ArrayMode)
     deisa._tasks = set()
     deisa._execute_callbacks_called = False
-    deisa._runtime_transports = {ARRAY_NAME: fleets.exchange}
+    deisa._ondemand_transports = {ARRAY_NAME: fleets.exchange}
     deisa._run_failure = None
     deisa._topic_handlers[ARRAY_NAME] = deisa._make_topic_handler(ARRAY_NAME)
     return deisa
@@ -334,7 +334,7 @@ def register(deisa, callback, window_size=2, when="OR", exception_handler=None, 
     }
     deisa._callbacks_by_array.setdefault(ARRAY_NAME, set()).add(callback_id)
     if precompute:
-        deisa._arrays[ARRAY_NAME].runtime = True
+        deisa._arrays[ARRAY_NAME].ondemand = True
     else:
         deisa._arrays[ARRAY_NAME].legacy = True
     return callback_id
@@ -351,7 +351,7 @@ async def _drain(tasks, timeout=20.0):
 def deliver(deisa, timestep, menus, menu_error=None, futures=()):
     """Hand the topic event for ``timestep`` to the real handler, then drain the callback tasks it spawned.
 
-    ``futures`` is the event's data payload: empty for a runtime delivery (the menu is the payload), one full-chunk
+    ``futures`` is the event's data payload: empty for an on-demand delivery (the menu is the payload), one full-chunk
     entry per bridge for a legacy scatter.
     """
     payload = {
@@ -386,7 +386,7 @@ def test_scalar_fold_is_served_from_the_eager_menu(fleets, client, monkeypatch):
     seen = []
 
     def callback(window):
-        assert isinstance(window[-1], DeisaCollection), "the runtime delivery must hand over collections"
+        assert isinstance(window[-1], DeisaCollection), "the on-demand delivery must hand over collections"
         seen.append(window[-1].sum().compute())
 
     register(deisa, callback)
@@ -574,12 +574,13 @@ def test_mixed_timestep_expression_aborts_the_run(fleets, client, monkeypatch, g
 
 
 def test_precompute_taxonomy_refusal_aborts_the_run(fleets, client, monkeypatch, go_event):
-    """A refusal from the PRECOMPUTE taxonomy aborts too, not just the runtime one.
+    """A refusal from the PRECOMPUTE taxonomy aborts too, not just the on-demand one.
 
-    The runtime classes subclass the precompute namesakes (``runtime_errors``), so a caller that catches
-    ``PrecomputeError`` still catches a runtime refusal -- one hierarchy, walked from the top by ``_is_run_aborting``.
-    This test raises the BASE class from a callback, which is what the legacy precompute view used to do, and proves
-    the precompute half of the predicate is covered on its own rather than only through a subclass.
+    The on-demand classes subclass the precompute namesakes (``ondemand_errors``), so a caller that catches
+    ``PrecomputeError`` still catches an on-demand refusal -- one hierarchy, walked from the top by
+    ``_is_run_aborting``. This test raises the BASE class from a callback, which is what the legacy precompute view
+    used to do, and proves the precompute half of the predicate is covered on its own rather than only through a
+    subclass.
     """
     deisa = make_deisa(fleets, client, monkeypatch)
 
@@ -590,7 +591,7 @@ def test_precompute_taxonomy_refusal_aborts_the_run(fleets, client, monkeypatch,
     deliver(deisa, 0, fleets.menus(0))
 
     assert isinstance(deisa._run_failure, deisa_module.UnsupportedReductionError)
-    assert not isinstance(deisa._run_failure, deisa_module.RuntimeRefusal), "the PRECOMPUTE taxonomy, not the runtime"
+    assert not isinstance(deisa._run_failure, deisa_module.OndemandRefusal), "the PRECOMPUTE taxonomy, not the ondemand"
     assert deisa._callbacks == {}, "a refused callback must not stay registered for the next cycle"
 
     with pytest.raises(deisa_module.UnsupportedReductionError):
@@ -702,7 +703,7 @@ def test_precompute_false_still_receives_the_full_chunk(fleets, client, monkeypa
         received.append(window[-1])
 
     register(deisa, callback, precompute=False)
-    assert not deisa._arrays[ARRAY_NAME].runtime, "a full-chunk callback declares no runtime-delivery array"
+    assert not deisa._arrays[ARRAY_NAME].ondemand, "a full-chunk callback declares no on-demand array"
     deliver(deisa, 0, fleets.menus(0), futures=full_chunk_futures())
 
     assert len(received) == 1
@@ -722,13 +723,13 @@ def test_one_event_serves_both_delivery_modes(fleets, client, monkeypatch):
         lambda self, blocks, global_shape: da.zeros(global_shape, chunks=CHUNK_SHAPE),
     )
 
-    def runtime_callback(window):
+    def ondemand_callback(window):
         collections_seen.append(window[-1])
 
     def full_chunk_callback(window):
         arrays_seen.append(window[-1])
 
-    register(deisa, runtime_callback)
+    register(deisa, ondemand_callback)
     register(deisa, full_chunk_callback, precompute=False)
     deliver(deisa, 0, fleets.menus(0), futures=full_chunk_futures())
 
@@ -738,14 +739,14 @@ def test_one_event_serves_both_delivery_modes(fleets, client, monkeypatch):
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# K7F-01: what the bridge ships depends on BOTH per-array facts -- a runtime target ships its menu, and it ships the
+# K7F-01: what the bridge ships depends on BOTH per-array facts -- an on-demand target ships its menu, and it ships the
 # chunk only while something on it reads the chunk. The two facts travel in one handshake read (the file's docstring
 # explains why a second collective is forbidden).
 # ---------------------------------------------------------------------------------------------------------------------
 def test_mixed_array_still_gets_the_full_chunk(fleets, client, monkeypatch):
-    """One array with a runtime callback AND a legacy one keeps the full-chunk scatter (decision F3's escape hatch).
+    """One array with an on-demand callback AND a legacy one keeps the full-chunk scatter (decision F3's escape hatch).
 
-    This is the case that forces the second handshake fact. The runtime callback alone makes the array a data-free
+    This is the case that forces the second handshake fact. The on-demand callback alone makes the array a data-free
     delivery -- the bridge would ship the menu and nothing else -- but the ``precompute=False`` callback on the SAME
     array reads the chunk, so skipping the scatter would hand it an event with ``futures: []``. Host, handshake actor
     and bridge are driven end to end here (no cluster): the host files both facts, the actor returns them in ONE dict,
@@ -756,22 +757,22 @@ def test_mixed_array_still_gets_the_full_chunk(fleets, client, monkeypatch):
     register(deisa, lambda window: None, precompute=False)
     deisa._flush_delivery_state_to_handshake()
 
-    assert deisa.handshake.runtime_arrays == {ARRAY_NAME}
-    assert deisa.handshake.legacy_arrays == {ARRAY_NAME}, "the legacy reader must be filed next to the runtime flag"
+    assert deisa.handshake.ondemand_arrays == {ARRAY_NAME}
+    assert deisa.handshake.legacy_arrays == {ARRAY_NAME}, "the legacy reader must be filed next to the on-demand flag"
 
     # The actor's read: the shape the bridge consumes, with both facts in one dict.
     actor = Handshake.HandshakeActor.__new__(Handshake.HandshakeActor)
-    actor.runtime_arrays = deisa.handshake.runtime_arrays
+    actor.ondemand_arrays = deisa.handshake.ondemand_arrays
     actor.legacy_arrays = deisa.handshake.legacy_arrays
     state = actor.get_task_state(ARRAY_NAME)
-    assert state == {"runtime": True, "legacy": True}, state
+    assert state == {"ondemand": True, "legacy": True}, state
 
     bridge, wire_client = _make_send_bridge()
     # Start from an empty cache, like a bridge taking its state from the handshake read.
     bridge._delivery = {}
     bridge.handshake = _WireHandshake(state)
     bridge._ensure_task_state(ARRAY_NAME)
-    assert bridge._delivery[ARRAY_NAME] == DeliveryState(runtime=True, legacy=True, fetched=True)
+    assert bridge._delivery[ARRAY_NAME] == DeliveryState(ondemand=True, legacy=True, fetched=True)
     assert bridge._needs_chunk_delivery(ARRAY_NAME), "a legacy reader on the array keeps the chunk delivery"
 
     scattered = []
@@ -793,16 +794,16 @@ def test_mixed_array_still_gets_the_full_chunk(fleets, client, monkeypatch):
     assert len(wire_client.events[0][1]["futures"]) == 1, "the event must still name the full chunk for that reader"
 
 
-def test_runtime_only_array_ships_its_menu_and_no_data(monkeypatch):
-    """Runtime target with NO legacy reader: no scatter, ``futures: []`` -- the menu is the payload.
+def test_ondemand_only_array_ships_its_menu_and_no_data(monkeypatch):
+    """On-demand target with NO legacy reader: no scatter, ``futures: []`` -- the menu is the payload.
 
-    This is the regression the memory suite measures (``test_runtime_worker_only_sees_partials``): at HEAD every
+    This is the regression the memory suite measures (``test_ondemand_worker_only_sees_partials``): at HEAD every
     ``precompute=True`` callback cost a 32 MB scatter per bridge per timestep for data nothing read. Three things must
     hold here -- nothing is scattered, the menu is still folded (it is the ENTIRE payload), and no key reaches the
     scheduler (an empty ``update_data`` + an empty desire list would be pure round trips).
     """
     bridge, wire_client = _make_send_bridge()
-    bridge._delivery = {ARRAY_NAME: DeliveryState(runtime=True, legacy=False, fetched=True)}
+    bridge._delivery = {ARRAY_NAME: DeliveryState(ondemand=True, legacy=False, fetched=True)}
     scattered = []
 
     def recording_scatter(*args, **kwargs):
@@ -844,7 +845,7 @@ class _WireHandshake:
 def test_first_send_on_lazy_path_ships_no_data():
     """K7F-06: the FIRST send on the lazy path (``wait_for_go=False``) must already be data-free.
 
-    ``test_runtime_only_array_ships_its_menu_and_no_data`` starts from a WARM cache -- the state the ``wait_for_go``
+    ``test_ondemand_only_array_ships_its_menu_and_no_data`` starts from a WARM cache -- the state the ``wait_for_go``
     init-time prefetch leaves behind. A deployment that never prefetches is the memory harness's shape
     (``test_precompute_memory.py``, which asserts after exactly ONE send), and there the caches are still empty when
     ``send`` runs. Computing ``data_free_delivery`` before ``_ensure_task_state`` filled them made that first send take
@@ -856,9 +857,9 @@ def test_first_send_on_lazy_path_ships_no_data():
     """
     bridge, wire_client = _make_send_bridge()
     # The lazy-path state at the first send: nothing prefetched, so the state cache is empty and the handshake is the
-    # only source. Runtime target with no legacy reader -- the data-free shape.
+    # only source. On-demand target with no legacy reader -- the data-free shape.
     bridge._delivery = {}
-    handshake = _WireHandshake({"runtime": True, "legacy": False})
+    handshake = _WireHandshake({"ondemand": True, "legacy": False})
     bridge.handshake = handshake
 
     scattered = []
@@ -878,8 +879,8 @@ def test_first_send_on_lazy_path_ships_no_data():
     bridge._has_close_been_called = True
 
     assert handshake.reads == [ARRAY_NAME], "the first send must read the array's delivery state"
-    assert scattered == [], "the FIRST send of a runtime-only array must not scatter the chunk"
-    assert bridge._delivery[ARRAY_NAME] == DeliveryState(runtime=True, legacy=False, fetched=True), (
+    assert scattered == [], "the FIRST send of an on-demand-only array must not scatter the chunk"
+    assert bridge._delivery[ARRAY_NAME] == DeliveryState(ondemand=True, legacy=False, fetched=True), (
         "the fetch must fill the cache the decision needs"
     )
     _, payload = wire_client.events[0]
@@ -921,7 +922,7 @@ def test_no_data_event_handed_to_a_legacy_reader_fails_the_run(fleets, client, m
 # chunk-scattering bridge ever registers.
 # ---------------------------------------------------------------------------------------------------------------------
 def test_data_free_event_files_no_future_ownership(fleets, client, monkeypatch):
-    """A runtime-only event files NO future ownership: nothing crossed the boundary, so there is nothing to own.
+    """An on-demand-only event files NO future ownership: nothing crossed the boundary, so there is nothing to own.
 
     Filing the release anyway names the pseudo client ``CLIENT_KEY`` ("deisa"), which a bridge creates only when it
     actually scatters a chunk. The scheduler answers that release with ``KeyError`` while replaying the host's queued
@@ -963,21 +964,21 @@ def test_full_chunk_event_still_files_future_ownership(fleets, client, monkeypat
     assert releases["keys"] == desires["keys"]
 
 
-def test_departed_runtime_callback_flips_the_array_off(fleets, client, monkeypatch, go_event):
-    """Unregistering the last ``precompute=True`` callback drops the array from the bridged runtime set."""
+def test_departed_ondemand_callback_flips_the_array_off(fleets, client, monkeypatch, go_event):
+    """Unregistering the last ``precompute=True`` callback drops the array from the bridged on-demand set."""
     deisa = make_deisa(fleets, client, monkeypatch)
 
-    runtime_id = register(deisa, lambda window: None)
-    assert deisa._arrays[ARRAY_NAME].runtime
+    ondemand_id = register(deisa, lambda window: None)
+    assert deisa._arrays[ARRAY_NAME].ondemand
     deisa._flush_delivery_state_to_handshake()
-    assert deisa.handshake.runtime_arrays == {ARRAY_NAME}
+    assert deisa.handshake.ondemand_arrays == {ARRAY_NAME}
 
     register(deisa, lambda window: None, precompute=False)
-    deisa.unregister_callback(runtime_id)
+    deisa.unregister_callback(ondemand_id)
 
-    assert not deisa._arrays[ARRAY_NAME].runtime, "no runtime callback is left on the array"
+    assert not deisa._arrays[ARRAY_NAME].ondemand, "no on-demand callback is left on the array"
     deisa.execute_callbacks()
-    assert deisa.handshake.runtime_arrays == set(), "the pruned set is re-filed at the cycle boundary"
+    assert deisa.handshake.ondemand_arrays == set(), "the pruned set is re-filed at the cycle boundary"
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -998,7 +999,7 @@ def test_harness_ships_one_eager_menu_per_bridge(fleets):
 # The wire: the menu the bridge publishes on the topic event (the ``Client.log_event`` msgpack hop)
 # ---------------------------------------------------------------------------------------------------------------------
 # ``Bridge.send`` ships the eager menu encoded with ``EagerMenu.as_payload`` because the event bus carries msgpack
-# primitives only. Before ``1fbb650`` the live objects went on the wire and the FIRST ``send`` of a runtime-mode run
+# primitives only. Before ``1fbb650`` the live objects went on the wire and the FIRST ``send`` of an on-demand-mode run
 # raised ``TypeError: Message must be msgpack serializable``: the delivery mode was unusable in production. Every test
 # above hands a live ``EagerMenu`` straight to the topic handler, so none of them crosses this hop. These two do.
 WIRE_METADATA = {
@@ -1047,7 +1048,7 @@ def _make_send_bridge():
     """Build the ``Bridge.__new__`` stub the tests below drive: one bridge, one array, no scheduler.
 
     Only the scatter is stubbed -- it is ``test_bridge.py``'s subject and needs a scheduler. Everything else (``send``'s
-    runtime-delivery boundary, the eager menu, the plan backlog seam) is the real code.
+    on-demand boundary, the eager menu, the plan backlog seam) is the real code.
     """
     bridge = Bridge.__new__(Bridge)
     wire_client = _WireClient()
@@ -1057,10 +1058,10 @@ def _make_send_bridge():
     bridge.workers = {"worker-0": {}}
     bridge.arrays_metadata = WIRE_METADATA
     bridge._array_comms = {ARRAY_NAME: FakeComm(FakeComm.State(1), 0)}
-    # The cached delivery state, as the init-time prefetch leaves it: a runtime-delivery target AND a legacy
-    # (chunk-reading) array, so these tests keep measuring the full-chunk payload. The data-free path (runtime target
+    # The cached delivery state, as the init-time prefetch leaves it: an on-demand target AND a legacy
+    # (chunk-reading) array, so these tests keep measuring the full-chunk payload. The data-free path (on-demand target
     # and no legacy reader) has its own test below.
-    bridge._delivery = {ARRAY_NAME: DeliveryState(runtime=True, legacy=True, fetched=True)}
+    bridge._delivery = {ARRAY_NAME: DeliveryState(ondemand=True, legacy=True, fetched=True)}
     # No handshake: the state above is already the cached result, so ``send`` must find the array fetched and never
     # enter the per-array broadcast (``DeliveryState.fetched`` is the fetch marker).
     bridge.handshake = None
@@ -1095,8 +1096,8 @@ def test_topic_event_from_the_bridge_is_msgpack_serializable(monkeypatch):
 
     Fail-before (the ``1fbb650`` bug, reproduced in ``evidence/probe_msgpack_roundtrip.log`` line 2): with the menu
     shipped as ``EagerMenu`` objects, ``msgpack.packb`` raises ``TypeError: can not serialize 'EagerMenu' object`` --
-    which is exactly what ``Client.log_event`` does to the first ``send`` of a runtime-mode run. The line that fails is
-    the ``msgpack.packb(entry)`` inside the loop below.
+    which is exactly what ``Client.log_event`` does to the first ``send`` of an on-demand-mode run. The line that
+    fails is the ``msgpack.packb(entry)`` inside the loop below.
     """
     chunk = np.random.default_rng(0).normal(size=CHUNK_SHAPE).astype(np.float32)
     payload = send_one_chunk(monkeypatch, chunk)

@@ -27,7 +27,7 @@
 # POSSIBILITY OF SUCH DAMAGE.
 # =============================================================================
 """
-The v1 refusal taxonomy of the DEISA runtime reduction path.
+The v1 refusal taxonomy of the DEISA on-demand reduction path.
 
 A callback that uses the DEISA lazy collection runs against a closed operator surface: what the surface does not
 support is REFUSED, never silently gathered. Every refusal in this module therefore carries three things, and each is
@@ -41,7 +41,7 @@ asserted by the test suite:
 Every class derives from :class:`~deisa.dask.precompute_errors.PrecomputeError`, the base of the precompute taxonomy,
 so existing ``except PrecomputeError`` handlers keep catching refusals. The five classes that have a namesake in that
 taxonomy ALSO subclass the namesake, so the two families are one ``isinstance`` graph: a handler written for the
-legacy class catches the runtime refusal that replaced it. (The taxonomy lives in
+legacy class catches the on-demand refusal that replaced it. (The taxonomy lives in
 :mod:`deisa.dask.precompute_errors`, not in the analyzer that used to define it: plan P4 deletes the analyzer, and
 the class identity callers catch must outlive it.)
 
@@ -59,9 +59,9 @@ __all__ = [
     "MaterializationError",
     "NoPrecomputableReductionError",
     "NonAssociativeReductionError",
+    "OndemandRefusal",
     "PrecomputeRuntimeError",
     "RawFieldReadError",
-    "RuntimeRefusal",
     "UnsupportedReductionError",
     "ambiguous_truth",
     "cross_reduction",
@@ -75,7 +75,7 @@ __all__ = [
     "non_associative",
     "numpy_materialization",
     "off_surface",
-    "precompute_runtime_invariant",
+    "ondemand_invariant",
     "raw_field_read",
     "rewrap",
     "stale_timestep",
@@ -95,7 +95,7 @@ _SURFACE_SUMMARY = (
 )
 
 
-class RuntimeRefusal(_precompute_errors.PrecomputeError):
+class OndemandRefusal(_precompute_errors.PrecomputeError):
     """Base class of the v1 refusals: a message naming the offending symbol, plus a remedy.
 
     ``str(exception)`` is ``"<message> Remedy: <remedy>"`` and the two halves are also kept as the ``message`` and
@@ -112,7 +112,7 @@ class RuntimeRefusal(_precompute_errors.PrecomputeError):
         super().__init__(f"{self.message} Remedy: {self.remedy}")
 
 
-class RawFieldReadError(RuntimeRefusal, _precompute_errors.RawFieldReadError):
+class RawFieldReadError(OndemandRefusal, _precompute_errors.RawFieldReadError):
     """The callback reads a registered array's raw data, which the reduction path never delivers.
 
     The precompute path ships per-bridge reduction partials only -- the chunk itself never crosses the network. A
@@ -122,7 +122,7 @@ class RawFieldReadError(RuntimeRefusal, _precompute_errors.RawFieldReadError):
     """
 
 
-class MaterializationError(RuntimeRefusal, _precompute_errors.MaterializationError):
+class MaterializationError(OndemandRefusal, _precompute_errors.MaterializationError):
     """A numpy conversion of a DEISA operand was attempted; that would gather the whole field.
 
     The hole this closes is silent: ``np.asarray(collection)`` leaves no graph artifact at all, so no analysis can see
@@ -131,7 +131,7 @@ class MaterializationError(RuntimeRefusal, _precompute_errors.MaterializationErr
     """
 
 
-class NonAssociativeReductionError(RuntimeRefusal):
+class NonAssociativeReductionError(OndemandRefusal):
     """A non-associative reduction was requested (argmax, argmin, median, quantile, percentile).
 
     These cannot be rebuilt from chunk-local partials: the answer depends on the GLOBAL ordering of the data, which no
@@ -145,7 +145,7 @@ class NonAssociativeReductionError(RuntimeRefusal):
     )
 
 
-class UnsupportedReductionError(RuntimeRefusal, _precompute_errors.UnsupportedReductionError):
+class UnsupportedReductionError(OndemandRefusal, _precompute_errors.UnsupportedReductionError):
     """The expression leaves the closed DEISA operator surface.
 
     Covers cross-array and mixed-timestep roots, a reduction used as an operand of another expression, slicing,
@@ -155,7 +155,7 @@ class UnsupportedReductionError(RuntimeRefusal, _precompute_errors.UnsupportedRe
     remedy = f"rewrite the callback with {_SURFACE_SUMMARY}, or {_REMEDY_PRECOMPUTE_OFF}"
 
 
-class NoPrecomputableReductionError(RuntimeRefusal, _precompute_errors.NoPrecomputableReductionError):
+class NoPrecomputableReductionError(OndemandRefusal, _precompute_errors.NoPrecomputableReductionError):
     """The callback contains no reduction the surface can dispatch.
 
     A callback that only builds pointwise expressions (or only reads metadata) asks for nothing a bridge could compute
@@ -163,8 +163,8 @@ class NoPrecomputableReductionError(RuntimeRefusal, _precompute_errors.NoPrecomp
     """
 
 
-class PrecomputeRuntimeError(RuntimeRefusal, _precompute_errors.PrecomputeRuntimeError):
-    """A runtime invariant of the reduction path was violated (bridge side or combine side).
+class PrecomputeRuntimeError(OndemandRefusal, _precompute_errors.PrecomputeRuntimeError):
+    """An on-demand invariant of the reduction path was violated (bridge side or combine side).
 
     Raised when the metadata, the composed request and the delivered partials disagree -- for example a chunk grid
     that contradicts the array metadata, or a branch callable executed without its program. Always preferred over
@@ -289,8 +289,8 @@ def no_precomputable_reduction(symbol: str, detail: str = "") -> NoPrecomputable
     )
 
 
-def precompute_runtime_invariant(symbol: str, detail: str) -> PrecomputeRuntimeError:
-    """Refusal for a violated runtime invariant, naming ``symbol`` and the ``detail`` that broke it."""
+def ondemand_invariant(symbol: str, detail: str) -> PrecomputeRuntimeError:
+    """Refusal for a violated on-demand invariant, naming ``symbol`` and the ``detail`` that broke it."""
     return PrecomputeRuntimeError(f"{symbol}: {detail}.")
 
 
@@ -333,6 +333,6 @@ def stale_timestep(symbol: str, *, array_name: str, requested: int, latest: int)
     )
 
 
-def rewrap(refusal: RuntimeRefusal, remedy: str) -> RuntimeRefusal:
+def rewrap(refusal: OndemandRefusal, remedy: str) -> OndemandRefusal:
     """Return a copy of ``refusal`` that keeps the message but carries ``remedy`` instead of its own."""
     return type(refusal)(refusal.message, remedy=remedy)

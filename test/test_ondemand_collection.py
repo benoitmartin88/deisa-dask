@@ -22,12 +22,12 @@ import numpy as np
 import pytest
 from dask.array.reductions import mean_agg, moment_agg
 
-from deisa.dask import runtime_errors as errors
+from deisa.dask import ondemand_errors as errors
 from deisa.dask.branch import _FULL_FOLD_FINALIZERS as LEGACY_FULL_FOLD_FINALIZERS
 from deisa.dask.branch import _chain_branch_func
 from deisa.dask.collection import DeisaCollection
-from deisa.dask.runtime_compose import FULL_FOLD_FINALIZERS, compose_request, probe_partial
-from deisa.dask.runtime_expr import (
+from deisa.dask.ondemand_compose import FULL_FOLD_FINALIZERS, compose_request, probe_partial
+from deisa.dask.ondemand_expr import (
     KIND_BOOLEAN,
     KIND_COUNT,
     KIND_MEAN,
@@ -130,7 +130,7 @@ def execute(request, chunk, op_name):
 # The closed operator surface
 # ---------------------------------------------------------------------------------------------------------------------
 # One builder + one numpy reference per pointwise operator. ``test_pointwise_surface_is_complete`` asserts this table's
-# key set EQUALS the runtime's whitelist, so adding an operator without exposing it (or exposing one the bridge cannot
+# key set EQUALS the on-demand whitelist, so adding an operator without exposing it (or exposing one the bridge cannot
 # evaluate) fails the suite.
 _POINTWISE_CASES = {
     "add": (lambda c: c + 1, lambda n: n + 1),
@@ -239,7 +239,7 @@ def test_reduction_surface_builds_the_expected_payload(op_name):
 
 
 def test_reduction_surface_is_complete():
-    """The tested reduction builders and the runtime whitelist agree."""
+    """The tested reduction builders and the on-demand whitelist agree."""
     assert set(_REDUCTION_CASES) == set(REDUCTION_OPS)
 
 
@@ -301,7 +301,7 @@ class TestMaterializationGuards:
         "build", [lambda c: c, lambda c: c * 2, lambda c: c.sum()], ids=["collection", "expr", "reduction"]
     )
     def test_numpy_and_python_consumption_is_refused(self, consume, build):
-        with pytest.raises(errors.RuntimeRefusal) as excinfo:
+        with pytest.raises(errors.OndemandRefusal) as excinfo:
             consume(build(make_collection()))
         assert "precompute=False" in str(excinfo.value)
 
@@ -362,7 +362,7 @@ class TestOffSurfaceMatrix:
         """A collection built by hand carries no bridge transport, so ``.compute()`` refuses instead of gathering.
 
         The dispatch boundary itself (request -> bridges -> partials -> combine) is proven over a fake communicator in
-        ``test_runtime_dispatch.py``; here the point is that a collection OUTSIDE the delivery path fails loudly and
+        ``test_ondemand_dispatch.py``; here the point is that a collection OUTSIDE the delivery path fails loudly and
         names the same remedy every other refusal names.
         """
         with pytest.raises(errors.PrecomputeRuntimeError) as excinfo:

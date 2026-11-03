@@ -29,8 +29,8 @@
 """
 Dispatch a reduction to the bridges, then merge the partials they send back.
 
-This module is the compute boundary of the runtime reduction path. ``ReductionExpr.compute()`` composes the slim wire
-request (:func:`deisa.dask.runtime_compose.compose_request`), hands it to :class:`PlanDispatcher`, and gets a concrete
+This module is the compute boundary of the on-demand reduction path. ``ReductionExpr.compute()`` composes the slim wire
+request (:func:`deisa.dask.ondemand_compose.compose_request`), hands it to :class:`PlanDispatcher`, and gets a concrete
 value back. Nothing else happens: the dispatcher sends the request, matches one report per bridge, and merges the
 partials with the combine algebra that already exists in :mod:`deisa.dask.branch` (imported, never copied).
 
@@ -70,7 +70,7 @@ is supported today; failing fast on the last one needs an end-of-run signal the 
 sent -- so on-demand plans are served for the LATEST delivered timestep only. A callback's window keeps older
 collections alive (and their menu still answers ``sum``/``min``/``max``/``mean``/``prod``/``std`` on the bare array,
 because the menu travels with the delivery), but an on-demand reduction rooted in an older element is refused at
-compose time by :func:`~deisa.dask.runtime_errors.stale_timestep`, with the remedy in the message. Serving the whole
+compose time by :func:`~deisa.dask.ondemand_errors.stale_timestep`, with the remedy in the message. Serving the whole
 window on demand would need one retained chunk per window slot per bridge -- a v2 memory decision, not a v1 one.
 
 :class:`EagerMenu` is the eager half of the transfer strategy: the six tiny scalar full folds a bridge computes once for
@@ -81,7 +81,7 @@ from its own program, so it never reads the menu and always dispatches on demand
 menu path on the operand program for exactly that reason.
 
 The same exchange carries the estimator-side PCA branch: :meth:`PlanDispatcher.compute_pca` dispatches a
-:class:`~deisa.dask.runtime_compose.PCARequest`, whose per-bridge partial is a mergeable
+:class:`~deisa.dask.ondemand_compose.PCARequest`, whose per-bridge partial is a mergeable
 :class:`~deisa.dask.mergeable_pca.PCASummary`, and merges those summaries at the root. A PCA payload cannot go through
 the reduction algebra, which is why it has its own request type and its own merge entry point.
 """
@@ -95,12 +95,12 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
-from deisa.dask import runtime_errors as errors
+from deisa.dask import ondemand_errors as errors
 from deisa.dask.branch import _BRANCH_KIND_PCA, _SCALAR_FOLDS, _combine_two_phase
-from deisa.dask.constants import RUNTIME_PLAN_QUEUE_PREFIX, RUNTIME_REPORT_QUEUE_PREFIX
+from deisa.dask.constants import ONDEMAND_PLAN_QUEUE_PREFIX, ONDEMAND_REPORT_QUEUE_PREFIX
 from deisa.dask.mergeable_pca import PCASummary, merge_tree
-from deisa.dask.runtime_compose import PCARequest, RuntimeRequest, compose_request
-from deisa.dask.runtime_expr import _CHUNK_PROGRAM, KIND_BOOLEAN, KIND_COUNT, KIND_SCALAR
+from deisa.dask.ondemand_compose import OndemandRequest, PCARequest, compose_request
+from deisa.dask.ondemand_expr import _CHUNK_PROGRAM, KIND_BOOLEAN, KIND_COUNT, KIND_SCALAR
 
 __all__ = [
     "EAGER_MENU_OPS",
@@ -128,7 +128,7 @@ __all__ = [
 _combine_partials = getattr(_combine_two_phase, "__wrapped__", None)
 if _combine_partials is None:  # pragma: no cover - only reachable if dask stops preserving the undecorated callable
     raise RuntimeError(
-        "deisa.dask.runtime_dispatch: the combine algebra must stay callable without a task graph, but "
+        "deisa.dask.ondemand_dispatch: the combine algebra must stay callable without a task graph, but "
         "dask no longer exposes the undecorated _combine_two_phase."
     )
 _COMBINE_PARTIALS: Callable[..., Any] = _combine_partials
@@ -156,14 +156,14 @@ class PlanRequest:
       older request cannot satisfy this one.
     - ``:param array_name:`` Registered array the request is rooted in.
     - ``:param timestep:`` Timestep the bridge's chunk must belong to; a bridge holding another timestep refuses.
-    - ``:param request:`` The slim wire request (a reduction's ``RuntimeRequest`` or a ``PCARequest``: ``key``,
+    - ``:param request:`` The slim wire request (a reduction's ``OndemandRequest`` or a ``PCARequest``: ``key``,
       ``kind``, composed ``branch_func``, and the reduction's ``axes``/``finalize``).
     """
 
     request_id: str
     array_name: str
     timestep: int
-    request: Union[RuntimeRequest, PCARequest]
+    request: Union[OndemandRequest, PCARequest]
 
 
 @dataclass(frozen=True)
@@ -288,9 +288,7 @@ def _partial_shape_dtype(value: Any) -> Tuple[Tuple[int, ...], str]:
             if key in value:
                 return _partial_shape_dtype(value[key])
         if not value:
-            raise errors.precompute_runtime_invariant(
-                "_partial_shape_dtype", "a dict partial carried no entries to describe"
-            )
+            raise errors.ondemand_invariant("_partial_shape_dtype", "a dict partial carried no entries to describe")
         return _partial_shape_dtype(next(iter(value.values())))
     array = np.asarray(value)
     return tuple(int(size) for size in array.shape), str(array.dtype)
@@ -397,7 +395,7 @@ def build_eager_menu(
         try:
             values[op_name] = request.branch_func(chunk)
         except Exception as exc:
-            raise errors.precompute_runtime_invariant(
+            raise errors.ondemand_invariant(
                 "build_eager_menu", f"the {op_name!r} menu entry failed on the local chunk: {exc!r}"
             ) from exc
     return EagerMenu(
@@ -409,7 +407,7 @@ def build_eager_menu(
     )
 
 
-def eager_menu_requests(collection: Any) -> Tuple[RuntimeRequest, ...]:
+def eager_menu_requests(collection: Any) -> Tuple[OndemandRequest, ...]:
     """The slim requests of the eager scalar menu, in :data:`EAGER_MENU_OPS` order.
 
     - ``:param collection:`` The :class:`~deisa.dask.collection.DeisaCollection` to compose the menu for.
@@ -430,7 +428,7 @@ def dispatch_plan_over_comm(comm: Any, plan: PlanRequest, responder: PlanRespond
     comm.bcast(plan, root=0)
     reports = comm.gather(responder.respond(plan), root=0)
     if reports is None:
-        raise errors.precompute_runtime_invariant(
+        raise errors.ondemand_invariant(
             "dispatch_plan_over_comm", f"the gather returned no reports for request {plan.request_id!r}"
         )
     return sorted(reports, key=lambda report: tuple(report.chunk_position))
@@ -463,7 +461,7 @@ def plan_request_queue_name(array_name: str) -> str:
 
     - ``:param array_name:`` Registered array the queue serves.
     """
-    return f"{RUNTIME_PLAN_QUEUE_PREFIX}{array_name}"
+    return f"{ONDEMAND_PLAN_QUEUE_PREFIX}{array_name}"
 
 
 def plan_report_queue_name(array_name: str) -> str:
@@ -471,7 +469,7 @@ def plan_report_queue_name(array_name: str) -> str:
 
     - ``:param array_name:`` Registered array the queue serves.
     """
-    return f"{RUNTIME_REPORT_QUEUE_PREFIX}{array_name}"
+    return f"{ONDEMAND_REPORT_QUEUE_PREFIX}{array_name}"
 
 
 # How long the array root bridge waits for a plan request at one send boundary, and how long the host waits for the
@@ -481,16 +479,16 @@ def plan_report_queue_name(array_name: str) -> str:
 # its next send boundary -- and it is also the bound a request that can never be served pays in full (see "The one
 # timing bound of that design", above: a reduction of the final delivered timestep has no further send to be answered
 # at). That is why it is cycle-tolerable rather than a five-minute stall, and why it is overridable.
-# ``DEISA_RUNTIME_PLAN_TIMEOUT`` is read by the HOST only: it bounds ``QueuePlanExchange``'s wait, and no bridge waits
+# ``DEISA_ONDEMAND_PLAN_TIMEOUT`` is read by the HOST only: it bounds ``QueuePlanExchange``'s wait, and no bridge waits
 # on it, so a simulation whose timestep is longer than the host default needs the variable set in the analytics host's
 # environment alone.
 _PLAN_BOUNDARY_POLL_SECONDS: float = 0.02
 _PLAN_REPORT_TIMEOUT_SECONDS: float = 60.0
-_PLAN_REPORT_TIMEOUT_ENV: str = "DEISA_RUNTIME_PLAN_TIMEOUT"
+_PLAN_REPORT_TIMEOUT_ENV: str = "DEISA_ONDEMAND_PLAN_TIMEOUT"
 
 
 def plan_report_timeout() -> float:
-    """Seconds the host waits for one round of reports: ``DEISA_RUNTIME_PLAN_TIMEOUT``, else the built-in default.
+    """Seconds the host waits for one round of reports: ``DEISA_ONDEMAND_PLAN_TIMEOUT``, else the built-in default.
 
     A malformed value falls back to the default rather than refusing: the timeout is a diagnostic bound, and a typo in
     an environment variable must not become the reason a run cannot start.
@@ -582,7 +580,7 @@ class QueuePlanExchange:
             while len(reports) < self._bridge_count:
                 reports.append(self._report_queue.get(timeout=self._timeout))
         except TimeoutError as exc:
-            raise errors.precompute_runtime_invariant(
+            raise errors.ondemand_invariant(
                 "QueuePlanExchange",
                 f"request {plan.request_id!r} for array {plan.array_name!r} at timestep {plan.timestep} collected "
                 f"{len(reports)} of {self._bridge_count} report(s) in {self._timeout}s; no bridge is serving plan "
@@ -610,20 +608,18 @@ def _grid_shape(reports: Sequence[PartialReport], ndim: int) -> Tuple[int, ...]:
     coords = [tuple(int(value) for value in report.chunk_position) for report in reports]
     for coord in coords:
         if len(coord) != ndim:
-            raise errors.precompute_runtime_invariant(
+            raise errors.ondemand_invariant(
                 "_grid_shape",
                 f"a partial reports the chunk position {coord} but the array has {ndim} data axes; the "
                 f"grid<->data-axis mapping is ambiguous",
             )
         if any(value < 0 for value in coord):
-            raise errors.precompute_runtime_invariant("_grid_shape", f"the chunk position {coord} has a negative axis")
+            raise errors.ondemand_invariant("_grid_shape", f"the chunk position {coord} has a negative axis")
     if len(set(coords)) != len(coords):
-        raise errors.precompute_runtime_invariant(
-            "_grid_shape", f"two partials report the same chunk position: {sorted(coords)}"
-        )
+        raise errors.ondemand_invariant("_grid_shape", f"two partials report the same chunk position: {sorted(coords)}")
     grid_shape = tuple(max(coord[axis] for coord in coords) + 1 for axis in range(ndim))
     if int(np.prod(grid_shape)) != len(coords):
-        raise errors.precompute_runtime_invariant(
+        raise errors.ondemand_invariant(
             "_grid_shape",
             f"the chunk grid {grid_shape} describes {int(np.prod(grid_shape))} chunks but {len(coords)} partials were "
             f"delivered",
@@ -656,7 +652,7 @@ def merge_partials(
     - ``:param finalize:`` Post-combine step (``"sqrt"`` for a standard deviation), else ``None``.
     """
     if not reports:
-        raise errors.precompute_runtime_invariant("merge_partials", "no per-bridge partial was delivered to merge")
+        raise errors.ondemand_invariant("merge_partials", "no per-bridge partial was delivered to merge")
     red_axes = tuple(range(ndim)) if not axes else tuple(int(axis) for axis in axes)
     kept_axes = tuple(axis for axis in range(ndim) if axis not in red_axes)
     grid_shape = _grid_shape(reports, ndim)
@@ -664,9 +660,7 @@ def merge_partials(
     if kind in _FOLD_KINDS and not kept_axes:
         fold = _SCALAR_FOLDS.get(op_name)
         if fold is None:
-            raise errors.precompute_runtime_invariant(
-                "merge_partials", f"no cross-bridge fold for the reduction {op_name!r}"
-            )
+            raise errors.ondemand_invariant("merge_partials", f"no cross-bridge fold for the reduction {op_name!r}")
         result = np.asarray(fold(np.stack([np.asarray(report.partial) for report in reports])))
         if finalize == _SQRT_FINALIZE:
             result = np.sqrt(result)
@@ -704,36 +698,36 @@ def _validate_reports(
       missing partial would silently shrink the merged value.
     """
     if not reports:
-        raise errors.precompute_runtime_invariant(
+        raise errors.ondemand_invariant(
             "PlanDispatcher", f"request {plan.request_id!r} returned no report from any bridge"
         )
     if expected is not None and len(reports) != expected:
-        raise errors.precompute_runtime_invariant(
+        raise errors.ondemand_invariant(
             "PlanDispatcher",
             f"request {plan.request_id!r} expected {expected} reports (one per bridge) but got {len(reports)}",
         )
     matched = []
     for report in reports:
         if report.request_id != plan.request_id:
-            raise errors.precompute_runtime_invariant(
+            raise errors.ondemand_invariant(
                 "PlanDispatcher",
                 f"request {plan.request_id!r} received a partial for request {report.request_id!r}; a result from "
                 f"another request cannot satisfy this one",
             )
         if report.timestep != plan.timestep:
-            raise errors.precompute_runtime_invariant(
+            raise errors.ondemand_invariant(
                 "PlanDispatcher",
                 f"request {plan.request_id!r} is for timestep {plan.timestep} but bridge {report.rank} answered with a "
                 f"partial of timestep {report.timestep}; refusing to mix two timesteps of array {plan.array_name!r}",
             )
         if report.array_name != plan.array_name:
-            raise errors.precompute_runtime_invariant(
+            raise errors.ondemand_invariant(
                 "PlanDispatcher",
                 f"request {plan.request_id!r} is rooted in array {plan.array_name!r} but bridge {report.rank} answered "
                 f"for array {report.array_name!r}",
             )
         if report.error is not None:
-            raise errors.precompute_runtime_invariant(
+            raise errors.ondemand_invariant(
                 "PlanDispatcher",
                 f"bridge {report.rank} could not serve the reduction {plan.request.key!r} on its chunk: "
                 f"{report.error}. Refusing to merge a partial set with a hole in it",
@@ -788,7 +782,7 @@ class PlanDispatcher:
     def compute(self, reduction: Any) -> Any:
         """Deliver the concrete value of ``reduction``.
 
-        - ``:param reduction:`` The :class:`~deisa.dask.runtime_expr.ReductionExpr` a callback computed.
+        - ``:param reduction:`` The :class:`~deisa.dask.ondemand_expr.ReductionExpr` a callback computed.
         """
         request = compose_request(reduction)
         ndim = reduction.operand.ndim
@@ -805,7 +799,7 @@ class PlanDispatcher:
         ):
             reports = self._menu_reports(menus, reduction.op_name)
             if self._bridge_count is not None and len(reports) != self._bridge_count:
-                raise errors.precompute_runtime_invariant(
+                raise errors.ondemand_invariant(
                     "PlanDispatcher",
                     f"the eager menu of array {request.input_name!r} at timestep {reduction.root.timestep} covers "
                     f"{len(reports)} bridge(s) but the array has {self._bridge_count}",
@@ -839,10 +833,10 @@ class PlanDispatcher:
         fit agree by construction rather than by reimplementation. ``n_components``/``whiten`` are NOT applied here:
         the estimator that dispatched the request is the root and applies them when it adopts the summary.
 
-        - ``:param request:`` The composed :class:`~deisa.dask.runtime_compose.PCARequest`.
+        - ``:param request:`` The composed :class:`~deisa.dask.ondemand_compose.PCARequest`.
         """
         if getattr(request, "kind", None) != _BRANCH_KIND_PCA:
-            raise errors.precompute_runtime_invariant(
+            raise errors.ondemand_invariant(
                 "PlanDispatcher",
                 f"a PCA dispatch needs a PCA request, got kind {getattr(request, 'kind', None)!r}",
             )
@@ -856,7 +850,7 @@ class PlanDispatcher:
         reports = self._reports_for(plan)
         for report in reports:
             if not isinstance(report.partial, PCASummary):
-                raise errors.precompute_runtime_invariant(
+                raise errors.ondemand_invariant(
                     "PlanDispatcher",
                     f"bridge {report.rank} answered the PCA branch {request.key!r} with a "
                     f"{type(report.partial).__name__}; only a mergeable summary can be merged",
@@ -869,7 +863,7 @@ class PlanDispatcher:
         Only the on-demand path is guarded: the menu path is decided before this call and is served from the menus
         shipped WITH the delivery, so it stays valid for every element of a callback's window.
 
-        - ``:param reduction:`` The :class:`~deisa.dask.runtime_expr.ReductionExpr` being computed.
+        - ``:param reduction:`` The :class:`~deisa.dask.ondemand_expr.ReductionExpr` being computed.
         - ``:param request:`` Its composed wire request (read for the root array's name).
         """
         self._refuse_stale_timestep(

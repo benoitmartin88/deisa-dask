@@ -33,7 +33,7 @@ callbacks, and the cycle boundary (``execute_callbacks``).
 
 Two delivery modes exist and each callback's ``precompute`` argument selects its own (decision F3):
 
-- **runtime reduction delivery** (``precompute=True``, the default): the callback receives one
+- **on-demand reduction delivery** (``precompute=True``, the default): the callback receives one
   :class:`~deisa.dask.collection.DeisaCollection` per (registered array, timestep) instead of an array. The collection
   is not a dask collection and carries no data -- it exposes the closed reduction surface and dispatches each
   ``.compute()`` to the bridges, which reduce their OWN chunk. The bridges' eager scalar menu and the on-demand plan
@@ -44,10 +44,10 @@ Two delivery modes exist and each callback's ``precompute`` argument selects its
 Delivery mode is per CALLBACK, not per run: two callbacks on the same array may be registered one way each, so the
 topic handler dispatches each callback down its own path within a single event.
 
-Window semantics under runtime delivery: the callback's argument is an ordinary Python list with one entry per array,
+Window semantics under on-demand delivery: the callback's argument is an ordinary Python list with one entry per array,
 so ``window[-1]`` is list indexing and delivers the current timestep's collection and ``window[-2]`` the previous
 one. A callback written against the old stub model that indexed the ARGUMENT as if it were the array (``def cb(a):
-return a[-1].sum()``) therefore keeps working and now reads ``a[-1]`` as "the latest timestep" -- the runtime reading,
+return a[-1].sum()``) therefore keeps working and now reads ``a[-1]`` as "the latest timestep" -- the on-demand reading,
 which is what the stub model was approximating. Anyone who needs the old array reading uses ``precompute=False``.
 
 Every refusal raised from a callback's ``.compute()`` fails the RUN (see ``_handle_callback_exception``) instead of
@@ -71,7 +71,7 @@ from deisa.core.interface import IDeisa
 from distributed import Client, Event, Future, Queue
 
 import dask.array as da
-from deisa.dask import runtime_errors as runtime_errors
+from deisa.dask import ondemand_errors as ondemand_errors
 from deisa.dask.collection import DeisaCollection
 from deisa.dask.constants import (
     CALLBACK_PREFIX,
@@ -82,27 +82,27 @@ from deisa.dask.constants import (
     WAIT_FOR_EXECUTE_CB_EVENT,
 )
 from deisa.dask.handshake import Handshake
-from deisa.dask.precompute_errors import (
-    MaterializationError,
-    PrecomputeRuntimeError,
-    RawFieldReadError,
-    UnsupportedReductionError,
-)
-from deisa.dask.runtime_dispatch import (
+from deisa.dask.ondemand_dispatch import (
     EagerMenu,
     PlanDispatcher,
     QueuePlanExchange,
     plan_report_queue_name,
     plan_request_queue_name,
 )
-from deisa.dask.runtime_errors import RuntimeRefusal
+from deisa.dask.ondemand_errors import OndemandRefusal
+from deisa.dask.precompute_errors import (
+    MaterializationError,
+    PrecomputeRuntimeError,
+    RawFieldReadError,
+    UnsupportedReductionError,
+)
 from deisa.dask.utils import build_deisa_array, get_client
 
 logger = logging.getLogger(__name__)
 
 # The refusal classes the precompute path raises mid-run: ``UnsupportedReductionError`` from chunk-local planning,
-# ``PrecomputeRuntimeError`` from the runtime transfer/merge steps. They are a separate family from
-# :mod:`deisa.dask.runtime_errors` (which subclasses them, never the other way around), so the abort predicate has to
+# ``PrecomputeRuntimeError`` from the on-demand transfer/merge steps. They are a separate family from
+# :mod:`deisa.dask.ondemand_errors` (which subclasses them, never the other way around), so the abort predicate has to
 # name them explicitly.
 _LEGACY_RUN_ABORTING: Tuple[type, ...] = (
     RawFieldReadError,
@@ -120,8 +120,8 @@ def _is_run_aborting(ex: BaseException) -> bool:
     deliver a wrong value on every later timestep, so the run stops once instead.
 
     BOTH taxonomies are covered because two delivery modes raise them:
-    :class:`~deisa.dask.runtime_errors.RuntimeRefusal` is the runtime path's family, and
-    :data:`_LEGACY_RUN_ABORTING` are the classes the legacy precompute view raises mid-run. The runtime classes
+    :class:`~deisa.dask.ondemand_errors.OndemandRefusal` is the on-demand path's family, and
+    :data:`_LEGACY_RUN_ABORTING` are the classes the legacy precompute view raises mid-run. The on-demand classes
     subclass their legacy namesakes, so a legacy ``except`` clause catches a new refusal too -- the two families are one
     hierarchy, and this predicate walks it from the top.
 
@@ -130,18 +130,18 @@ def _is_run_aborting(ex: BaseException) -> bool:
 
     - ``:param ex:`` The exception a callback raised.
     """
-    return isinstance(ex, (RuntimeRefusal, *_LEGACY_RUN_ABORTING))
+    return isinstance(ex, (OndemandRefusal, *_LEGACY_RUN_ABORTING))
 
 
 @dataclass
 class ArrayMode:
     """One array's delivery mode on the HOST side: one record per registered array, in ``Deisa._arrays``.
 
-    The three facts used to live in three parallel containers (``_runtime_arrays``, ``_legacy_arrays``,
-    ``_runtime_latest_timestep``) that only ever agreed on their key set; they are the same array's answer to three
+    The three facts used to live in three parallel containers (``_ondemand_arrays``, ``_legacy_arrays``,
+    ``_ondemand_latest_timestep``) that only ever agreed on their key set; they are the same array's answer to three
     questions, so they travel together.
 
-    - ``:param runtime:`` At least one ``precompute=True`` callback reads the array, i.e. the bridges must build its
+    - ``:param ondemand:`` At least one ``precompute=True`` callback reads the array, i.e. the bridges must build its
       eager scalar menu (and may skip the chunk once no legacy reader shares the array).
     - ``:param legacy:`` At least one ``precompute=False`` callback reads the array, so the bridges must keep
       scattering its chunk -- decision F3's escape hatch.
@@ -151,7 +151,7 @@ class ArrayMode:
       compose time instead of aborting the run.
     """
 
-    runtime: bool = False
+    ondemand: bool = False
     legacy: bool = False
     latest_timestep: Optional[int] = None
 
@@ -194,30 +194,30 @@ class Deisa(IDeisa):
         self._tasks = set()
         # True once execute_callbacks() has run; no new callbacks may be registered after the cycle has started.
         self._execute_callbacks_called = False
-        # array_name -> exchange callable of the runtime reduction path (one request/reports round trip over the
+        # array_name -> exchange callable of the on-demand reduction path (one request/reports round trip over the
         # array's sub-comm). Internal, never a user parameter: the delivery attaches the collection's compute boundary
         # from here, and an array without an entry still serves its eager menu and refuses the rest.
-        self._runtime_transports: Dict[str, Callable[[Any], Any]] = {}
+        self._ondemand_transports: Dict[str, Callable[[Any], Any]] = {}
         # One record per array for BOTH delivery facts and the newest delivered timestep. A ``precompute=True``
-        # callback files ``runtime`` (declared to the bridges over the handshake by
+        # callback files ``ondemand`` (declared to the bridges over the handshake by
         # ``_flush_delivery_state_to_handshake``, because an eager scalar menu for an array no callback subscribes to is
         # six chunk folds per bridge per timestep of pure critical-path cost); a ``precompute=False`` callback files
-        # ``legacy``, i.e. the array that still needs the LEGACY full-chunk scatter. A runtime-delivery array WITHOUT a
+        # ``legacy``, i.e. the array that still needs the LEGACY full-chunk scatter. An on-demand array WITHOUT a
         # legacy reader needs no data shipped at all (its menu and its on-demand plans answer every callback), while
         # one WITH a legacy reader must keep the chunk -- that is decision F3's escape hatch. Default-constructed on
         # first touch: only registered arrays ever reach this table.
         self._arrays: Dict[str, ArrayMode] = defaultdict(ArrayMode)
-        # First runtime refusal a callback raised; ``execute_callbacks`` re-raises it so the run fails instead of
+        # First on-demand refusal a callback raised; ``execute_callbacks`` re-raises it so the run fails instead of
         # logging once per timestep. None while the run is healthy.
         self._run_failure: Optional[BaseException] = None
         # Populate the per-array transports now, once: a delivery may ask for an on-demand reduction as soon as the
         # first event arrives, and attaching is a scheduler round trip per array.
-        self._attach_runtime_transports()
+        self._attach_ondemand_transports()
 
-    def _attach_runtime_transports(self) -> None:
+    def _attach_ondemand_transports(self) -> None:
         """Attach the production transport of every registered array: the array's pair of dask queues.
 
-        This is the writer of ``_runtime_transports``. The queues are named by convention and per array, the same way
+        This is the writer of ``_ondemand_transports``. The queues are named by convention and per array, the same way
         the feedback queues are, so the bridges attach to them without the host sending them anything: the host puts a
         request on ``plan_request_queue_name``, the array's root bridge picks it up and answers on
         ``plan_report_queue_name``, and what comes back is merged exactly as a test-injected exchange's reports are.
@@ -231,12 +231,12 @@ class Deisa(IDeisa):
             bridge_count = _grid_size_from_metadata(metadata)
             if not bridge_count:
                 continue
-            self._runtime_transports[array_name] = QueuePlanExchange(
+            self._ondemand_transports[array_name] = QueuePlanExchange(
                 Queue(plan_request_queue_name(array_name), client=self.client),
                 Queue(plan_report_queue_name(array_name), client=self.client),
                 bridge_count,
             )
-            logger.debug(f"runtime transport attached for array {array_name!r} over {bridge_count} bridge(s)")
+            logger.debug(f"on-demand transport attached for array {array_name!r} over {bridge_count} bridge(s)")
 
     def __del__(self):
         try:
@@ -276,13 +276,13 @@ class Deisa(IDeisa):
                 for arr2 ``@deisa.register(Window("arr1", 2), Window("arr2", 5), "arr3")`` # window size 2 for arr1 and
                 5 for arr2, default window size for arr3
 
-                Every callback is served by runtime reduction delivery by default: the bridges reduce their own chunk
+                Every callback is served by on-demand reduction delivery by default: the bridges reduce their own chunk
                 and the callback receives one data-free collection per array and timestep, whose reductions answer
                 from an eager scalar menu or an on-demand plan round. A callback that needs the whole field -- a raw
                 read, a reduction whose input is a derived expression the closed surface cannot express -- registers
                 with ``precompute=False`` and receives the legacy full-chunk scatter instead.
 
-                Delivery state filing contract: registration declares its arrays as runtime-delivery targets to the
+                Delivery state filing contract: registration declares its arrays as on-demand targets to the
                 handshake actor immediately (required: a bridge on the wait_for_go=False path fetches the state lazily
                 on its first send()). ``unregister_callback`` prunes memory only; the pruned set is re-filed at the
                 per-cycle boundary by ``execute_callbacks()`` (which always flushes before unblocking the bridges).
@@ -291,7 +291,7 @@ class Deisa(IDeisa):
         exception_handler:`` Optional exception handler to manage errors during callback execution. Defaults to
         ``__default_exception_handler``. - ``:param when:`` Specifies the conditional logic for triggering the
         callback. Can be 'AND' or 'OR'. Defaults to 'AND'. - ``:param precompute:`` Selects the delivery mode of THIS
-        callback: True (default) for runtime reduction delivery, False for the legacy full-chunk scatter. -
+        callback: True (default) for on-demand reduction delivery, False for the legacy full-chunk scatter. -
         ``:return:`` A callable that wraps the provided callback with the configured parameters and logic. -
         ``:rtype:`` Callable
         """
@@ -330,7 +330,7 @@ class Deisa(IDeisa):
         arguments representing callback-specific parameters. - ``:param exception_handler:`` Optional exception
         handler to manage errors during callback execution. - ``:param when:`` Specifies the conditional logic
         for triggering the callback. Can be 'AND' or 'OR'. - ``:param precompute:`` Selects the delivery mode of
-        this callback: True (default) for runtime reduction delivery, False for the legacy full-chunk scatter. -
+        this callback: True (default) for on-demand reduction delivery, False for the legacy full-chunk scatter. -
         ``:return:`` A callable that wraps the provided callback with the configured parameters and logic.
         """
         logger.debug(f"register_callback: callback={callback}, callback_args={callback_args}")
@@ -409,11 +409,11 @@ class Deisa(IDeisa):
             for array_name in array_names:
                 self._arrays[array_name].legacy = True
         else:
-            # These arrays are runtime-delivery targets: the bridges need to know, because an eager scalar menu for an
+            # These arrays are on-demand targets: the bridges need to know, because an eager scalar menu for an
             # array no callback reads is six chunk folds per bridge per timestep of pure critical-path cost. Filed
             # with the handshake actor here and at the per-cycle boundary, like the rest of the delivery state.
             for array_name in array_names:
-                self._arrays[array_name].runtime = True
+                self._arrays[array_name].ondemand = True
 
         # Both per-array facts travel in ONE handshake read, so they are filed together whatever the mode.
         self._flush_delivery_state_to_handshake()
@@ -431,7 +431,7 @@ class Deisa(IDeisa):
 
         # Register the callback payload only after every step that can raise (delivery-state filing, subscription) has
         # succeeded. ``precompute`` is carried in the payload because it is read per EVENT: the topic handler dispatches
-        # each callback down its own delivery path, and an unregistration recomputes the array's runtime-delivery
+        # each callback down its own delivery path, and an unregistration recomputes the array's on-demand
         # membership from the surviving payloads.
         self._callbacks[callback_id] = {
             "callback": callback,
@@ -447,7 +447,7 @@ class Deisa(IDeisa):
     def _prune_delivery_flags(self, array_name: str) -> None:
         """Recompute both per-array delivery facts from the surviving callbacks.
 
-        - ``runtime``: at least one callback registered on the array delivers with ``precompute=True``;
+        - ``ondemand``: at least one callback registered on the array delivers with ``precompute=True``;
         - ``legacy``: at least one callback registered on the array delivers with ``precompute=False``, i.e. reads the
           chunk itself, so the bridges must keep scattering it.
 
@@ -458,7 +458,7 @@ class Deisa(IDeisa):
         """
         surviving = [self._callbacks.get(cid, {}) for cid in self._callbacks_by_array.get(array_name, ())]
         mode = self._arrays[array_name]
-        mode.runtime = any(payload.get("precompute", True) for payload in surviving)
+        mode.ondemand = any(payload.get("precompute", True) for payload in surviving)
         mode.legacy = any(not payload.get("precompute", True) for payload in surviving)
 
     def unregister_callback(self, callback_id: Callback_id) -> None:
@@ -474,7 +474,7 @@ class Deisa(IDeisa):
                 s.discard(callback_id)
                 if not s:
                     del self._callbacks_by_array[array_name]
-            # Prune unconditionally for every array the callback touched: the dead callback's runtime-delivery claim
+            # Prune unconditionally for every array the callback touched: the dead callback's on-demand claim
             # must leave the set even if other callbacks remain registered.
             self._prune_delivery_flags(array_name)
 
@@ -503,17 +503,17 @@ class Deisa(IDeisa):
         Two per-array facts travel to the bridges, over the ONE broadcast each of them already enters per array (see
         :meth:`deisa.dask.handshake.Handshake.get_task_state`):
 
-        - whether the array is a runtime-delivery target, i.e. whether the eager scalar menu it computes has any
+        - whether the array is an on-demand target, i.e. whether the eager scalar menu it computes has any
           reader at all, and
         - whether the array still has a legacy (``precompute=False``) reader, i.e. whether its chunk must be scattered
-          even though a runtime callback on it needs no data.
+          even though an on-demand callback on it needs no data.
 
         Called by ``register_callback`` (a bridge on the wait_for_go=False path fetches lazily on first send(),
         possibly before the next cycle) and by ``execute_callbacks`` (before the bridges are unblocked).
         ``unregister_callback`` never files: an actor call inside the async topic handler stalls the handler loop. The
         pruned state is filed at the next flush point.
         """
-        self.handshake.set_runtime_arrays(sorted(name for name, mode in self._arrays.items() if mode.runtime))
+        self.handshake.set_ondemand_arrays(sorted(name for name, mode in self._arrays.items() if mode.ondemand))
         self.handshake.set_legacy_arrays(sorted(name for name, mode in self._arrays.items() if mode.legacy))
 
     def execute_callbacks(self) -> None:
@@ -609,19 +609,19 @@ class Deisa(IDeisa):
                 # callbacks get one data-free collection per array and timestep, ``precompute=False`` callbacks keep
                 # the legacy full-chunk scatter. The event's ``precomputed`` field is no longer read -- with nothing
                 # filing branches it is empty by construction.
-                runtime_views: Dict[Any, Any] = {}
-                if _weak_self._has_runtime_callbacks(array_name):
+                ondemand_views: Dict[Any, Any] = {}
+                if _weak_self._has_ondemand_callbacks(array_name):
                     # The bridges' eager menu is the zero-round-trip half of the reduction path, so its failure is the
                     # RUN's failure: recorded once per event, before any collection is built on top of it.
                     _weak_self._record_menu_failure(payload)
-                    runtime_views = _weak_self._runtime_views(array_name, iteration, payload)
+                    ondemand_views = _weak_self._ondemand_views(array_name, iteration, payload)
 
                 full_chunk_darr: List[Any] = []
 
                 def _get_full_chunk_darr():
                     """Tile the full-chunk futures into one dask array on first use, and pin it in the scheduler.
 
-                    Built lazily on purpose: an event whose callbacks are ALL served by runtime delivery must not pay
+                    Built lazily on purpose: an event whose callbacks are ALL served by on-demand delivery must not pay
                     for a dask graph over a chunk nobody reads.
 
                     An EMPTY ``futures`` is a delivery-state bug, not a data condition: the bridges skip the scatter
@@ -661,7 +661,7 @@ class Deisa(IDeisa):
                         # Resolving the operand is inside the try: a delivery that cannot produce one is a refusal of
                         # THIS callback (run-aborting, named after the array), never a logged handler error.
                         if cb_data.get("precompute", True):
-                            cb_darr = runtime_views.get(callback_id)
+                            cb_darr = ondemand_views.get(callback_id)
                             if cb_darr is None:
                                 # The callback was unregistered while this event was in flight: nothing to deliver.
                                 continue
@@ -691,15 +691,15 @@ class Deisa(IDeisa):
         detail = payload.get("menu_error")
         if not detail:
             return
-        failure = runtime_errors.precompute_runtime_invariant("the bridge eager menu", str(detail))
+        failure = ondemand_errors.ondemand_invariant("the bridge eager menu", str(detail))
         if getattr(self, "_run_failure", None) is None:
             self._run_failure = failure
         logger.error(f"the bridge eager menu failed for array {payload.get('array_name')!r}: {detail}")
 
-    def _has_runtime_callbacks(self, array_name: str) -> bool:
-        """Whether ANY callback registered on ``array_name`` is served by runtime delivery.
+    def _has_ondemand_callbacks(self, array_name: str) -> bool:
+        """Whether ANY callback registered on ``array_name`` is served by on-demand delivery.
 
-        The topic handler reads this once per event: with no runtime callback there is nobody to hand a collection
+        The topic handler reads this once per event: with no on-demand callback there is nobody to hand a collection
         to, so the event carries no menu worth recording and no view worth building.
 
         - ``:param array_name:`` Registered array the topic event is for.
@@ -708,8 +708,8 @@ class Deisa(IDeisa):
             self._callbacks.get(cid, {}).get("precompute", True) for cid in self._callbacks_by_array.get(array_name, ())
         )
 
-    def _runtime_views(self, array_name: str, iteration: int, payload: Mapping[str, Any]) -> Dict[Any, Any]:
-        """Build the runtime delivery view of one array for one timestep: a FRESH collection per callback.
+    def _ondemand_views(self, array_name: str, iteration: int, payload: Mapping[str, Any]) -> Dict[Any, Any]:
+        """Build the on-demand delivery view of one array for one timestep: a FRESH collection per callback.
 
         - ``:param array_name:`` Registered array the topic event is for.
         - ``:param iteration:`` Timestep the event delivered.
@@ -731,12 +731,12 @@ class Deisa(IDeisa):
         self._arrays[array_name].latest_timestep = int(iteration)
         menus = None if payload.get("menu_error") else payload.get("menu")
         return {
-            callback_id: self._runtime_collection(array_name, iteration, menus)
+            callback_id: self._ondemand_collection(array_name, iteration, menus)
             for callback_id in list(self._callbacks_by_array.get(array_name, ()))
             if self._callbacks.get(callback_id, {}).get("precompute", True)
         }
 
-    def _runtime_collection(self, array_name: str, iteration: int, menus: Any = None) -> DeisaCollection:
+    def _ondemand_collection(self, array_name: str, iteration: int, menus: Any = None) -> DeisaCollection:
         """Build the collection a callback receives for ``array_name`` at ``iteration``.
 
         The compute boundary is attached here and nowhere else. It carries the bridges' eager menu, so a scalar full
@@ -749,7 +749,7 @@ class Deisa(IDeisa):
         """
         metadata = self.arrays_metadata.get(array_name, {})
         dispatcher = PlanDispatcher(
-            self._runtime_transports.get(array_name),
+            self._ondemand_transports.get(array_name),
             bridge_count=_grid_size_from_metadata(metadata),
             menu=_as_eager_menus(menus),
             latest_timestep=lambda: self._arrays[array_name].latest_timestep,
@@ -820,7 +820,7 @@ class Deisa(IDeisa):
                     state[name]["changed"] = False
 
     def _handle_callback_exception(self, callback_id, cb_data, ex):
-        """Route a callback failure: a runtime refusal FAILS THE RUN, anything else goes to the user's handler.
+        """Route a callback failure: an on-demand refusal FAILS THE RUN, anything else goes to the user's handler.
 
         The refusal branch is first and is not negotiable by an exception handler. A refusal means the callback asked
         for something the reduction path cannot serve -- a raw read, a numpy materialization, an off-surface or
@@ -860,7 +860,7 @@ class Deisa(IDeisa):
         keys = [p["future"].key for p in futures]
         if not keys:
             # Nothing crossed the boundary, so there is no ownership to transfer: an event whose callbacks are all
-            # served by runtime delivery carries no data future at all. The skip is not an optimization -- the
+            # served by on-demand delivery carries no data future at all. The skip is not an optimization -- the
             # release below names the pseudo client ``CLIENT_KEY`` ("deisa"), which only a bridge that actually
             # scattered a chunk ever registers (``Bridge.send`` files that desire next to ``update_data``, on the
             # non-data-free path only). Releasing keys against a client the scheduler has never seen makes it raise

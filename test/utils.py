@@ -161,7 +161,7 @@ def _scalar(value: Any) -> float:
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Runtime-planner harness (the delivery path a callback is handed: DeisaCollections, not dask arrays)
+# On-demand planner harness (the delivery path a callback is handed: DeisaCollections, not dask arrays)
 # ---------------------------------------------------------------------------------------------------------------------
 DEFAULT_META: Dict[str, Any] = {"f": {"global_shape": (8, 8), "chunk_shape": (4, 4)}}
 
@@ -169,9 +169,9 @@ DEFAULT_META: Dict[str, Any] = {"f": {"global_shape": (8, 8), "chunk_shape": (4,
 class RecordingDispatcher:
     """The compute boundary a harness collection carries: record every reduction, dispatch nothing.
 
-    A planner test is about WHAT a callback asks for (:class:`~deisa.dask.runtime_compose.RuntimeRequest`), not about
+    A planner test is about WHAT a callback asks for (:class:`~deisa.dask.ondemand_compose.OndemandRequest`), not about
     the merged number, so the boundary returns a sentinel and records the reductions in call order. Value parity with
-    the real :class:`~deisa.dask.runtime_dispatch.PlanDispatcher` is asserted separately, over an in-process exchange.
+    the real :class:`~deisa.dask.ondemand_dispatch.PlanDispatcher` is asserted separately, over an in-process exchange.
     """
 
     def __init__(self, value: Any = 0.0) -> None:
@@ -206,7 +206,7 @@ def _collection(
 def _run_callback(
     body: str,
     params: str = "arr",
-    name: str = "runtime_cb",
+    name: str = "ondemand_cb",
     meta: Optional[Dict[str, Any]] = None,
     collections: Optional[Dict[str, Any]] = None,
     dispatcher: Any = None,
@@ -227,7 +227,7 @@ def _run_callback(
     """
     import dask.array as da
 
-    from deisa.dask.runtime_compose import compose_request
+    from deisa.dask.ondemand_compose import compose_request
 
     arg_names = [raw.strip() for raw in params.split(",") if raw.strip()]
     boundary = dispatcher if dispatcher is not None else RecordingDispatcher()
@@ -242,7 +242,7 @@ def _run_callback(
     scope: Dict[str, Any] = {"np": np, "da": da}
     scope.update(extra_globals or {})
     src = textwrap.dedent(f"def {name}({params}):\n{textwrap.indent(body, '    ')}")
-    exec(compile(src, f"<runtime-utils:{name}>", "exec"), scope)
+    exec(compile(src, f"<on-demand-utils:{name}>", "exec"), scope)
     callback = scope[name]
     callback.__source__ = src  # type: ignore[attr-defined]
 
@@ -253,7 +253,7 @@ def _run_callback(
 def _direct_exchange(chunks: Sequence[Any], array_name: str = "f", timestep: int = 0, grid: Sequence[int] = (2, 2)):
     """An in-process bridge exchange: every bridge answers the plan from its own chunk, no communicator, no threads.
 
-    This is the production responder (:class:`~deisa.dask.runtime_dispatch.PlanResponder`) and the production merge,
+    This is the production responder (:class:`~deisa.dask.ondemand_dispatch.PlanResponder`) and the production merge,
     with the transport replaced by a plain function call -- enough to assert DELIVERED VALUES without a cluster.
 
     - ``:param chunks:`` One numpy chunk per bridge, in rank order.
@@ -261,7 +261,7 @@ def _direct_exchange(chunks: Sequence[Any], array_name: str = "f", timestep: int
     - ``:param timestep:`` Timestep the chunks belong to.
     - ``:param grid:`` Chunk-grid extent (the MPI cart dims) the rank order maps onto.
     """
-    from deisa.dask.runtime_dispatch import PlanResponder
+    from deisa.dask.ondemand_dispatch import PlanResponder
 
     positions = [tuple(int(value) for value in np.unravel_index(rank, grid)) for rank in range(len(chunks))]
 
@@ -290,7 +290,7 @@ def _dispatched(
     - ``:param timestep:`` Timestep of the delivery.
     """
     from deisa.dask.collection import DeisaCollection
-    from deisa.dask.runtime_dispatch import PlanDispatcher
+    from deisa.dask.ondemand_dispatch import PlanDispatcher
 
     field = np.asarray(field)
     chunk_shape = tuple(chunk_shape or (field.shape[0] // grid[0], field.shape[1] // grid[1]))

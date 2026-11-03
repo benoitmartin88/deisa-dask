@@ -30,10 +30,10 @@
 The reduction planner a callback's ``.compute()`` goes through.
 
 The retired AST precompute analyzer walked the callback source symbolically, evaluated dask stubs without executing the
-callback, and read hints off each dask task graph. The v1 runtime path plans nothing from the source at all -- the
+callback, and read hints off each dask task graph. The v1 on-demand path plans nothing from the source at all -- the
 callback RUNS against a lazily-reducible :class:`~deisa.dask.collection.DeisaCollection`, and every reduction it
 computes carries its own ``op_name`` / ``axes`` / ``kind`` / ``finalize``, from which
-:func:`~deisa.dask.runtime_compose.compose_request` builds the slim wire request. This file is the fixture suite for
+:func:`~deisa.dask.ondemand_compose.compose_request` builds the slim wire request. This file is the fixture suite for
 that planner.
 
 The suite keeps the dimensionality of the gysela workload that motivated the design
@@ -41,7 +41,7 @@ The suite keeps the dimensionality of the gysela workload that motivated the des
 ``test_gysela_measure_helper_loop_reduces_five_expressions_per_species``): those are the only fixtures that reduce an
 array with ``ndim > 2``, which is why they cannot be dropped as redundant with the 2-D axis fixtures.
 
-Refusals are pinned against the RUNTIME taxonomy (``deisa.dask.runtime_errors``), which is the one a callback meets.
+Refusals are pinned against the ONDEMAND taxonomy (``deisa.dask.ondemand_errors``), which is the one a callback meets.
 A non-associative reduction (``argmax``/``argmin``/``median``/``quantile``/``percentile``) is refused as
 ``NonAssociativeReductionError``, and the refusal names the cause (the answer depends on the GLOBAL ordering of the
 data) and the remedy (the associative set). The retired analyzer misdiagnosed it -- ``argmax`` as a raw field read,
@@ -76,10 +76,10 @@ from utils import (
     _scalar,
 )
 
-from deisa.dask import runtime_errors as errors
+from deisa.dask import ondemand_errors as errors
 from deisa.dask.collection import DeisaCollection
 from deisa.dask.deisa import ArrayMode, Deisa
-from deisa.dask.runtime_dispatch import PlanDispatcher, PlanResponder
+from deisa.dask.ondemand_dispatch import PlanDispatcher, PlanResponder
 
 # The chunk every branch callable is exercised on: mixed signs, so max/min/mean/var distinguish the ops.
 CHUNK = np.arange(16.0).reshape(4, 4) - 8.0
@@ -327,7 +327,7 @@ def test_full_fold_ships_one_scalar_per_bridge() -> None:
     Without the finalizer the partial would be dask's ``(1, 4)`` tier shape for a ``(4, 4)`` chunk, which is four times
     the payload for the same information.
     """
-    from deisa.dask.runtime_compose import probe_partial
+    from deisa.dask.ondemand_compose import probe_partial
 
     _, requests, _ = _run_callback("result = arr.sum()\nresult.compute()")
     chain = requests[0].branch_func.keywords["_chain"]
@@ -340,7 +340,7 @@ def test_full_fold_ships_one_scalar_per_bridge() -> None:
 
 def test_axis_fold_keeps_a_tier_partial() -> None:
     """An axis fold keeps the un-reduced axis (one row per bridge), so no full-fold finalizer is composed."""
-    from deisa.dask.runtime_compose import probe_partial
+    from deisa.dask.ondemand_compose import probe_partial
 
     _, requests, _ = _run_callback("result = arr.sum(axis=0)\nresult.compute()")
     chain = requests[0].branch_func.keywords["_chain"]
@@ -653,7 +653,8 @@ def test_numpy_linalg_on_the_collection_is_refused() -> None:
     """``np.linalg.norm(collection)`` is refused: on the analytics host there is no chunk to consume.
 
     Numpy's coercion is refused at the point where the gather would have happened, so the whole field never
-    materializes on the analytics host. This closes an unsound hole; it is not a capability the runtime should acquire.
+    materializes on the analytics host. This closes an unsound hole; it is not a capability the on-demand path
+    should acquire.
     """
     with pytest.raises(errors.MaterializationError):
         _run_callback("v = np.linalg.norm(arr)\ns = arr.sum()\nreturn s.compute(), v")
@@ -749,7 +750,7 @@ def test_derived_reduction_delivers_the_value() -> None:
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# The gysela 5-D surface: the workload the redesign was motivated by, on the runtime closed surface
+# The gysela 5-D surface: the workload the redesign was motivated by, on the on-demand closed surface
 # ---------------------------------------------------------------------------------------------------------------------
 # ``fdistribu`` is a 5-D distribution function, and ``density()``/``measure()`` reduce velocity and space axes out of
 # it. These two fixtures keep that dimensionality (the axis fixtures above are 2-D) on the closed surface: no
@@ -779,7 +780,7 @@ class _RecordingPlanDispatcher:
 
     A multi-reduction helper reduces to plain values before it returns, so the reductions are only enumerable at the
     compute boundary; this records them while delegating the delivery itself (value, merge, refusals) to the real
-    :class:`~deisa.dask.runtime_dispatch.PlanDispatcher`.
+    :class:`~deisa.dask.ondemand_dispatch.PlanDispatcher`.
     """
 
     def __init__(self, inner) -> None:
@@ -817,7 +818,7 @@ def test_gysela_density_helper_plans_the_5d_axis_tuple_and_delivers_the_value() 
     5000 B chunk, and the delivered value against numpy. The literals are the contract, so a drift in the axis tuple,
     the wire key or the partial shape is a test failure rather than a deployment surprise.
     """
-    from deisa.dask.runtime_compose import probe_partial
+    from deisa.dask.ondemand_compose import probe_partial
 
     body = "s = arr.sum(axis=(0, 3, 4))\ns.compute()"
     _, requests, _ = _run_callback(body, meta=GYSELA_META)
@@ -844,7 +845,7 @@ def test_gysela_density_helper_plans_the_5d_axis_tuple_and_delivers_the_value() 
 
 
 def test_gysela_measure_helper_loop_reduces_five_expressions_per_species() -> None:
-    """``measure()`` in the runtime spelling: five full reductions per species, on the same 5-D grid.
+    """``measure()`` in the on-demand spelling: five full reductions per species, on the same 5-D grid.
 
     The fixture asserts the VALUE of each quantity, so a program attached to the wrong reduction cannot hide behind a
     count: ``f``, ``f**2``, ``f*vx``, ``f*vy`` and ``f*v2`` are five separate requests, each folding its own program on
@@ -911,14 +912,14 @@ def test_each_callback_gets_its_own_collection() -> None:
     """
     deisa = Deisa.__new__(Deisa)
     deisa.arrays_metadata = DEFAULT_META
-    deisa._runtime_transports = {}
+    deisa._ondemand_transports = {}
     deisa._arrays = defaultdict(ArrayMode)
     deisa._callbacks_by_array = {"f": {"cb-1", "cb-2"}}
     # Delivery mode is per CALLBACK (decision F3): the view builder reads each payload's ``precompute`` flag, so the
     # stubbed registrations must carry one like a real one does.
     deisa._callbacks = {"cb-1": {"precompute": True}, "cb-2": {"precompute": True}}
 
-    views = deisa._runtime_views("f", 3, {"menu": []})
+    views = deisa._ondemand_views("f", 3, {"menu": []})
 
     assert set(views) == {"cb-1", "cb-2"}
     assert views["cb-1"] is not views["cb-2"]

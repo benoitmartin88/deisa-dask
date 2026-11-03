@@ -313,7 +313,7 @@ class TestPrecomputeRegressions:
         b1.arrays_metadata["temperature"] = meta0["temperature"]
         calls = {"state": 0, "menu": 0, "scatter": 0}
         orig_state = b1._ensure_task_state
-        orig_menu = b1._build_runtime_menu
+        orig_menu = b1._build_ondemand_menu
         orig_scatter = b1._scatter_full
 
         def spy_state(array_name):
@@ -329,7 +329,7 @@ class TestPrecomputeRegressions:
             return orig_scatter(data, workers=workers, hash=hash)
 
         b1._ensure_task_state = spy_state
-        b1._build_runtime_menu = spy_menu
+        b1._build_ondemand_menu = spy_menu
         b1._scatter_full = spy_scatter
         b1.send("temperature", np.ones(4), timestep=0)
         assert calls == {"state": 0, "menu": 0, "scatter": 0}

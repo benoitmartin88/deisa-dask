@@ -33,7 +33,7 @@ are planned, and everything else is ordinary Python over metadata. This file pin
 the spellings that are OUTSIDE the surface, the class each refusal raises, and the boundary cases where refusing would
 be wrong (sibling reductions, predicate builtins, metadata reads, plain Python control flow).
 
-Every refusal here is a property of the runtime surface, stated together with the spelling that works instead. The
+Every refusal here is a property of the on-demand surface, stated together with the spelling that works instead. The
 notes below collect the calls that look surprising in either direction.
 
 - **``map_blocks``**: refused, opaque or resolvable, because the surface never inspects a callable. The intent of
@@ -69,8 +69,8 @@ import numpy as np
 import pytest
 from utils import RecordingDispatcher, _collection, _run_callback, _scalar
 
-from deisa.dask import runtime_errors as errors
-from deisa.dask.runtime_compose import probe_partial
+from deisa.dask import ondemand_errors as errors
+from deisa.dask.ondemand_compose import probe_partial
 
 META_AB = {
     "a": {"global_shape": (8, 8), "chunk_shape": (4, 4)},
@@ -101,9 +101,9 @@ def _two_arrays(body: str):
 def test_map_blocks_is_off_surface(body) -> None:
     """``arr.map_blocks(...)`` is refused, opaque or resolvable -- the surface is closed and inspects no callable.
 
-    Folding ``np.abs`` into a branch would mean reasoning about a callable, which the runtime never does, so both forms
-    are refused at the same gate and the message names the spellings that work: the pointwise operator, or
-    ``precompute=False``.
+    Folding ``np.abs`` into a branch would mean reasoning about a callable, which the on-demand path never does,
+    so both forms are refused at the same gate and the message names the spellings that work: the pointwise
+    operator, or ``precompute=False``.
     """
     with pytest.raises(errors.UnsupportedReductionError) as refusal:
         _run_callback(body)
@@ -237,7 +237,7 @@ def test_unbound_param_subscript_of_a_collection_is_refused_not_crashing() -> No
         pytest.param("s = arr.sum()\nreturn s.compute()", (), (), id="full_sum"),
     ],
 )
-def test_partial_metadata_is_probed_from_the_runtime_plan(body, axes, expected_shape) -> None:
+def test_partial_metadata_is_probed_from_the_ondemand_plan(body, axes, expected_shape) -> None:
     """The shipped partial is the CHUNK's partial (8x8 array, 4x4 chunks), probed off the composed callable.
 
     The value travels in the topic event and drives the combine ``out_shape``, so it is pinned as a literal here: a
@@ -247,7 +247,7 @@ def test_partial_metadata_is_probed_from_the_runtime_plan(body, axes, expected_s
     request = requests[0]
     shape, dtype = probe_partial(request, (4, 4), np.dtype(np.float64))
     assert request.axes == axes
-    assert shape == expected_shape, f"runtime partial {shape}, expected {expected_shape}"
+    assert shape == expected_shape, f"on-demand partial {shape}, expected {expected_shape}"
     assert dtype == np.dtype(np.float64)
 
 
@@ -287,8 +287,8 @@ def test_multiarray_branch_func_computes_own_reduction() -> None:
 def test_raw_field_read_via_opaque_call_refused_at_consumption(callee) -> None:
     """``plot(arr)``/``custom(arr)``: handing the operand over is free, CONSUMING it is refused -- role 3.
 
-    The runtime hands over a lazy operand and refuses at the point where the whole field would have been gathered, with
-    ``MaterializationError``. The data never reaches the host, and the refusal names the remedy.
+    The on-demand path hands over a lazy operand and refuses at the point where the whole field would have been
+    gathered, with ``MaterializationError``. The data never reaches the host, and the refusal names the remedy.
     """
 
     def consumer(value):

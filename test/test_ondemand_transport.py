@@ -27,9 +27,9 @@
 # POSSIBILITY OF SUCH DAMAGE.
 # =============================================================================
 """
-The PRODUCTION transport of the runtime reduction path: the host's queue exchange and the bridge's plan pump.
+The PRODUCTION transport of the on-demand reduction path: the host's queue exchange and the bridge's plan pump.
 
-Nothing in this file injects a transport. The host half is ``Deisa._attach_runtime_transports`` -- the exact call
+Nothing in this file injects a transport. The host half is ``Deisa._attach_ondemand_transports`` -- the exact call
 ``Deisa.__init__`` makes -- over real ``distributed.Queue`` objects, and the bridge half is the production SHAPE of the
 array side: exactly ONE queue consumer per array (the root bridge's poll inside ``PlanPump.serve``), the requests it
 takes parked in the root's ``PlanRequestBacklog``, and ``PlanPump.serve`` doing the folding at the send boundary. One
@@ -41,7 +41,7 @@ request is answered at the first send AFTER it reached the queue. One test pins 
 folds nothing; a request queued before the boundary is served by it; nothing is served twice).
 
 Only MPI itself is out of scope: the multi-bridge collective runs over ``FakeComm`` (the same stand-in
-``test_runtime_dispatch`` uses), because a two-rank mpi4py run is not something a unit suite can host. Everything that
+``test_ondemand_dispatch`` uses), because a two-rank mpi4py run is not something a unit suite can host. Everything that
 decides whether an axis reduction aborts the run -- the wiring, the queues, the reports, the merge -- is the production
 code path, and two SUCCESSIVE reductions are asserted, because the single-request case cannot see a leftover report.
 
@@ -63,13 +63,13 @@ from utils import FakeComm, wait_for
 
 from deisa.dask import bridge as bridge_module
 from deisa.dask import deisa as deisa_module
-from deisa.dask import runtime_dispatch as runtime_dispatch_module
-from deisa.dask import runtime_errors as errors
+from deisa.dask import ondemand_dispatch as ondemand_dispatch_module
+from deisa.dask import ondemand_errors as errors
 from deisa.dask.bridge import Bridge, DeliveryState, PlanPump
 from deisa.dask.collection import DeisaCollection
 from deisa.dask.deisa import ArrayMode, Deisa
-from deisa.dask.runtime_compose import compose_request
-from deisa.dask.runtime_dispatch import (
+from deisa.dask.ondemand_compose import compose_request
+from deisa.dask.ondemand_dispatch import (
     PlanRequest,
     QueuePlanExchange,
     plan_report_queue_name,
@@ -87,7 +87,7 @@ METADATA = {ARRAY_NAME: {"global_shape": GLOBAL_SHAPE, "chunk_shape": CHUNK_SHAP
 def client():
     """A real scheduler: the queues are the production ones, not a stand-in."""
     cluster = LocalCluster(n_workers=1, threads_per_worker=1, processes=False, dashboard_address=None)
-    instance = Client(cluster, name="runtime-transport-test")
+    instance = Client(cluster, name="on-demand-transport-test")
     try:
         yield instance
     finally:
@@ -157,7 +157,7 @@ def make_deisa_stub(client, monkeypatch, transports=None):
     deisa._tasks = set()
     deisa._execute_callbacks_called = False
     deisa._run_failure = None
-    deisa._runtime_transports = {} if transports is None else transports
+    deisa._ondemand_transports = {} if transports is None else transports
     deisa._arrays = collections.defaultdict(ArrayMode)
     return deisa
 
@@ -176,7 +176,7 @@ def register_callback(deisa, callback, window_size=1):
         },
     }
     deisa._callbacks_by_array.setdefault(ARRAY_NAME, set()).add(callback_id)
-    deisa._arrays[ARRAY_NAME].runtime = True
+    deisa._arrays[ARRAY_NAME].ondemand = True
     return callback_id
 
 
@@ -238,12 +238,12 @@ def test_two_successive_axis_folds_are_served_by_the_production_transport(client
 
     deisa = make_deisa_stub(client, monkeypatch)
     # A wiring failure must be a failing test in seconds, not a 60 s stall.
-    monkeypatch.setattr(runtime_dispatch_module, "plan_report_timeout", lambda: 20.0)
+    monkeypatch.setattr(ondemand_dispatch_module, "plan_report_timeout", lambda: 20.0)
 
     # The wiring under test: the SAME call Deisa.__init__ makes. Nothing is injected into the table.
-    deisa._attach_runtime_transports()
-    assert set(deisa._runtime_transports) == {ARRAY_NAME}, "the production attach must populate the transport table"
-    assert isinstance(deisa._runtime_transports[ARRAY_NAME], QueuePlanExchange)
+    deisa._attach_ondemand_transports()
+    assert set(deisa._ondemand_transports) == {ARRAY_NAME}, "the production attach must populate the transport table"
+    assert isinstance(deisa._ondemand_transports[ARRAY_NAME], QueuePlanExchange)
     deisa._topic_handlers[ARRAY_NAME] = deisa._make_topic_handler(ARRAY_NAME)
 
     state = FakeComm.State(bridge_count)
@@ -382,7 +382,7 @@ def test_backlog_belongs_to_every_participating_array(monkeypatch):
     bridge._plan_pumps = {}
     bridge._array_comms = {ARRAY_NAME: FakeComm(FakeComm.State(1), 0), "not-mine": bridge_module._COMM_NULL}
 
-    bridge._start_runtime_plan_pumps()
+    bridge._start_ondemand_plan_pumps()
 
     assert set(bridge._plan_pumps) == {ARRAY_NAME}, (
         "every participating array needs a pump, so the send boundary is the same collective on every rank"

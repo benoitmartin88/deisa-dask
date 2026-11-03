@@ -54,7 +54,7 @@ from typing import Any, Tuple
 
 import numpy as np
 
-from deisa.dask import runtime_errors as errors
+from deisa.dask import ondemand_errors as errors
 
 # Kinds of reduction payload. The first three are the values the existing combine algebra already understands; the last
 # two are the F4 extension (any/all -> boolean, count -> count). Their cross-bridge folds live in the combine tables
@@ -178,7 +178,7 @@ def eval_pointwise(program: Tuple[Any, ...], chunk: Any) -> Any:
         return program[1]
     func = _POINTWISE_FUNCS.get(head)
     if func is None:
-        raise errors.precompute_runtime_invariant(
+        raise errors.ondemand_invariant(
             "eval_pointwise", f"unknown pointwise operator {head!r} in a composed branch program"
         )
     return func(*[eval_pointwise(child, chunk) for child in program[1:]])

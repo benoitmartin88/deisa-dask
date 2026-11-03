@@ -31,7 +31,7 @@ The DEISA lazy collection a callback receives, one instance per registered array
 
 The collection is what the topic handler delivers (in P3) where it used to deliver a dask array. It carries the array's
 identity and metadata -- name, timestep, global shape, dtype, chunk shape and the number of bridges that own a chunk --
-and it exposes the closed operator surface of :mod:`deisa.dask.runtime_expr`. It is deliberately NOT a dask
+and it exposes the closed operator surface of :mod:`deisa.dask.ondemand_expr`. It is deliberately NOT a dask
 collection and NOT an ``dask.array.Array`` subclass:
 
 - a ``da.Array`` subclass loses its identity on the first derived expression, so it cannot keep a whole expression
@@ -49,20 +49,20 @@ from typing import Any, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
-from deisa.dask import runtime_errors as errors
-from deisa.dask.runtime_expr import _CHUNK_PROGRAM, LazyOperand, Root
+from deisa.dask import ondemand_errors as errors
+from deisa.dask.ondemand_expr import _CHUNK_PROGRAM, LazyOperand, Root
 
 __all__ = ["DeisaCollection"]
 
 
 def _as_shape(value: Any, what: str) -> Tuple[int, ...]:
-    """Normalize ``value`` into a non-empty tuple of positive ints, or raise a runtime-invariant refusal."""
+    """Normalize ``value`` into a non-empty tuple of positive ints, or raise a refusal for a violated invariant."""
     try:
         shape = tuple(int(size) for size in value)
     except (TypeError, ValueError):
-        raise errors.precompute_runtime_invariant("DeisaCollection", f"{what} {value!r} is not a shape") from None
+        raise errors.ondemand_invariant("DeisaCollection", f"{what} {value!r} is not a shape") from None
     if not shape or any(size <= 0 for size in shape):
-        raise errors.precompute_runtime_invariant("DeisaCollection", f"{what} {shape} is not a non-empty shape")
+        raise errors.ondemand_invariant("DeisaCollection", f"{what} {shape} is not a non-empty shape")
     return shape
 
 
@@ -112,12 +112,12 @@ class DeisaCollection(LazyOperand):
         self._dtype = np.dtype(dtype)
         self.chunk_shape = self._shape if chunk_shape is None else _as_shape(chunk_shape, "the chunk shape")
         if len(self.chunk_shape) != len(self._shape):
-            raise errors.precompute_runtime_invariant(
+            raise errors.ondemand_invariant(
                 "DeisaCollection",
                 f"the chunk shape {self.chunk_shape} and the global shape {self._shape} have different ranks",
             )
         if any(chunk > size for chunk, size in zip(self.chunk_shape, self._shape)):
-            raise errors.precompute_runtime_invariant(
+            raise errors.ondemand_invariant(
                 "DeisaCollection",
                 f"the chunk shape {self.chunk_shape} does not fit inside the global shape {self._shape}",
             )
@@ -125,7 +125,7 @@ class DeisaCollection(LazyOperand):
         # array's data axes, so the product IS the number of bridges holding a chunk of this array.
         self.bridge_count = int(np.prod([max(1, size // chunk) for chunk, size in zip(self.chunk_shape, self._shape)]))
         if bridge_count is not None and int(bridge_count) != self.bridge_count:
-            raise errors.precompute_runtime_invariant(
+            raise errors.ondemand_invariant(
                 "DeisaCollection",
                 f"the metadata implies {self.bridge_count} bridge(s) for array {self.name!r} "
                 f"(global shape {self._shape}, chunk shape {self.chunk_shape}) but {bridge_count} was declared",
@@ -157,7 +157,7 @@ class DeisaCollection(LazyOperand):
         """
         global_shape = metadata.get("global_shape")
         if not global_shape:
-            raise errors.precompute_runtime_invariant(
+            raise errors.ondemand_invariant(
                 "DeisaCollection.from_metadata", f"the metadata for array {name!r} carries no ``global_shape``"
             )
         return cls(

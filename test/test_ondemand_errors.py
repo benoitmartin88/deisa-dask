@@ -7,8 +7,8 @@ present -- which is also what keeps the wording from silently degrading.
 
 import pytest
 
+from deisa.dask import ondemand_errors as errors
 from deisa.dask import precompute_errors as analyzer_errors
-from deisa.dask import runtime_errors as errors
 from deisa.dask.precompute_errors import PrecomputeError
 
 # Every refusal class of the v1 taxonomy (the brief's list, in the order it gives).
@@ -54,7 +54,7 @@ FACTORY_CASES = [
         lambda: errors.no_precomputable_reduction("the callback 'cb'"), ["the callback 'cb'"], id="no-reduction"
     ),
     pytest.param(
-        lambda: errors.precompute_runtime_invariant("DeisaCollection", "the metadata is inconsistent"),
+        lambda: errors.ondemand_invariant("DeisaCollection", "the metadata is inconsistent"),
         ["DeisaCollection", "the metadata is inconsistent"],
         id="invariant",
     ),
@@ -64,7 +64,7 @@ FACTORY_CASES = [
 def test_every_refusal_is_a_precompute_error():
     """The taxonomy plugs into the existing handling: ``except PrecomputeError`` still catches every refusal."""
     for kind in REFUSAL_CLASSES:
-        assert issubclass(kind, errors.RuntimeRefusal)
+        assert issubclass(kind, errors.OndemandRefusal)
         assert issubclass(kind, PrecomputeError)
 
 
@@ -77,19 +77,19 @@ NAMESAKE_PAIRS = [
 ]
 
 
-@pytest.mark.parametrize("runtime_kind,analyzer_kind", NAMESAKE_PAIRS)
-def test_every_runtime_refusal_is_its_analyzer_namesake(runtime_kind, analyzer_kind):
+@pytest.mark.parametrize("ondemand_kind,analyzer_kind", NAMESAKE_PAIRS)
+def test_every_ondemand_refusal_is_its_analyzer_namesake(ondemand_kind, analyzer_kind):
     """The two taxonomies share their names, so they must also share their classes.
 
     Two unrelated classes with the same name are a trap: a handler written as ``except PrecomputeRuntimeError`` (the
-    analyzer's) silently misses a runtime refusal that now aborts the run, and ``isinstance`` checks against the legacy
-    names would not see the new refusals at all. Subclassing the analyzer namesake in the runtime taxonomy closes both
-    directions for the errors that cross the delivery boundary.
+    analyzer's) silently misses an on-demand refusal that now aborts the run, and ``isinstance`` checks against the
+    legacy names would not see the new refusals at all. Subclassing the analyzer namesake in the on-demand taxonomy
+    closes both directions for the errors that cross the delivery boundary.
     """
-    assert runtime_kind is not analyzer_kind, "the runtime class is its own type, not an alias"
-    assert issubclass(runtime_kind, analyzer_kind), f"{runtime_kind.__name__} must subclass the analyzer namesake"
-    assert issubclass(runtime_kind, errors.RuntimeRefusal)
-    assert isinstance(runtime_kind("a message"), analyzer_kind)
+    assert ondemand_kind is not analyzer_kind, "the on-demand class is its own type, not an alias"
+    assert issubclass(ondemand_kind, analyzer_kind), f"{ondemand_kind.__name__} must subclass the analyzer namesake"
+    assert issubclass(ondemand_kind, errors.OndemandRefusal)
+    assert isinstance(ondemand_kind("a message"), analyzer_kind)
 
 
 def test_every_class_carries_a_remedy_that_names_the_escape_hatch():
@@ -112,7 +112,7 @@ def test_rewrap_keeps_the_message_and_swaps_the_remedy():
 def test_factory_message_names_the_offending_symbol_and_the_remedy(factory, markers):
     """Content, not just type: the message names what was refused and how to get a working path back."""
     refusal = factory()
-    assert isinstance(refusal, errors.RuntimeRefusal)
+    assert isinstance(refusal, errors.OndemandRefusal)
     assert isinstance(refusal, PrecomputeError)
     text = str(refusal)
     for marker in markers:

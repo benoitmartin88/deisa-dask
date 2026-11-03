@@ -47,7 +47,7 @@ not to a reduction.
 
 The composed callable is ``functools.partial(_chain_branch_func, _chain=<layers>)`` where each layer is a
 ``(func, kwargs, input_count)`` triple -- the same shape the bridge executes, so
-:meth:`deisa.dask.runtime_dispatch.PlanResponder.respond` needs no knowledge of the chain. The layers are, in order:
+:meth:`deisa.dask.ondemand_dispatch.PlanResponder.respond` needs no knowledge of the chain. The layers are, in order:
 
 1. the pointwise program (skipped when the reduction is taken straight off the collection),
 2. the reduction's chunk stage, and
@@ -69,13 +69,13 @@ from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 import numpy as np
 
 from dask.array.reductions import mean_chunk, moment_chunk
-from deisa.dask import runtime_errors as errors
+from deisa.dask import ondemand_errors as errors
 from deisa.dask.branch import _BRANCH_KIND_PCA, _PCA_OP_NAME, _chain_branch_func, _full_fold_layer
 from deisa.dask.branch import _FULL_FOLD_FINALIZERS as _LEGACY_FULL_FOLD_FINALIZERS
 from deisa.dask.mergeable_pca import _build_pca_branch_func
-from deisa.dask.runtime_expr import _CHUNK_PROGRAM, ReductionExpr, eval_pointwise
+from deisa.dask.ondemand_expr import _CHUNK_PROGRAM, ReductionExpr, eval_pointwise
 
-__all__ = ["PCARequest", "RuntimeRequest", "compose_pca_request", "compose_request", "probe_partial"]
+__all__ = ["PCARequest", "OndemandRequest", "compose_pca_request", "compose_request", "probe_partial"]
 
 
 # -- Bridge-side callables (module level, because the request is pickled) ---------------------------------------------
@@ -86,9 +86,7 @@ def _pointwise_layer(chunk: Any, _program: Optional[Tuple[Any, ...]] = None) -> 
     - ``:param _program:`` The picklable program tuple bound by :func:`compose_request`.
     """
     if _program is None:
-        raise errors.precompute_runtime_invariant(
-            "_pointwise_layer", "the layer was executed without its bound program"
-        )
+        raise errors.ondemand_invariant("_pointwise_layer", "the layer was executed without its bound program")
     return eval_pointwise(_program, chunk)
 
 
@@ -160,7 +158,7 @@ def _tier_func(op_name: str, axes: Tuple[int, ...], dtype: Any) -> Callable[[Any
         return functools.partial(moment_chunk, order=2, axis=axis, keepdims=True, dtype=str(_accumulation_dtype(dtype)))
     func = _TIER_FUNCS.get(op_name)
     if func is None:
-        raise errors.precompute_runtime_invariant("compose_request", f"no chunk stage for the reduction {op_name!r}")
+        raise errors.ondemand_invariant("compose_request", f"no chunk stage for the reduction {op_name!r}")
     return functools.partial(func, axis=axis, keepdims=True)
 
 
@@ -190,7 +188,7 @@ def _build_chain(reduction: ReductionExpr) -> Tuple[Tuple[Callable, dict, int], 
 
 
 @dataclass(frozen=True)
-class RuntimeRequest:
+class OndemandRequest:
     """One dispatchable reduction request (the slim v1 wire format, decision F5).
 
     - ``:param key:`` Dedup/namespace key of the payload, e.g. ``"f-sum"`` or ``"f-sum-axis0"``.
@@ -210,21 +208,21 @@ class RuntimeRequest:
     finalize: Optional[str]
 
 
-def compose_request(reduction: ReductionExpr) -> RuntimeRequest:
+def compose_request(reduction: ReductionExpr) -> OndemandRequest:
     """Compose the wire request for one reduction.
 
-    Pure object-model work: no graph, no analysis, nothing is sent. :mod:`deisa.dask.runtime_dispatch` hands the result
+    Pure object-model work: no graph, no analysis, nothing is sent. :mod:`deisa.dask.ondemand_dispatch` hands the result
     to the bridges and reuses the unchanged combine algebra on the partials that come back.
 
-    - ``:param reduction:`` The :class:`~deisa.dask.runtime_expr.ReductionExpr` a callback computed.
-    - ``:return:`` The :class:`RuntimeRequest` for it.
+    - ``:param reduction:`` The :class:`~deisa.dask.ondemand_expr.ReductionExpr` a callback computed.
+    - ``:return:`` The :class:`OndemandRequest` for it.
     """
     if not isinstance(reduction, ReductionExpr):
-        raise errors.precompute_runtime_invariant(
+        raise errors.ondemand_invariant(
             "compose_request",
             f"expected a reduction expression, got {type(reduction).__name__}; only reductions are dispatchable",
         )
-    return RuntimeRequest(
+    return OndemandRequest(
         key=reduction.key,
         input_name=reduction.root.array_name,
         kind=reduction.kind,
@@ -241,7 +239,7 @@ class PCARequest:
     A PCA branch is not a reduction: its partial is a mergeable
     :class:`~deisa.dask.mergeable_pca.PCASummary`, not a scalar/tier array, and its root-side combine is the summary
     merge tree rather than the reduction algebra. That is why it carries its own request type instead of posing as a
-    sixth-kind ``RuntimeRequest``: the two payloads cannot be merged by the same code, so they must not be
+    sixth-kind ``OndemandRequest``: the two payloads cannot be merged by the same code, so they must not be
     indistinguishable on the wire.
 
     - ``:param key:`` Dedup/namespace key of the payload, ``{array}-pca`` -- the same name the analyzer-driven branch
@@ -291,7 +289,7 @@ def compose_pca_request(collection: Any, policy: Optional[Mapping[str, Any]] = N
 
 
 def probe_partial(
-    request: RuntimeRequest, chunk_shape: Sequence[int], dtype: Any = np.float64
+    request: OndemandRequest, chunk_shape: Sequence[int], dtype: Any = np.float64
 ) -> Tuple[Tuple[int, ...], str]:
     """Derive ``(partial_shape, partial_dtype)`` by running the composed callable on a placeholder chunk.
 

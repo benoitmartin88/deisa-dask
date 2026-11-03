@@ -26,18 +26,18 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 # =============================================================================
-"""The precompute refusal taxonomy, kept as the base of the runtime refusal taxonomy.
+"""The precompute refusal taxonomy, kept as the base of the on-demand refusal taxonomy.
 
 This module holds the exception classes the precompute analyzer used to define. They live here, and not in the
-analyzer, for one reason: :mod:`deisa.dask.runtime_errors` derives the runtime refusals from them, so
+analyzer, for one reason: :mod:`deisa.dask.ondemand_errors` derives the on-demand refusals from them, so
 ``except PrecomputeError`` -- a handler written against the precompute path -- keeps catching every refusal the
-runtime reduction path raises. That ``isinstance`` graph outlives the analyzer it was named after (plan P4 removes the
+on-demand reduction path raises. That ``isinstance`` graph outlives the analyzer it was named after (plan P4 removes the
 analyzer; it does not remove the class identity callers may already catch).
 
 The classes are unchanged in name and hierarchy. Their docstrings below describe the precompute analyzer that used to
-raise them, which is now gone: the refusal FAMILY survives, the raise sites do not. The runtime path raises the
-:mod:`deisa.dask.runtime_errors` subclasses; a caller should catch :class:`PrecomputeError` or
-:class:`~deisa.dask.runtime_errors.RuntimeRefusal`, never the analyzer-era subclasses directly.
+raise them, which is now gone: the refusal FAMILY survives, the raise sites do not. The on-demand path raises the
+:mod:`deisa.dask.ondemand_errors` subclasses; a caller should catch :class:`PrecomputeError` or
+:class:`~deisa.dask.ondemand_errors.OndemandRefusal`, never the analyzer-era subclasses directly.
 """
 
 from __future__ import annotations

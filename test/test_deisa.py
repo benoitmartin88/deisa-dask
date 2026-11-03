@@ -80,19 +80,19 @@ class _FakeHandshake:
     """Minimal handshake surface used by Deisa._register_callback_impl."""
 
     def __init__(self):
-        self.runtime_arrays: list = []
+        self.ondemand_arrays: list = []
         self.legacy_arrays: list = []
 
-    def set_runtime_arrays(self, array_names):  # noqa: D102
-        self.runtime_arrays = list(array_names)
+    def set_ondemand_arrays(self, array_names):  # noqa: D102
+        self.ondemand_arrays = list(array_names)
 
     def set_legacy_arrays(self, array_names):  # noqa: D102
         self.legacy_arrays = list(array_names)
 
 
-def _runtime_names(d: Deisa) -> set:
-    """The array names ``d`` files as runtime-delivery targets, read off its per-array delivery-mode records."""
-    return {name for name, mode in d._arrays.items() if mode.runtime}
+def _ondemand_names(d: Deisa) -> set:
+    """The array names ``d`` files as on-demand targets, read off its per-array delivery-mode records."""
+    return {name for name, mode in d._arrays.items() if mode.ondemand}
 
 
 def _make_deisa_stub() -> Deisa:
@@ -167,8 +167,8 @@ class TestDeisaRegistration:
 
         The topic handler can only fire a callback whose payload lives in ``_callbacks``; it must be stored once every
         step that can raise has succeeded. The payload carries the delivery mode the callback registered with (decision
-        F3: the mode is per CALLBACK, not per run), and the array is filed with the handshake actor as a
-        runtime-delivery target -- which is what the bridges gate their eager scalar menu on now that registration no
+        F3: the mode is per CALLBACK, not per run), and the array is filed with the handshake actor as an
+        on-demand target -- which is what the bridges gate their eager scalar menu on now that registration no
         longer files branches.
         """
         d = _make_deisa_stub()
@@ -183,8 +183,8 @@ class TestDeisaRegistration:
         assert "a" in d.client.subscribed
         # The delivery state is filed immediately (a bridge on the wait_for_go=False path fetches it lazily on its
         # first send(), possibly before the next cycle).
-        assert _runtime_names(d) == {"a"}
-        assert d.handshake.runtime_arrays == ["a"]
+        assert _ondemand_names(d) == {"a"}
+        assert d.handshake.ondemand_arrays == ["a"]
 
     def test_registration_failure_leaves_no_trace(self):
         """A registration that raises leaks no payload.

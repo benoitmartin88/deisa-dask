@@ -9,10 +9,10 @@
 # This file used to measure the AST precompute path: the analyzer planned the
 # reductions at registration, the bridges shipped their partials with the topic
 # event, and the test asserted that the worker store held only ~8-byte scalars.
-# The runtime path plans nothing from the source -- the callback receives a
+# The on-demand path plans nothing from the source -- the callback receives a
 # lazily-reducible ``DeisaCollection`` and its reductions either read the eager
 # menu shipped with the delivery or dispatch an on-demand plan -- so the SAME
-# callback bodies are measured here against the runtime delivery. What changes
+# callback bodies are measured here against the on-demand delivery. What changes
 # is what the callback is handed (a collection describing the WHOLE array, not a
 # ``(n_bridges,)`` stack of partials), which is why the shape assertions below
 # now carry the discrimination instead of the stack shape.
@@ -24,7 +24,7 @@
 # e.g. ``(1, 2048) float64`` = 16 KB, while the full chunk of this harness is
 # 32 MB (three orders of magnitude larger).
 #
-# Every test here runs on the runtime delivery path, which is what ``precompute=True`` (the default) means since the
+# Every test here runs on the on-demand delivery path, which is what ``precompute=True`` (the default) means since the
 # delivery flag was retired (decision F3: ``precompute`` is the only selector), except the control test, which pins that
 # ``precompute=False`` still means the legacy full-chunk scatter.
 # =============================================================================
@@ -42,16 +42,16 @@ from TestSimulator import TestSimulation
 from utils import wait_for
 
 from deisa.dask import Deisa
-from deisa.dask import runtime_errors as errors
+from deisa.dask import ondemand_errors as errors
 from deisa.dask.collection import DeisaCollection
-from deisa.dask.runtime_compose import compose_request, probe_partial
+from deisa.dask.ondemand_compose import compose_request, probe_partial
 
 logging.basicConfig(level=logging.DEBUG)
 
 # Skip on the github-only windowless context
 pytestmark = pytest.mark.timeout(60)
 
-# The memory invariant of the runtime path: one worker never holds more than a
+# The memory invariant of the on-demand path: one worker never holds more than a
 # chunk-local payload. The analyzer-era bound was 8 bytes; an on-demand axis
 # partial is legitimately bigger, the full chunk (32 MB here) is not.
 MAX_KEY_BYTES = 64 * 1024
@@ -92,11 +92,11 @@ def _assert_only_partials_on_workers(after: Dict[str, Dict[str, Any]], chunk_byt
     the chunk size would mean the payload is bigger than one chunk-local partial.
     """
     max_per_worker = _largest_key_per_worker(after)
-    logging.warning(f"RUNTIME MEMORY TEST ({label}): per-worker max key nbytes: {max_per_worker}")
-    logging.warning(f"RUNTIME MEMORY TEST ({label}): per-worker keys: {after}")
+    logging.warning(f"ONDEMAND MEMORY TEST ({label}): per-worker max key nbytes: {max_per_worker}")
+    logging.warning(f"ONDEMAND MEMORY TEST ({label}): per-worker keys: {after}")
     for worker, max_nbytes in max_per_worker.items():
         assert max_nbytes < MAX_KEY_BYTES, (
-            f"Worker {worker} holds a key of {max_nbytes} bytes; the runtime path delivers chunk-local payloads only "
+            f"Worker {worker} holds a key of {max_nbytes} bytes; the on-demand path delivers chunk-local payloads only "
             f"(< {MAX_KEY_BYTES} bytes). Keys: {after}"
         )
         assert max_nbytes < chunk_bytes // 2, (
@@ -109,8 +109,8 @@ def _make_callback(op: str, callback_results: List[float]) -> Callable:
     """Compile ``def _cb(window): ...`` reducing ``window[-1]`` via ``arr.<op>()``.
 
     The body is deliberately the analyzer-era body, unchanged: the same callback source must keep working under the
-    runtime delivery, which is the point of the port. ``__source__`` is still attached because the legacy registration
-    path reads it; the runtime path plans from the object model instead.
+    on-demand delivery, which is the point of the port. ``__source__`` is still attached because the legacy registration
+    path reads it; the on-demand path plans from the object model instead.
     """
     src = textwrap.dedent(
         f"def _cb(window):\n    arr = window[-1]\n    s = arr.{op}().compute()\n    callback_results.append(float(s))\n"
@@ -156,9 +156,9 @@ def env_setup_2workers():
     cluster.close()
 
 
-class TestRuntimeReductionMemory:
+class TestOndemandReductionMemory:
     """End-to-end tests that measure worker memory to confirm the full chunk
-    never crosses the bridge -> worker boundary on the runtime reduction path.
+    never crosses the bridge -> worker boundary on the on-demand reduction path.
 
     Everything the analyzer-era file measured still holds; what changed is the
     OBJECT the callback receives. ``window[-1]`` is now a ``DeisaCollection``
@@ -172,11 +172,11 @@ class TestRuntimeReductionMemory:
         "op",
         ["sum", "mean", "var"],
     )
-    def test_runtime_worker_only_sees_partials(self, env_setup_2workers, op):
+    def test_ondemand_worker_only_sees_partials(self, env_setup_2workers, op):
         """A ``arr.<op>().compute()`` callback leaves only chunk-local payloads on the workers (~8-16 bytes).
 
         The full chunk (~32 MB) must NOT appear. Parametrized over the EAGER-MENU reductions (``sum`` / ``mean`` /
-        ``var``): the menu is the zero-round-trip half of the runtime delivery, so one send is enough to answer a full
+        ``var``): the menu is the zero-round-trip half of the on-demand delivery, so one send is enough to answer a full
         reduction. ``std`` and every AXIS reduction are NOT menu entries -- they take the on-demand path, whose answer
         arrives at the NEXT send boundary -- so their payloads are measured directly (no cluster sample can see them
         in a one-send run) by ``test_on_demand_payloads_are_chunk_local`` below.
@@ -187,7 +187,7 @@ class TestRuntimeReductionMemory:
         client, cluster = env_setup_2workers
         # Use a chunk big enough that "big" vs "small" is unmistakable.
         # 2048 * 2048 * 8 = 32 MB per chunk. Two bridges => 64 MB total
-        # in the legacy path, a scalar per bridge on the runtime path.
+        # in the legacy path, a scalar per bridge on the on-demand path.
         chunk_shape = (2048, 2048)
         global_shape = (chunk_shape[0] * 2, chunk_shape[1])
         array_name = "temperature"
@@ -235,7 +235,7 @@ class TestRuntimeReductionMemory:
         truth = {"sum": np.sum, "mean": np.mean, "var": np.var}[op](global_data)
         assert np.isclose(callback_results[0], truth, rtol=1e-5, atol=1e-9), (
             f"callback result {callback_results[0]!r} is not the true {op!r} of the global data "
-            f"(expected {truth!r}). The runtime delivery must return the combined FINAL value, "
+            f"(expected {truth!r}). The on-demand delivery must return the combined FINAL value, "
             f"never a value a re-applied callback op computes from a mis-shaped delivered operand."
         )
 
@@ -299,17 +299,17 @@ class TestRuntimeReductionMemory:
             f"Expected at least one worker to hold ~{chunk_bytes} bytes "
             f"(the full chunk), but max key seen was {max_seen} bytes. "
             f"Per-worker: {after_max_per_worker}. Harness is broken -- "
-            f"this control confirms the runtime test above is meaningful."
+            f"this control confirms the on-demand test above is meaningful."
         )
 
         assert len(callback_results) == 1
-        # See note in test_runtime_worker_only_sees_partials about
+        # See note in test_ondemand_worker_only_sees_partials about
         # why we do not call execute_callbacks() here.
 
-    def test_multi_array_runtime_end_to_end(self, env_setup_2workers):
+    def test_multi_array_ondemand_end_to_end(self, env_setup_2workers):
         """Two arrays registered in ONE callback: both reductions are correct and rooted in their OWN array.
 
-        The analyzer-era discriminator was a ``(2,)`` partial stack per array. Under the runtime delivery there is no
+        The analyzer-era discriminator was a ``(2,)`` partial stack per array. Under the on-demand delivery there is no
         stack: the callback receives one collection per array, describing the WHOLE array. The discriminators are
         therefore (a) the collection's global shape -- a legacy full-chunk tiled delivery would report the chunk shape,
         (b) per-array attribution, which is what keeps the two roots' attempts apart, and (c) the delivered values.
@@ -358,7 +358,7 @@ class TestRuntimeReductionMemory:
         # direct full-array sum, so compare with a loose relative tolerance.
         assert np.isclose(x_sum, float(np.sum(x_global)))
         assert np.isclose(y_sum, float(np.sum(y_global)))
-        # The runtime hands each callback ONE collection per array: the global
+        # The on-demand path hands each callback ONE collection per array: the global
         # shape (never the chunk shape, never a partial stack) and the array name
         # are what prove per-array attribution reached the callback.
         assert x_shape == global_shape, f"x delivered shape {x_shape}, expected the GLOBAL {global_shape}"
@@ -416,7 +416,7 @@ class TestRuntimeReductionMemory:
 
         The e2e half of this test cannot run in a one-send harness: an AXIS reduction is not an eager-menu entry, so it
         takes the on-demand path, whose answer the bridge serves at the NEXT send boundary (``send`` ->
-        ``PlanPump.serve``; the two-send transport behaviour is pinned in ``test_runtime_transport.py``). What the
+        ``PlanPump.serve``; the two-send transport behaviour is pinned in ``test_ondemand_transport.py``). What the
         memory invariant needs -- the SIZE of what crosses -- is fully determined by the composed request, so it is
         measured here without a cluster.
 
@@ -446,9 +446,9 @@ class TestRuntimeReductionMemory:
     def test_multiple_callbacks_same_array_each_correct(self, env_setup_2workers):
         """Two callbacks on the same array each get their own result.
 
-        The runtime builds a FRESH collection per callback (role 4 of the retired dispatch view, proven structurally in
-        the ported ``test_precompute.py``), so one callback's ``sum`` cannot be answered from the other's ``mean``
-        attempt: the attempt is keyed per (root, op, axes).
+        The on-demand path builds a FRESH collection per callback (role 4 of the retired dispatch view, proven
+        structurally in the ported ``test_precompute.py``), so one callback's ``sum`` cannot be answered from the
+        other's ``mean`` attempt: the attempt is keyed per (root, op, axes).
         """
         client, cluster = env_setup_2workers
         chunk_shape = (2048, 2048)
@@ -489,17 +489,17 @@ class TestRuntimeReductionMemory:
     def test_chained_and_sliced_reductions_on_a_delivered_collection(self):
         """``(arr * arr).sum()`` is SERVED and ``arr[2:5].sum()`` is REFUSED -- the registration test ported.
 
-        The original test asserted the analyzer's registration gate refused both as non-direct reductions. The runtime
+        The original test asserted the analyzer's registration gate refused both as non-direct reductions. The on-demand
         path classifies them differently, and both halves are pinned here on a real delivered collection:
 
         - ``(arr * arr).sum()`` is CORRECT: the pointwise program travels with the composed request, so the bridge folds
           ``chunk ** 2`` before summing. This is the analyzer's ``deliver_direct`` refusal made unnecessary.
         - ``arr[2:5].sum()`` is refused at the ITEM ACCESS with ``UnsupportedReductionError`` -- a slice of a registered
-          field is a raw read, and the access is where the runtime can name it.
+          field is a raw read, and the access is where the on-demand path can name it.
 
         Transitional note (K6a): the registration gate is still the analyzer until the deletion card lands, so
         ``deisa.register`` of these sources still raises the analyzer's class. This test therefore exercises the
-        runtime PLANNER on the object a callback is delivered, which is what survives the deletion.
+        on-demand PLANNER on the object a callback is delivered, which is what survives the deletion.
         """
         from utils import _dispatched
 
@@ -525,7 +525,7 @@ class TestRuntimeReductionMemory:
 
         Everything that crosses is therefore under the 64 KB budget, and the chunk is never of them.
         """
-        from deisa.dask.runtime_dispatch import EAGER_MENU_OPS
+        from deisa.dask.ondemand_dispatch import EAGER_MENU_OPS
 
         chunk_shape = (2048, 2048)
         chunk_bytes = int(np.prod(chunk_shape) * 8)

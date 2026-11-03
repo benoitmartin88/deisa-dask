@@ -27,7 +27,7 @@
 # POSSIBILITY OF SUCH DAMAGE.
 # =============================================================================
 """
-End-to-end tests for the BRIDGE-SIDE MergeablePCA path on RUNTIME DELIVERY: registration, the dispatched PCA branch,
+End-to-end tests for the BRIDGE-SIDE MergeablePCA path on ONDEMAND DELIVERY: registration, the dispatched PCA branch,
 and the delivered fit.
 
 This file exists because two execution blockers once shipped unnoticed: the analyzer None-filled every constructor
@@ -41,10 +41,10 @@ them rather than dropped -- the four below are the acceptance, and each still fa
 
 1. ``MergeablePCA(n_components=3)`` on a registered array is ACCEPTED end to end (``Deisa._register_callback_impl``).
    Registration analyzes nothing now, so acceptance is pinned by what registration actually produces -- the callback
-   payload plus the array filed as a runtime-delivery target -- and by the bridge policy the estimator dispatches,
+   payload plus the array filed as an on-demand target -- and by the bridge policy the estimator dispatches,
    which carries no root-only field and therefore cannot invent an omitted parameter. That is blocker 1's fix
    expressed structurally.
-2. A fit on a delivered collection completes through ``MergeablePCA._fit_runtime_collection`` -> the composed PCA
+2. A fit on a delivered collection completes through ``MergeablePCA._fit_ondemand_collection`` -> the composed PCA
    request -> per-bridge leaves -> the merge tree -> ``_fit_delivered``, and yields the requested number of components
    with the right ``n_features_in_``, against a numpy batch-PCA reference.
 3. An EXPLICITLY invalid configuration is still refused -- by the estimator's own constructor, which is the only
@@ -72,7 +72,7 @@ from utils import _make_callback
 from deisa.dask.collection import DeisaCollection
 from deisa.dask.deisa import ArrayMode, Deisa
 from deisa.dask.mergeable_pca import MergeablePCA, PCASummary, local_pca, merge_tree
-from deisa.dask.runtime_compose import compose_pca_request
+from deisa.dask.ondemand_compose import compose_pca_request
 
 # The registered array every test here works against: 12 samples over 6 features, split into 4 chunks of 3 rows.
 # ``d = 6`` is deliberately greater than 1, which is the case the carrier's ``shape[-1] == 1`` refused.
@@ -106,7 +106,7 @@ class _FieldDispatcher:
 
     ``PlanDispatcher.compute_pca`` puts the request on the plan queues and merges what the bridges report back. The
     ROUND TRIP is all this stands in for: the request, the per-bridge leaf and the merge tree are the real ones, so a
-    fit driven through here covers the same code path the runtime delivery takes.
+    fit driven through here covers the same code path the on-demand delivery takes.
     """
 
     def __init__(self, field: np.ndarray, chunk_shape: Sequence[int], summary: Optional[PCASummary] = None) -> None:
@@ -154,19 +154,19 @@ class _FakeHandshake:
     """The handshake surface registration touches: filing the per-array delivery state."""
 
     def __init__(self) -> None:
-        self.runtime_arrays: list = []
+        self.ondemand_arrays: list = []
         self.legacy_arrays: list = []
 
-    def set_runtime_arrays(self, array_names: list) -> None:
-        self.runtime_arrays = list(array_names)
+    def set_ondemand_arrays(self, array_names: list) -> None:
+        self.ondemand_arrays = list(array_names)
 
     def set_legacy_arrays(self, array_names: list) -> None:
         self.legacy_arrays = list(array_names)
 
 
-def _runtime_names(d: Deisa) -> set:
-    """The array names ``d`` files as runtime-delivery targets, read off its per-array delivery-mode records."""
-    return {name for name, mode in d._arrays.items() if mode.runtime}
+def _ondemand_names(d: Deisa) -> set:
+    """The array names ``d`` files as on-demand targets, read off its per-array delivery-mode records."""
+    return {name for name, mode in d._arrays.items() if mode.ondemand}
 
 
 def _deisa_stub() -> Deisa:
@@ -213,7 +213,7 @@ def test_registration_accepts_the_documented_motivating_example():
     registration entry point, not through the estimator, because registration is where users hit it.
 
     Registration analyzes nothing any more (plan P4), so acceptance is pinned by what it produces: the callback payload
-    carrying the delivery mode, and the array filed as a runtime-delivery target with the handshake actor. Nothing is
+    carrying the delivery mode, and the array filed as an on-demand target with the handshake actor. Nothing is
     filed as branches -- nothing files branches any more.
     """
     d = _deisa_stub()
@@ -223,8 +223,8 @@ def test_registration_accepts_the_documented_motivating_example():
 
     assert cid in d._callbacks, "the callback must be registered, not refused"
     assert d._callbacks[cid]["precompute"] is True, "the payload must carry the delivery mode selected per callback"
-    assert _runtime_names(d) == {"f"}, f"the array must be filed as a runtime-delivery target, got {_runtime_names(d)}"
-    assert d.handshake.runtime_arrays == ["f"], "registration files the runtime arrays with the handshake actor"
+    assert _ondemand_names(d) == {"f"}, f"the array must be filed as an on-demand target, got {_ondemand_names(d)}"
+    assert d.handshake.ondemand_arrays == ["f"], "registration files the on-demand arrays with the handshake actor"
 
 
 def test_the_bridge_policy_carries_only_the_leaf_relevant_fields():
@@ -349,7 +349,7 @@ def test_explicit_invalid_configuration_is_refused_by_the_estimator(kwargs, cons
         _pca_callback(constructor), [Window("f", size=1)], exception_handler=None, when="AND", precompute=True
     )
     assert cid in d._callbacks, "with no AST pass nothing is left to refuse an invalid constructor at registration"
-    assert _runtime_names(d) == {"f"}
+    assert _ondemand_names(d) == {"f"}
 
 
 def test_constructor_rejects_non_bool_whiten_outside_the_bridge_path():

@@ -53,12 +53,12 @@ class Handshake:
             self.bridges_ready = False
             self.feedback_queue_size = 1024
             self.timestep: Optional[int] = None
-            # Arrays the analytics host delivers to at least one runtime-delivery callback. The bridge reads this to
+            # Arrays the analytics host delivers to at least one on-demand callback. The bridge reads this to
             # decide whether its eager scalar menu has a reader at all: a menu for an array nobody subscribes to is
             # six chunk folds per bridge per timestep of pure critical-path cost.
-            self.runtime_arrays = set()
+            self.ondemand_arrays = set()
             # Arrays with at least one LEGACY (``precompute=False``) reader, i.e. a callback that reads the chunk
-            # itself. The bridge reads this to decide whether it must scatter the chunk at all: a runtime-delivery
+            # itself. The bridge reads this to decide whether it must scatter the chunk at all: an on-demand
             # array with no such reader is answered entirely by its menu and its on-demand plans, so shipping the
             # chunk as well would send 32 MB per bridge per timestep for data nobody reads.
             self.legacy_arrays = set()
@@ -94,9 +94,9 @@ class Handshake:
         def get_feedback_queue_size(self) -> int | Future:
             return self.feedback_queue_size
 
-        def set_runtime_arrays(self, array_names: list) -> None:
-            logger.debug(f"set_runtime_arrays(): array_names={array_names}")
-            self.runtime_arrays = set(array_names)
+        def set_ondemand_arrays(self, array_names: list) -> None:
+            logger.debug(f"set_ondemand_arrays(): array_names={array_names}")
+            self.ondemand_arrays = set(array_names)
 
         def set_legacy_arrays(self, array_names: list) -> None:
             logger.debug(f"set_legacy_arrays(): array_names={array_names}")
@@ -105,17 +105,17 @@ class Handshake:
         def get_task_state(self, array_name: str) -> dict | Future:
             """Every per-array scheduling fact in one read.
 
-            The bridge fetches this over a single per-array broadcast: the runtime-delivery flag and the
+            The bridge fetches this over a single per-array broadcast: the on-demand flag and the
             legacy-reader flag must arrive in the same collective, because a second, separate broadcast would have
             to be entered in the same order on every rank of the sub-comm -- two maskable sources of a hang for one
             dict entry.
 
-            ``legacy`` is what keeps the escape hatch (decision F3) working: a runtime-delivery array that ALSO has a
+            ``legacy`` is what keeps the escape hatch (decision F3) working: an on-demand array that ALSO has a
             ``precompute=False`` callback still needs its chunk scattered, so the bridge may skip the data only when
-            ``runtime`` is true AND ``legacy`` is false.
+            ``ondemand`` is true AND ``legacy`` is false.
             """
             return {
-                "runtime": array_name in self.runtime_arrays,
+                "ondemand": array_name in self.ondemand_arrays,
                 "legacy": array_name in self.legacy_arrays,
             }
 
@@ -168,9 +168,9 @@ class Handshake:
         assert self.__handshake_actor is not None
         return self.__handshake_actor.get_nb_bridges().result()
 
-    def set_runtime_arrays(self, array_names: list) -> None:
+    def set_ondemand_arrays(self, array_names: list) -> None:
         assert self.__handshake_actor is not None
-        self.__handshake_actor.set_runtime_arrays(array_names).result()
+        self.__handshake_actor.set_ondemand_arrays(array_names).result()
 
     def set_legacy_arrays(self, array_names: list) -> None:
         assert self.__handshake_actor is not None

@@ -906,8 +906,8 @@ class MergeablePCA:
         Three paths, all ending in the SAME root state (``_summary_`` plus the materialized public attributes), so
         "in-situ on the bridge" and "standalone on Dask" cannot drift apart:
 
-        - A **runtime collection** (a DEISA callback's window entry, which carries no data) takes
-          :meth:`_fit_runtime_collection`: it dispatches a PCA branch request to the bridges, merges their summaries
+        - A **on-demand collection** (a DEISA callback's window entry, which carries no data) takes
+          :meth:`_fit_ondemand_collection`: it dispatches a PCA branch request to the bridges, merges their summaries
           at the root and adopts the result through :meth:`_fit_delivered`.
         - A **dask array** is fitted through :meth:`_fit_dask_delayed` / :meth:`_fit_dask`.
         - A **numpy array** takes the in-memory path, the single-leaf base case of the same tree.
@@ -920,8 +920,8 @@ class MergeablePCA:
           dimensions, ``axis_names`` / ``feature_axes`` / ``sample_axes`` say which axes are which.
         - ``:param y:`` Accepted and ignored, for scikit-learn parity.
         """
-        if self._is_runtime_collection(X):
-            return self._fit_runtime_collection(X)
+        if self._is_ondemand_collection(X):
+            return self._fit_ondemand_collection(X)
 
         array = X if isinstance(X, da.Array) else da.asarray(X)
         flat = self._as_2d(array)
@@ -949,12 +949,12 @@ class MergeablePCA:
         return self._adopt_summary(summary, n_features)
 
     @staticmethod
-    def _is_runtime_collection(X) -> bool:
-        """Whether ``X`` is a DEISA runtime collection, i.e. a data-free operand the delivery path handed a callback.
+    def _is_ondemand_collection(X) -> bool:
+        """Whether ``X`` is a DEISA on-demand collection, i.e. a data-free operand the delivery path handed a callback.
 
         The import is deferred so this module's import chain does not pull the delivery stack back in: the collection
-        module pulls ``runtime_errors`` and the runtime compose/dispatch modules, and this module sits at the bottom of
-        that chain. The check is an ``isinstance`` against that class rather than a duck
+        module pulls ``ondemand_errors`` and the on-demand compose/dispatch modules, and this module sits at the
+        bottom of that chain. The check is an ``isinstance`` against that class rather than a duck
         check on attributes: ``DeisaCollection`` is the only operand the delivery produces, and a false positive here
         would dispatch a PCA branch for something a bridge never described.
 
@@ -978,10 +978,10 @@ class MergeablePCA:
             "sample_axes": self.sample_axes,
         }
 
-    def _fit_runtime_collection(self, collection) -> MergeablePCA:
+    def _fit_ondemand_collection(self, collection) -> MergeablePCA:
         """Fit on a delivered collection: dispatch the PCA branch, merge the summaries at the root, adopt the result.
 
-        This is the in-situ placement for the runtime reduction path, and it is the only complete route through
+        This is the in-situ placement for the on-demand reduction path, and it is the only complete route through
         :meth:`fit` for a collection -- a collection carries no data, so there is no local fallback. Without a bridge
         transport the fit refuses with the no-transport refusal (the remedy is the legacy ``precompute=False``
         delivery) instead of gathering anything.
@@ -993,8 +993,8 @@ class MergeablePCA:
 
         - ``:param collection:`` The :class:`~deisa.dask.collection.DeisaCollection` a callback received.
         """
-        from deisa.dask import runtime_errors as errors
-        from deisa.dask.runtime_compose import compose_pca_request
+        from deisa.dask import ondemand_errors as errors
+        from deisa.dask.ondemand_compose import compose_pca_request
 
         dispatcher = collection.dispatcher
         if dispatcher is None:

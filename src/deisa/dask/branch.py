@@ -30,9 +30,9 @@
 Branch-level local compute on the bridge.
 
 Each dispatch unit describes one chunk-local sub-expression of the user's callback that the bridge executes on its local
-numpy chunk and whose result the Deisa-side runtime path combines across bridges. The request types live in
-:mod:`deisa.dask.runtime_expr` (the planner's product-side contract); this module holds the bridge-side and combine-side
-callables that consume them.
+numpy chunk and whose result the Deisa-side on-demand path combines across bridges. The request types live
+in :mod:`deisa.dask.ondemand_expr` (the planner's product-side contract); this module holds the bridge-side
+and combine-side callables that consume them.
 """
 
 from __future__ import annotations
@@ -67,7 +67,7 @@ _BRANCH_KIND_PCA = "pca"
 
 # The op name recorded for a PCA branch. It is NOT a dask reduction op: it names the decomposition the bridge runs, so
 # it takes the same path through ``output_key`` (``{array}-pca``), ``op_name`` and the dispatch signatures as every
-# other op without pretending to be one of the dask reductions the runtime tables of this module key on.
+# other op without pretending to be one of the dask reductions the on-demand tables of this module key on.
 _PCA_OP_NAME = "pca"
 
 

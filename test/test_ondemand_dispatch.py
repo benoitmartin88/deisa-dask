@@ -27,7 +27,7 @@
 # POSSIBILITY OF SUCH DAMAGE.
 # =============================================================================
 """
-The dispatch + merge boundary of the runtime reduction path, proven on a fake communicator.
+The dispatch + merge boundary of the on-demand reduction path, proven on a fake communicator.
 
 Every test here runs the real protocol: a request is composed from a lazy expression, broadcast over a ``FakeComm``
 sub-comm, executed by one responder per bridge on THAT bridge's numpy chunk, gathered back, matched against the request
@@ -43,11 +43,11 @@ import numpy as np
 import pytest
 from utils import FakeComm
 
-from deisa.dask import runtime_errors as errors
+from deisa.dask import ondemand_errors as errors
 from deisa.dask.branch import _combine_two_phase
 from deisa.dask.collection import DeisaCollection
-from deisa.dask.runtime_compose import compose_request
-from deisa.dask.runtime_dispatch import (
+from deisa.dask.ondemand_compose import compose_request
+from deisa.dask.ondemand_dispatch import (
     EAGER_MENU_OPS,
     PlanDispatcher,
     PlanRequest,
@@ -57,7 +57,7 @@ from deisa.dask.runtime_dispatch import (
     merge_partials,
     serve_plan_requests,
 )
-from deisa.dask.runtime_expr import KIND_SCALAR
+from deisa.dask.ondemand_expr import KIND_SCALAR
 
 ARRAY_NAME = "f"
 GLOBAL_SHAPE = (8, 8)
