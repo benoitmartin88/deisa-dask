@@ -161,7 +161,7 @@ def _scalar(value: Any) -> float:
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# On-demand planner harness (the delivery path a callback is handed: DeisaCollections, not dask arrays)
+# On-demand planner harness (the delivery path a callback is handed: DeisaArray operands, not dask arrays)
 # ---------------------------------------------------------------------------------------------------------------------
 DEFAULT_META: Dict[str, Any] = {"f": {"global_shape": (8, 8), "chunk_shape": (4, 4)}}
 

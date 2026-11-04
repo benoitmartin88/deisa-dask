@@ -281,9 +281,9 @@ class Deisa(IDeisa):
         This is the writer of ``_ondemand_transports``. The request side is the ONE handshake actor the run already
         starts (:meth:`deisa.dask.handshake.Handshake.put_plan`); the report side is the event the array root already
         publishes, which the topic handler feeds into ``_plan_reports``. Nothing is spawned and nothing is queued: the
-        host puts a request in the actor's per-array slot, the array's root bridge takes it at its next ``send``
-        boundary, and the reports come back on that send's event -- merged exactly as a test-injected exchange's
-        reports are.
+        host appends a request to the actor's per-array FIFO, the array's root bridge takes the whole FIFO at its next
+        ``send`` boundary and serves every parked request there, and the reports come back on that send's event --
+        merged exactly as a test-injected exchange's reports are.
 
         Every array gets one: the first on-demand request can arrive as soon as the first delivered timestep, which is
         before any callback has necessarily run, so there is no later point at which attaching could be justified over

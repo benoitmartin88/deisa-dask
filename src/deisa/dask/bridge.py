@@ -169,16 +169,18 @@ class PlanPump:
         """Answer the on-demand reduction requests that reached the actor before this ``send`` for the array.
 
         Called at the send boundary, where every rank of the array is about to enter the same collectives: the root
-        takes the host's parked request out of the handshake actor, broadcasts what it took, every rank folds its OWN
-        chunk with the requested program, and the root GATHERS the reports -- which it returns, because they travel
-        back on the topic event this ``send`` publishes. The chunk is this rank's last-sent chunk, which is why it is
-        retained -- the host's request for timestep N necessarily arrives after ``send`` returned for N.
+        takes the host's parked requests out of the handshake actor, broadcasts what it took, every rank folds its OWN
+        chunk with the requested program once per request, and the root GATHERS the reports of each -- which it
+        returns, because they travel back on the topic event this ``send`` publishes. The chunk is this rank's last-sent
+        chunk, which is why it is retained -- the host's request for timestep N necessarily arrives after ``send``
+        returned for N.
 
-        THE PICKUP INVARIANT: the actor slot is taken exactly once per boundary, by the root, without waiting. A
-        request that is already parked is served here; a request that arrives AFTER that take stays parked and is
-        served at the NEXT boundary -- it is never dropped and never served twice. That is the guarantee the dedicated
-        polling thread gave: a request is answered at the first send boundary after it reached the actor, and
-        ``PlanEventExchange``'s timeout is what tolerates the wait.
+        THE PICKUP INVARIANT: the actor's per-array FIFO is taken exactly once per boundary, by the root, without
+        waiting, and EVERY request in it is served by THIS boundary (in put order, one gather each, the same order on
+        every rank because the list is what the root broadcasts). A request that arrives AFTER that take stays parked
+        and is served at the NEXT boundary -- it is never dropped and never served twice. Two callbacks on the same
+        array dispatching concurrently is therefore two entries drained here, not a race: that is the guarantee the
+        dedicated polling thread gave, and ``PlanEventExchange``'s timeout is what tolerates the wait.
 
         THE PER-BOUNDARY COST is ONE actor round trip (the actor is an ordinary object on a worker; the call is
         host-side client -> scheduler -> worker and back, sub-millisecond idle on a local cluster), and every other rank

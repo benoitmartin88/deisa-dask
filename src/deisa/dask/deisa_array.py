@@ -49,6 +49,16 @@ to avoid. The subclass swap below keeps both: :class:`OndemandDeisaArray` puts :
 LazyOperand` FIRST in its MRO, so the guards and the closed surface win over dask's, and it refuses, one by one, the
 dask ``Array`` methods that would otherwise build a graph over a field that was never delivered.
 
+**Interim policy break: ``isinstance`` against the deisa-core class.** ``DeisaArray`` is a COPY of
+``deisa.core.types.DeisaArray`` until the ``TODO(ben)`` on it lands, and a copy is not a subclass: the two classes are
+UNRELATED, so ``isinstance(<any delivered array>, deisa.core.types.DeisaArray)`` is ``False`` -- for the on-demand
+operand AND for the legacy path, which builds its operand with ``utils.build_deisa_array`` from this same copy. The
+public callback signature (``deisa.core.interface.IDeisa.Callback``) still names the core class, so a type annotation
+or a runtime guard written against it sees a mismatch even though the duck-typed surface (``.t``/``.timestep``,
+``.name``, the operators, the reductions) is identical. Nothing behaves differently for it: every delivered array is a
+``deisa.dask.DeisaArray``, ``OndemandDeisaArray`` included. Both classes collapse into one when deisa-core imports this
+class, at which point the core name becomes the delivered type and no user code needs a change beyond dropping a guard.
+
 The refusal wording is deliberately UNCHANGED from the pre-K13C carrier (it says "the collection ..."): the messages
 are part of the refusal contract asserted by the test suite, and no refusal semantics may move in this change.
 """
@@ -56,6 +66,7 @@ are part of the refusal contract asserted by the test suite, and no refusal sema
 from __future__ import annotations
 
 import pathlib
+import weakref
 from collections.abc import Iterator, Mapping
 from typing import Any, NamedTuple, Optional, Sequence, Tuple, Union
 
@@ -379,16 +390,28 @@ class _NoGraph(Mapping):
 
     It is a ``Mapping`` because that is what ``dask.array.Array`` stores, so every consumer's ``dict``/``merge``/
     ``.layers`` step lands on one of the three methods below.
+
+    The array name in the refusal is re-read from the OPERAND at refusal time, not captured here: ``.name`` is
+    write-mutable metadata (see :attr:`OndemandDeisaArray.name`), so a callback that renames its instance must get a
+    refusal naming the name it is looking at -- and the same name the array's other refusals use -- instead of the name
+    the operand happened to have when the graph was built.
     """
 
-    __slots__ = ("_symbol",)
+    __slots__ = ("_operand",)
 
-    def __init__(self, symbol: str) -> None:
-        self._symbol = str(symbol)
+    def __init__(self, operand: Any) -> None:
+        # A weak reference: the operand owns this graph (``operand.dask``), so a strong one would be a reference cycle
+        # for a pure error path. The fallback wording is only reached if the operand is already gone, i.e. nobody can
+        # be reading the graph through an operand whose name matters any more.
+        self._operand = weakref.ref(operand)
+
+    def _symbol(self) -> str:
+        operand = self._operand()
+        return operand._symbol() if operand is not None else "the operand"
 
     def _refuse(self) -> Any:
         raise errors.off_surface(
-            f"the dask graph of {self._symbol}",
+            f"the dask graph of {self._symbol()}",
             "the operand carries no graph: its field is never delivered, so any dask computation built over it "
             "would gather the whole registered array",
         )
@@ -486,7 +509,7 @@ class OndemandDeisaArray(LazyOperand, DeisaArray):
         self._dispatcher = dispatcher
         # Replace the empty HighLevelGraph ``Array.__new__`` wrapped around it: the operand has no task to run, and
         # every dask computation that reaches for one must refuse instead of computing a hole.
-        self.dask = _NoGraph(self._symbol())
+        self.dask = _NoGraph(self)
 
     @classmethod
     def from_metadata(
@@ -571,6 +594,10 @@ class OndemandDeisaArray(LazyOperand, DeisaArray):
 # delivered, so each one is refused with the closed-surface message the suite asserts. Metadata properties
 # (``shape``/``dtype``/``ndim``/``size``/``nbytes``/``chunks``/``chunksize``/``numblocks``/``name``/``itemsize``) stay
 # readable -- they describe the registered array and are what a callback is allowed to size itself from.
+#
+# Known K13C delta, documented and not fixed: ``copy`` is in this list, so ``copy.copy(operand)`` refuses too (the
+# pre-K13C collection shallow-copied through the default protocol, since it was not a ``da.Array``). A data-free
+# operand has nothing worth copying -- its state is metadata plus a dispatcher handle -- so the refusal stands.
 _REFUSED_ARRAY_METHODS: Tuple[str, ...] = (
     "argtopk",
     "astype",

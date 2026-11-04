@@ -29,7 +29,7 @@
 """
 The DEISA lazy expression tree: pointwise nodes, reduction nodes and their metadata.
 
-Every value a callback can build out of a DEISA collection is one of these objects. They are NOT dask collections and
+Every value a callback can build out of a DEISA array is one of these objects. They are NOT dask collections and
 NOT ``dask.array.Array`` subclasses: a ``da.Array`` subclass loses its identity on the first derived expression
 (``(m + 1)`` is a plain ``Array``), so owning the operator surface is the only way the whole expression stays
 inspectable. That is also why there is no ``__dask_graph__`` here: an external dask graph must fail fast instead of
@@ -37,7 +37,7 @@ silently materializing the chunk.
 
 Two node kinds cover the closed v1 surface:
 
-- :class:`PointwiseExpr` -- a pointwise tree over ONE root (``(collection * 2 - 1).sqrt()``). Constants are ordinary
+- :class:`PointwiseExpr` -- a pointwise tree over ONE root (``(operand * 2 - 1).sqrt()``). Constants are ordinary
   program leaves, because the tree is built through our own API and needs no extraction step.
 - :class:`ReductionExpr` -- one associative reduction over a pointwise tree, carrying the ``op_name`` / ``axes`` /
   ``kind`` / ``finalize`` payload the wire request is composed from.
@@ -87,7 +87,7 @@ _REDUCTION_FINALIZERS = {"std": "sqrt"}
 # as raw field reads, which pointed at a remedy that does not help).
 NON_ASSOCIATIVE_OPS = frozenset({"argmax", "argmin", "median", "percentile", "quantile"})
 
-# The pointwise whitelist. A name here is reachable through the collection/expression API and is executed on the bridge
+# The pointwise whitelist. A name here is reachable through the operand/expression API and is executed on the bridge
 # chunk by :func:`eval_pointwise`; a name that is NOT here is refused, never silently converted.
 _POINTWISE_FUNCS = {
     # Binary arithmetic.
@@ -266,13 +266,13 @@ class LazyOperand:
     """Shared behaviour of every lazy DEISA operand: provenance, metadata, the surface and the refusal guards.
 
     Subclasses supply ``_root`` / ``_shape`` / ``_dtype`` / ``_program``; everything a callback can DO lives here, so
-    the collection and every expression offer exactly the same closed surface.
+    the operand and every expression offer exactly the same closed surface.
     """
 
     __slots__ = ()
 
     # Reflected operators need this: it puts our ``__radd__``/``__rmul__`` ahead of numpy's own attempt to coerce the
-    # operand (which would otherwise trip the ``__array__`` guard on ``2 * collection``).
+    # operand (which would otherwise trip the ``__array__`` guard on ``2 * operand``).
     __array_priority__ = 1000
 
     # Comparing two operands yields an expression, exactly as numpy arrays do, so a lazy operand is not hashable.
@@ -307,7 +307,7 @@ class LazyOperand:
     def dispatcher(self) -> Any:
         """The compute boundary this operand dispatches through, or ``None`` when it has no bridge transport.
 
-        The delivery path attaches it to the collection, and every expression inherits it from the operand it was built
+        The delivery path attaches it to the operand, and every expression inherits it from the operand it was built
         from, so ``.compute()`` on a reduction reaches the bridges without a registry and without global state.
         """
         return self._dispatcher
@@ -348,7 +348,7 @@ class LazyOperand:
         """Refuse indexing: a slice or an index of a registered field is a raw read.
 
         Window callbacks are unaffected -- ``window`` is an ordinary Python list, so ``window[-1]`` is list indexing
-        and delivers the collection it holds.
+        and delivers the operand it holds.
         """
         raise errors.off_surface(
             f"the item access {key!r}",
@@ -663,7 +663,7 @@ class ReductionExpr(LazyOperand):
     It is NOT an array: it delivers one value and has no chunk-local partial another expression could fold. That is
     exactly what the guards below refuse -- using it as a pointwise operand, or reducing it a second time.
 
-    - ``:param operand:`` The pointwise expression (or the bare collection) being reduced.
+    - ``:param operand:`` The pointwise expression (or the bare array) being reduced.
     - ``:param op_name:`` Canonical reduction name, a key of the associative whitelist.
     - ``:param axes:`` Reduced data axes; ``()`` means the FULL reduction (the wire convention).
     - ``:param kind:`` Payload kind the combine step dispatches on.
@@ -739,7 +739,7 @@ class ReductionExpr(LazyOperand):
         partial, and merges the partials with the surviving combine algebra. The chunk never crosses: only the partials
         do, and the callback gets a concrete scalar/array back.
 
-        - ``:raises PrecomputeRuntimeError:`` when the collection carries no bridge transport, i.e. when it was built
+        - ``:raises PrecomputeRuntimeError:`` when the operand carries no bridge transport, i.e. when it was built
           outside the delivery path that attaches one.
         """
         dispatcher = self.dispatcher

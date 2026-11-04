@@ -210,10 +210,10 @@ def test_the_boundary_take_is_the_pickup(client):
 
     Three phases, the whole contract the removed polling thread used to carry:
 
-    - an idle actor slot folds nothing and returns no reports;
+    - an idle actor folds nothing and returns no reports;
     - a request put BEFORE the boundary is answered by that boundary -- and a request that arrives after one
       boundary's take is therefore answered by the NEXT one, because it simply stays parked;
-    - a request is served ONCE: the boundary after that finds the slot empty.
+    - a request is served ONCE: the boundary after that finds the FIFO empty.
     """
     field = make_field(seed=2)
     plan = make_plan(axes=(0,))
@@ -232,12 +232,14 @@ def test_the_boundary_take_is_the_pickup(client):
     assert pump.serve((0, field)) == [], "and only once"
 
 
-def test_the_actor_keeps_one_slot_per_array(client):
-    """One slot per array, latest wins: a request nobody waits for is replaced, never served late.
+def test_the_actor_keeps_a_fifo_per_array(client):
+    """A FIFO per array: two requests parked for one array are BOTH taken, in put order -- nobody is overwritten.
 
-    The host's exchange BLOCKS until the reports of the request it put have arrived, so it never has two requests for
-    one array in flight; the replacement rule is what keeps a request whose host side already timed out from being
-    served at a later boundary, where its reports would be dropped.
+    The host really has two requests in flight for one array: ``_process_callback`` starts one asyncio task per
+    ``precompute=True`` callback, so two callbacks on the same array dispatch concurrently and both block in their own
+    ``PlanEventExchange``. Overwriting the older request therefore did not replace "a request nobody waits for" -- it
+    dropped a live one, whose exchange then burned its whole timeout and aborted the run with the misleading
+    "no bridge is serving plan requests" refusal. The list keeps both, and the boundary serves both in one visit.
     """
     handshake = Handshake(client)
     first = make_plan(timestep=1)
@@ -246,10 +248,10 @@ def test_the_actor_keeps_one_slot_per_array(client):
     handshake.put_plan(ARRAY_NAME, first)
     handshake.put_plan(ARRAY_NAME, second)
 
-    assert [plan.request_id for plan in handshake.take_plans(ARRAY_NAME)] == [second.request_id], (
-        "the slot keeps the LATEST request: an older, unserved one is replaced"
+    assert [plan.request_id for plan in handshake.take_plans(ARRAY_NAME)] == [first.request_id, second.request_id], (
+        "both parked requests must be taken, in the order they were put: the older one is never overwritten"
     )
-    assert handshake.take_plans(ARRAY_NAME) == [], "and taking it empties the slot"
+    assert handshake.take_plans(ARRAY_NAME) == [], "and taking them empties the array's FIFO"
 
 
 def test_an_idle_boundary_answers_in_a_round_trip_not_a_grace_window(client):
@@ -357,6 +359,127 @@ def test_two_successive_axis_folds_are_served_by_the_production_transport(client
         assert not isinstance(value, float), "an axis fold is one value per kept column, not a full scalar"
 
 
+class _RecordingHandshake:
+    """The array's handshake handle, recording the puts the host's exchanges make and passing it all through.
+
+    The recording is what makes the concurrency deterministic: the test waits until BOTH callbacks' requests have been
+    parked (``put_plan`` returned) and NO boundary has taken anything yet, which is exactly the state the actor has to
+    survive. Everything below is the production ``Handshake`` -- only the bookkeeping is added.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+        self._lock = threading.Lock()
+        self.put_request_ids = []
+        self.take_count = 0
+
+    def put_plan(self, array_name, plan):
+        """- ``:param array_name:`` Registered array the request is rooted in. - ``:param plan:`` The request."""
+        self._inner.put_plan(array_name, plan)
+        with self._lock:
+            self.put_request_ids.append(plan.request_id)
+
+    def take_plans(self, array_name):
+        """- ``:param array_name:`` Registered array whose FIFO the boundary takes."""
+        with self._lock:
+            self.take_count += 1
+        return self._inner.take_plans(array_name)
+
+
+def test_two_callbacks_on_one_array_are_both_served_by_one_boundary(client, monkeypatch):
+    """Two ``precompute=True`` callbacks on ONE array dispatch concurrently: both plans are answered.
+
+    This is the failure the actor's FIFO exists for. ``_process_callback`` starts one asyncio task per callback, so
+    the two callbacks of one event are inside two ``PlanEventExchange`` calls at the same time, each with a request for
+    the SAME array parked in the actor. With a single slot per array, the second put overwrote the first: the boundary
+    served only the later request, and the earlier callback waited out the whole ``DEISA_ONDEMAND_PLAN_TIMEOUT`` and
+    aborted the run with "no bridge is serving plan requests" -- for a bridge that was serving them fine.
+
+    The test pins all three facts: both requests are parked before any boundary (the premise the old docstring denied),
+    ONE boundary serves both (2 requests x 2 bridges = 4 reports, one per request id), and both callbacks receive the
+    value of THEIR reduction.
+    """
+    fields = [make_field(seed=0), make_field(seed=1)]
+    per_timestep = [split_chunks(field) for field in fields]
+    bridge_count = len(per_timestep[0])
+    handshake = Handshake(client)
+
+    deisa = make_deisa_stub(client, monkeypatch)
+    recorder = _RecordingHandshake(handshake)
+    deisa.handshake = recorder
+    # A wiring failure must be a failing test in seconds, not a 60 s stall.
+    monkeypatch.setattr(ondemand_dispatch_module, "plan_report_timeout", lambda: 20.0)
+    deisa._attach_ondemand_transports()
+    deisa._topic_handlers[ARRAY_NAME] = deisa._make_topic_handler(ARRAY_NAME)
+
+    state = FakeComm.State(bridge_count)
+    comms = [FakeComm(state, rank) for rank in range(bridge_count)]
+    bridges = [make_bridge_stub(rank, 0, per_timestep[0][rank], handshake, comms[rank]) for rank in range(bridge_count)]
+
+    def one_round():
+        """One full send boundary, every rank in lockstep; returns the reports the ROOT gathered."""
+        peers = [
+            threading.Thread(target=serve_boundary, args=(bridges[rank],), name=f"send-boundary-{rank}", daemon=True)
+            for rank in range(1, bridge_count)
+        ]
+        for peer in peers:
+            peer.start()
+        reports = serve_boundary(bridges[0])
+        for peer in peers:
+            peer.join(timeout=20)
+        assert not any(peer.is_alive() for peer in peers), "a peer rank never left the send boundary"
+        return reports
+
+    def retain(timestep):
+        """Retain the timestep's chunk on every rank, as ``send`` does AFTER the boundary."""
+        for rank in range(bridge_count):
+            bridges[rank]._delivery[ARRAY_NAME].last_chunk = (timestep, per_timestep[timestep][rank])
+
+    seen = {}
+
+    def first_callback(window):
+        if window[-1].timestep == 0:  # the second send only carries these two reductions' reports
+            seen["first"] = window[-1].sum(axis=0).compute()
+
+    def second_callback(window):
+        if window[-1].timestep == 0:
+            seen["second"] = window[-1].mean(axis=0).compute()
+
+    register_callback(deisa, first_callback)
+    register_callback(deisa, second_callback)
+
+    one_round()  # the empty boundary of the first send
+    retain(0)
+    deliver(deisa, 0)  # both callbacks dispatch, concurrently, for the SAME array
+
+    deadline = time.monotonic() + 20.0
+    while time.monotonic() < deadline and len(recorder.put_request_ids) < 2:
+        time.sleep(0.005)
+    assert len(recorder.put_request_ids) == 2, (
+        "both callbacks must have their request parked at the actor before the boundary: "
+        f"parked {len(recorder.put_request_ids)}"
+    )
+    assert recorder.take_count == 0, "no boundary may have taken anything: both requests are in flight for one array"
+
+    reports = one_round()  # ONE boundary for both parked requests
+    retain(1)
+    served = {report.request_id for report in reports}
+    assert served == set(recorder.put_request_ids), (
+        "one boundary must serve BOTH parked requests: "
+        f"served {sorted(served)}, parked {sorted(recorder.put_request_ids)}"
+    )
+    assert len(reports) == 2 * bridge_count, "two requests over two bridges: one report per request per bridge"
+
+    deliver(deisa, 1, reports)
+    drain(deisa)
+    deisa.client = None
+
+    assert deisa._run_failure is None, f"the run must not abort: {deisa._run_failure!r}"
+    assert set(seen) == {"first", "second"}, f"both callbacks must be served by the same boundary, got {sorted(seen)}"
+    assert np.allclose(seen["first"], fields[0].sum(axis=0)), "the first callback must fold the chunks of its timestep"
+    assert np.allclose(seen["second"], fields[0].mean(axis=0)), "the second callback must fold its OWN reduction"
+
+
 def test_window_reduction_older_than_the_delivery_is_refused_at_compose_time(client, monkeypatch):
     """A reduction of ``window[-2]`` never reaches a bridge: refused at compose time, with the remedy named.
 
@@ -452,6 +575,32 @@ def test_bridge_send_boundary_serves_the_actor_request_over_the_sub_comm(client)
     assert all(report.error is None for report in reports), "no bridge may answer with an error report"
     merged = np.sum([report.partial for report in reports], axis=0)
     assert np.allclose(merged, field.sum(axis=0))
+
+
+def test_an_empty_boundary_still_opens_the_collective_exactly_once():
+    """Nothing parked is not permission to skip the boundary: every send issues exactly ONE bcast to the array's peers.
+
+    ``PlanPump.serve`` broadcasts what the root took BEFORE it returns on an empty list, because the peers are already
+    parked in that broadcast -- it is a sub-comm collective, not a local shortcut. A mutation that moved the
+    ``if not requests: return []`` early return above the bcast would keep this suite green (an idle rank simply
+    returns) while hanging every peer rank at the next unbalanced send, so the boundary is pinned from the peers'
+    side: the rank that is not the root must come out of ``serve`` having seen exactly one broadcast, and the shared
+    communicator must have advanced one generation.
+    """
+    field = make_field(seed=3)
+    state = FakeComm.State(2)
+    comms = [FakeComm(state, rank) for rank in range(2)]
+    pumps = [PlanPump(ARRAY_NAME, comms[rank], chunk_position(rank), rank) for rank in range(2)]
+
+    generation = state.bcast_generation
+    peer = threading.Thread(target=pumps[1].serve, args=((0, field),), name="empty-boundary-peer", daemon=True)
+    peer.start()
+    assert pumps[0].serve((0, field)) == [], "an empty boundary serves nothing"
+    peer.join(timeout=10)
+    assert not peer.is_alive(), "the peer rank never left the empty boundary: the broadcast was skipped"
+    assert state.bcast_generation == generation + 1, (
+        f"an empty boundary is exactly ONE broadcast per rank, got {state.bcast_generation - generation}"
+    )
 
 
 def test_exchange_refuses_when_no_bridge_answers(client):

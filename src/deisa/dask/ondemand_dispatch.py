@@ -51,13 +51,13 @@ for an earlier request, or for an earlier timestep of the same array, never sati
 because merging it would silently mix two timesteps of one field.
 
 **How the two messages travel in production.** The request rides the handshake actor the run ALREADY runs
-(:meth:`deisa.dask.handshake.Handshake.put_plan` puts it in the actor's one slot for the array), and the reports ride
-the topic event the array root publishes at each ``send``: the root takes the slot at its boundary -- the one place
-where every rank of the array is inside the same sub-comm collective -- broadcasts what it took, folds the retained
-chunk of the requested timestep, and attaches the gathered reports to the ``plan_reports`` entry of the NEXT event it
-publishes (:class:`PlanEventExchange` is the host's half). Nothing is exchanged to agree on a name, no queue lives in
-the scheduler, and no bridge folds a chunk off its main thread: a second thread inside an MPI communicator is not a
-safe place to be.
+(:meth:`deisa.dask.handshake.Handshake.put_plan` appends it to that array's FIFO of requests), and the reports ride
+the topic event the array root publishes at each ``send``: the root takes the whole FIFO at its boundary -- the one
+place where every rank of the array is inside the same sub-comm collective -- broadcasts what it took, folds the
+retained chunk of the requested timestep once per request, and attaches the gathered reports to the ``plan_reports``
+entry of the NEXT event it publishes (:class:`PlanEventExchange` is the host's half). Nothing is exchanged to agree on
+a name, no queue lives in the scheduler, and no bridge folds a chunk off its main thread: a second thread inside an MPI
+communicator is not a safe place to be.
 
 **The one timing bound of that design.** A request is answered at the array's *next* ``send``, so a request must reach
 the array root before the simulation sends that array again, and its reports come back on that send's event. The host
@@ -674,18 +674,24 @@ class PlanReportCollector:
 class PlanEventExchange:
     """The analytics host's transport: put the request in the handshake actor, take the reports off the topic events.
 
-    One request/reports round trip with nothing spawned and nothing queued: the host puts the request in the actor's
-    per-array slot (:meth:`deisa.dask.handshake.Handshake.put_plan`), the array root takes it at its next ``send``
-    boundary, folds with every rank of the array, and attaches the gathered reports to the event that send publishes.
-    The exchange returns as soon as THAT event delivered one report per bridge.
+    One request/reports round trip with nothing spawned and nothing queued: the host appends the request to the
+    actor's per-array FIFO (:meth:`deisa.dask.handshake.Handshake.put_plan`), the array root takes the WHOLE FIFO at
+    its next ``send`` boundary, folds with every rank of the array once per parked request, and attaches the gathered
+    reports to the event that send publishes. The exchange returns as soon as THAT event delivered one report per
+    bridge for ITS request id.
 
     A plan asked AFTER an event was published is served at the FOLLOWING event -- that is the boundary contract, not a
     race: the reports are matched on the request id, so a later event can never satisfy an earlier request by accident.
 
+    Concurrent requests for the SAME array are normal, not a corner case: one asyncio task runs per callback, so two
+    ``precompute=True`` callbacks on one array are both inside this ``__call__`` at the same time. They park two FIFO
+    entries and the one boundary serves both (one gather each), so neither can starve the other -- which is why the
+    actor keeps a list per array and not a single slot.
+
     The put happens ONCE per request. Putting once per bridge would be wrong for the same reason a broadcast is not a
     per-rank call: the array has exactly one root, it serves the request with all N ranks, and the event therefore
-    carries exactly N reports -- N puts would park N requests (each replacing the previous one in the single slot) and
-    still produce one round.
+    carries exactly N reports for that request id -- N puts would park N duplicate requests (N folds, N report sets, of
+    which N-1 are dropped at the collector) and still produce one round.
 
     The reports come back in the order the bridges answered; :func:`_validate_reports` and the merge both match on the
     request id and sort by chunk position, so the order is not part of the contract.

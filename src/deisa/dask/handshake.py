@@ -58,10 +58,12 @@ class Handshake:
             # would be pure critical-path waste. An array the host never filed -- nobody registered a callback on it --
             # is ``"plain"``: the full-chunk scatter is the DEFAULT, not a registration fact.
             self.delivery_modes: dict = {}
-            # The analytics host's on-demand plan requests, ONE slot per array: ``array_name -> PlanRequest``. The
-            # root bridge of the array takes the slot at each ``send`` boundary and folds it there, which is why no
-            # queue (and no polling thread) is needed to carry a request: this actor is already the one round trip
-            # both sides make, so a request rides the mechanism every other handshake fact rides.
+            # The analytics host's on-demand plan requests, a FIFO of them per array: ``array_name -> [PlanRequest]``.
+            # The root bridge of the array takes the whole list at each ``send`` boundary and folds every entry there,
+            # which is why no queue (and no polling thread) is needed to carry a request: this actor is already the one
+            # round trip both sides make, so a request rides the mechanism every other handshake fact rides. A LIST and
+            # not one slot per array: two ``precompute=True`` callbacks on the SAME array dispatch concurrently (one
+            # asyncio task per callback), so two requests for one array can be parked when a boundary takes them.
             self.plan_requests: dict = {}
             self.timestep: Optional[int] = None
 
@@ -113,33 +115,42 @@ class Handshake:
             return {"delivery": self.delivery_modes.get(array_name, "plain")}
 
         def put_plan(self, array_name: str, plan: Any) -> None:
-            """Park the host's on-demand plan request for ONE array, replacing any request not yet taken.
+            """Append the host's on-demand plan request for ONE array to that array's FIFO.
 
-            ONE slot per array, and that is a correctness statement, not a simplification: the host's
-            ``PlanEventExchange`` blocks until the reports of the request it put have arrived, so it never has two
-            requests for the same array in flight -- a second put can only follow a completed round. Where an older
-            request is still parked, nobody is waiting for it any more (its host side timed out and refused), so the
-            latest request is the only one worth serving. A queue here would instead let a request nobody waits for
-            be served at a later boundary, which is work whose reports are dropped.
+            A FIFO per array, and both halves of that matter:
 
-            - ``:param array_name:`` Registered array the request is rooted in; the array root's slot key.
+            - FIFO ORDER: two requests for the same array are served in the order they were put, so a request put
+              first cannot be starved by one put later.
+            - A LIST, not one slot: the host REALLY does have two requests in flight for one array. One asyncio task
+              runs per ``precompute=True`` callback, so two callbacks registered on the same array dispatch
+              concurrently from the same event -- each blocked in its own ``PlanEventExchange`` call. A single slot
+              would silently overwrite the older request, and the callback waiting on it would burn the whole
+              ``DEISA_ONDEMAND_PLAN_TIMEOUT`` and then abort the run with the misleading "no bridge is serving plan
+              requests" refusal, for a bridge that is serving them fine.
+
+            Nothing is lost by keeping the older request: the boundary serves EVERY parked request in one visit (one
+            gather each, in this same order on every rank), so the extra entry costs folds that were already asked for,
+            not a round trip. A request whose host side gave up while it was parked is still served once, and its
+            reports are dropped at :meth:`PlanReportCollector.deliver` (nobody waits for that id) -- cheaper than
+            dropping a live request, which is what the overwrite did.
+
+            - ``:param array_name:`` Registered array the request is rooted in; the array's FIFO key.
             - ``:param plan:`` The composed :class:`~deisa.dask.ondemand_dispatch.PlanRequest`.
             """
-            self.plan_requests[str(array_name)] = plan
+            self.plan_requests.setdefault(str(array_name), []).append(plan)
 
         def take_plans(self, array_name: str) -> List[Any]:
-            """Take the array's parked request, and answer at once: ``[]`` or ``[plan]``, never a wait.
+            """Take the array's parked requests, in put order, and answer at once: a list, never a wait.
 
             The bridge calls this at the array's ``send`` boundary. It is non-blocking by construction -- the actor
-            answers with what is stored, or with an empty list when nothing was put since the last take -- so an idle
-            boundary costs one actor round trip and no deadline is hidden in the scheduler. A list rather than a
-            single request because it is what the boundary broadcasts to the array's peers: the root hands the
-            broadcast exactly what it took, empty or not, so every rank enters the same collective every timestep.
+            answers with what is parked (``[]`` when nothing was put since the last take) -- so an idle boundary costs
+            one actor round trip and no deadline is hidden in the scheduler. The WHOLE list comes back: the root hands
+            the broadcast exactly what it took, empty or not, so every rank enters the same collective every timestep
+            and every parked request is answered by this boundary rather than the next.
 
-            - ``:param array_name:`` Registered array whose slot is drained.
+            - ``:param array_name:`` Registered array whose FIFO is drained.
             """
-            plan = self.plan_requests.pop(str(array_name), None)
-            return [] if plan is None else [plan]
+            return self.plan_requests.pop(str(array_name), [])
 
         def __go(self) -> None:
             logger.debug("Handshake go !")
@@ -201,8 +212,10 @@ class Handshake:
     def put_plan(self, array_name: str, plan: Any) -> None:
         """Hand ONE on-demand plan request to the array's root bridge, through the handshake actor.
 
-        The host half of the plan transport: the request waits in the actor's per-array slot until the array root
-        takes it at its next ``send`` boundary. One actor call, no queue, no subscription.
+        The host half of the plan transport: the request is appended to the actor's per-array FIFO and waits there
+        until the array root takes the whole FIFO at its next ``send`` boundary. One actor call, no queue, no
+        subscription. Two requests for the same array -- two ``precompute=True`` callbacks on one array dispatch
+        concurrently -- both stay parked and are both served by that boundary, in put order.
 
         - ``:param array_name:`` Registered array the request is rooted in.
         - ``:param plan:`` The composed :class:`~deisa.dask.ondemand_dispatch.PlanRequest`.
@@ -211,11 +224,12 @@ class Handshake:
         self.__handshake_actor.put_plan(array_name, plan).result()
 
     def take_plans(self, array_name: str) -> List[Any]:
-        """Take the array's parked plan request, if any: ``[]`` or ``[plan]``, without waiting for one.
+        """Take the array's parked plan requests, in put order, without waiting for one.
 
-        The bridge half of the plan transport, called by the array root at its ``send`` boundary.
+        The bridge half of the plan transport, called by the array root at its ``send`` boundary. Returns the whole
+        parked FIFO (``[]`` when nothing was put since the last take).
 
-        - ``:param array_name:`` Registered array whose request slot is drained.
+        - ``:param array_name:`` Registered array whose request FIFO is drained.
         """
         assert self.__handshake_actor is not None
         return self.__handshake_actor.take_plans(array_name).result()
