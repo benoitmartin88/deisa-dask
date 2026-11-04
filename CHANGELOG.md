@@ -22,8 +22,8 @@ Types of changes:
 - Runtime reduction delivery: a callback registered with `precompute=True` (the default) receives one `DeisaCollection`
   per array and timestep, and its chunk-local reductions (`sum`, `mean`, `var`, `std`, `min`, `max`, `prod`) are
   evaluated by the bridge on the numpy chunk it already holds. Two transports carry the answer back, and the array's
-  data crosses neither of them: the bridge publishes an eager scalar menu on the topic event, which answers the common
-  folds with no round trip, and serves the expressions the menu cannot answer on demand, when the worker asks for the
+  data crosses neither of them: the bridge publishes an eager scalar aggregates on the topic event, which answers the common
+  folds with no round trip, and serves the expressions the aggregates cannot answer on demand, when the worker asks for the
   reduction of a chunk the bridge retains. When no callback on an array reads the chunk itself, `Bridge.send()` ships
   no data at all -- no scatter and an empty `futures` list -- so a whole-array `sum()` costs a few scalars per bridge
   per timestep instead of the chunk. `precompute=False` keeps the legacy full-chunk scatter, and an array that has at
@@ -61,6 +61,10 @@ Types of changes:
   outside it raise `UnsupportedReductionError` instead of being served from metadata: a length or a foreign attribute
   invites reading a shape or a value that is never delivered to the worker. The surface itself is unchanged and
   complete -- `field.shape`, `field.dtype`, `field.ndim`, the pointwise operators and the reductions all still work.
+- The eager aggregate vocabulary is renamed: `EagerMenu` is now `EagerAggregates`, `build_eager_menu` is now
+  `build_eager_aggregates`, `EAGER_MENU_OPS` is now `EAGER_AGGREGATES_OPS`, and the topic-event payload keys
+  `menu`/`menu_error` are now `aggregates`/`aggregates_error`. The rename is one commit because the bridge writes and
+  the analytics host reads those two keys in lockstep; no cross-version wire compatibility is claimed for them.
 
 ### Removed
 

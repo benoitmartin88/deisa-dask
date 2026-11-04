@@ -26,7 +26,7 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 # =============================================================================
 """
-The delivery boundary of the on-demand reduction path: topic handler, eager menu, run abort and the PCA hook.
+The delivery boundary of the on-demand reduction path: topic handler, eager aggregates, run abort and the PCA hook.
 
 Every test here runs the real pieces without a cluster: the callbacks are handed over by the real
 ``Deisa._make_topic_handler``, their reductions run through the real ``PlanDispatcher`` over a ``FakeComm`` fleet whose
@@ -58,11 +58,11 @@ from deisa.dask.handshake import Handshake
 from deisa.dask.mergeable_pca import MergeablePCA, PCASummary
 from deisa.dask.ondemand_compose import PCARequest, compose_request
 from deisa.dask.ondemand_dispatch import (
-    EAGER_MENU_OPS,
-    EagerMenu,
+    EAGER_AGGREGATES_OPS,
+    EagerAggregates,
     PlanRequest,
     PlanResponder,
-    build_eager_menu,
+    build_eager_aggregates,
     dispatch_plan_over_comm,
     serve_plan_requests,
 )
@@ -133,11 +133,11 @@ class BridgeFleet:
         self.rounds.append((plan, reports))
         return reports
 
-    def menus(self):
-        """The eager menu every bridge of this fleet would ship with its timestep event."""
+    def aggregates(self):
+        """The eager aggregates every bridge of this fleet would ship with its timestep event."""
         collection = OndemandDeisaArray.from_metadata(self.array_name, self.timestep, METADATA[self.array_name])
         return [
-            build_eager_menu(collection, chunk, rank=rank, chunk_position=chunk_position(rank))
+            build_eager_aggregates(collection, chunk, rank=rank, chunk_position=chunk_position(rank))
             for rank, chunk in enumerate(self.chunks)
         ]
 
@@ -163,8 +163,8 @@ class Fleet:
         """Route one round trip to the fleet holding the plan's timestep (what the array transport does)."""
         return self.fleets[plan.timestep].exchange(plan)
 
-    def menus(self, timestep):
-        return self.fleets[timestep].menus()
+    def aggregates(self, timestep):
+        return self.fleets[timestep].aggregates()
 
     def rounds(self, timestep):
         return self.fleets[timestep].rounds
@@ -347,19 +347,19 @@ async def _drain(tasks, timeout=20.0):
     assert not tasks, "a callback task never finished"
 
 
-def deliver(deisa, timestep, menus, menu_error=None, futures=()):
+def deliver(deisa, timestep, aggregates, aggregates_error=None, futures=()):
     """Hand the topic event for ``timestep`` to the real handler, then drain the callback tasks it spawned.
 
-    ``futures`` is the event's data payload: empty for an on-demand delivery (the menu is the payload), one full-chunk
-    entry per bridge for a legacy scatter.
+    ``futures`` is the event's data payload: empty for an on-demand delivery (the aggregates are the payload), one
+    full-chunk entry per bridge for a legacy scatter.
     """
     payload = {
         "iteration": timestep,
         "futures": list(futures),
-        "menu": menus,
+        "aggregates": aggregates,
     }
-    if menu_error is not None:
-        payload["menu_error"] = menu_error
+    if aggregates_error is not None:
+        payload["aggregates_error"] = aggregates_error
     handler = deisa._topic_handlers[ARRAY_NAME]
     deisa.client.sync(lambda: handler((None, payload)))
     deisa.client.sync(lambda: _drain(deisa._tasks))
@@ -377,10 +377,10 @@ def full_chunk_futures(shape=CHUNK_SHAPE):
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Delivery: the callback receives collections, and the menu answers the scalar folds
+# Delivery: the callback receives collections, and the aggregates answer the scalar folds
 # ---------------------------------------------------------------------------------------------------------------------
-def test_scalar_fold_is_served_from_the_eager_menu(fleets, client, monkeypatch):
-    """``window[-1].sum().compute()`` is answered by the pre-placed menu: no round trip, correct value."""
+def test_scalar_fold_is_served_from_the_eager_aggregates(fleets, client, monkeypatch):
+    """``window[-1].sum().compute()`` is answered by the pre-placed aggregates: no round trip, correct value."""
     deisa = make_deisa(fleets, client, monkeypatch)
     seen = []
 
@@ -389,14 +389,14 @@ def test_scalar_fold_is_served_from_the_eager_menu(fleets, client, monkeypatch):
         seen.append(window[-1].sum().compute())
 
     register(deisa, callback)
-    deliver(deisa, 0, fleets.menus(0))
+    deliver(deisa, 0, fleets.aggregates(0))
 
     assert seen == [pytest.approx(fleets.fields[0].sum())]
-    assert fleets.rounds(0) == [], "a menu-served scalar fold must not dispatch an on-demand request"
+    assert fleets.rounds(0) == [], "an aggregates-served scalar fold must not dispatch an on-demand request"
 
 
 def test_axis_fold_dispatches_on_demand(fleets, client, monkeypatch):
-    """A partial fold is not in the menu, so it dispatches one round trip and still returns the right value."""
+    """A partial fold is not in the aggregates, so it dispatches one round trip and still returns the right value."""
     deisa = make_deisa(fleets, client, monkeypatch)
     seen = []
 
@@ -404,18 +404,20 @@ def test_axis_fold_dispatches_on_demand(fleets, client, monkeypatch):
         seen.append(window[-1].sum(axis=0).compute())
 
     register(deisa, callback)
-    deliver(deisa, 0, fleets.menus(0))
+    deliver(deisa, 0, fleets.aggregates(0))
 
     np.testing.assert_allclose(seen[0], fleets.fields[0].sum(axis=0))
     assert len(fleets.rounds(0)) == 1, "an axis fold must dispatch exactly one on-demand request"
 
 
-def test_derived_reduction_is_not_answered_by_the_bare_array_menu(fleets, client, monkeypatch):
-    """A derived reduction misses the menu: the menu holds the BARE array's partials, so serving it would be wrong.
+def test_derived_reduction_is_not_answered_by_the_bare_array_aggregates(fleets, client, monkeypatch):
+    """A derived reduction misses the aggregates: the aggregates hold the BARE array's partials, so serving it
+    would be wrong.
 
-    The menu is built from the bare collection (``build_eager_menu`` composes the identity program), so its ``sum``
-    entry is ``sum(field)``. ``(window[-1] * 2).sum()`` is ``2 * sum(field)``; answering it from the menu silently
-    returns the wrong number with no round trip and no exception. Only the on-demand path can serve it.
+    The aggregates are built from the bare collection (``build_eager_aggregates`` composes the identity program), so
+    its ``sum`` entry is ``sum(field)``. ``(window[-1] * 2).sum()`` is ``2 * sum(field)``; answering it from the
+    aggregates silently returns the wrong number with no round trip and no exception. Only the on-demand path can
+    serve it.
     """
     deisa = make_deisa(fleets, client, monkeypatch)
     seen = []
@@ -426,18 +428,21 @@ def test_derived_reduction_is_not_answered_by_the_bare_array_menu(fleets, client
         seen.append((derived, bare))
 
     register(deisa, callback)
-    deliver(deisa, 0, fleets.menus(0))
+    deliver(deisa, 0, fleets.aggregates(0))
 
     derived, bare = seen[0]
     truth = fleets.fields[0].sum()
-    assert bare == pytest.approx(truth), "the bare fold is still the menu's job"
+    assert bare == pytest.approx(truth), "the bare fold is still the aggregates' job"
     assert derived == pytest.approx(2 * truth), "a derived reduction must fold the DERIVED operand"
     assert derived != pytest.approx(bare), "the derived value must not be the bare array's partial"
-    assert len(fleets.rounds(0)) == 1, "exactly the derived reduction may dispatch; the bare fold stays in the menu"
+    assert len(fleets.rounds(0)) == 1, (
+        "exactly the derived reduction may dispatch; the bare fold stays in the aggregates"
+    )
 
 
-def test_menu_value_of_another_timestep_cannot_answer(fleets, client, monkeypatch):
-    """A menu computed for timestep N never answers a timestep N+1 request: the dispatcher keys the menu by timestep."""
+def test_aggregate_value_of_another_timestep_cannot_answer(fleets, client, monkeypatch):
+    """An aggregate value computed for timestep N never answers a timestep N+1 request: the dispatcher keys the
+    aggregates by timestep."""
     deisa = make_deisa(fleets, client, monkeypatch)
     seen = []
 
@@ -445,11 +450,11 @@ def test_menu_value_of_another_timestep_cannot_answer(fleets, client, monkeypatc
         seen.append(window[-1].sum().compute())
 
     register(deisa, callback)
-    # The event announces timestep 1 but carries timestep 0's menus. The menu lookup must miss and dispatch.
-    deliver(deisa, 1, fleets.menus(0))
+    # The event announces timestep 1 but carries timestep 0's aggregates. The aggregates lookup must miss and dispatch.
+    deliver(deisa, 1, fleets.aggregates(0))
 
     assert seen == [pytest.approx(fleets.fields[1].sum())]
-    assert len(fleets.rounds(1)) == 1, "a stale menu value must not be consumed"
+    assert len(fleets.rounds(1)) == 1, "a stale aggregate value must not be consumed"
 
 
 def test_window_is_a_list_of_collections(fleets, client, monkeypatch):
@@ -463,8 +468,8 @@ def test_window_is_a_list_of_collections(fleets, client, monkeypatch):
         seen.append((window[-1].timestep, window[-2].timestep, window[-1].sum().compute()))
 
     register(deisa, callback, window_size=2)
-    deliver(deisa, 0, fleets.menus(0))
-    deliver(deisa, 1, fleets.menus(1))
+    deliver(deisa, 0, fleets.aggregates(0))
+    deliver(deisa, 1, fleets.aggregates(1))
 
     assert seen == [(1, 0, pytest.approx(fleets.fields[1].sum()))]
 
@@ -487,14 +492,14 @@ def test_each_callback_gets_its_own_collection(fleets, client, monkeypatch):
 
     register(deisa, first)
     register(deisa, second)
-    deliver(deisa, 0, fleets.menus(0))
+    deliver(deisa, 0, fleets.aggregates(0))
 
     assert seen["first"] is not seen["second"], "each callback must get its own collection object"
     assert seen["second"].name == ARRAY_NAME, "a sibling's write must not reach the other callback's view"
 
 
-def test_menu_failure_payload_aborts_the_run(fleets, client, monkeypatch):
-    """A bridge that could not build its menu ships the cause; the delivery must record it as the run failure."""
+def test_aggregates_failure_payload_aborts_the_run(fleets, client, monkeypatch):
+    """A bridge that could not build its aggregates ships the cause; the delivery must record it as the run failure."""
     deisa = make_deisa(fleets, client, monkeypatch)
     calls = []
 
@@ -502,11 +507,11 @@ def test_menu_failure_payload_aborts_the_run(fleets, client, monkeypatch):
         calls.append(window[-1])
 
     register(deisa, callback)
-    deliver(deisa, 0, None, menu_error="array 'f' at timestep 0, bridge 1: ValueError('empty chunk')")
+    deliver(deisa, 0, None, aggregates_error="array 'f' at timestep 0, bridge 1: ValueError('empty chunk')")
 
     assert calls, "the delivery still reaches the callback: fail-loud, not fail-the-send"
     assert isinstance(deisa._run_failure, errors.PrecomputeRuntimeError), (
-        f"the menu failure must fail the run at the cycle boundary: {deisa._run_failure!r}"
+        f"the aggregates failure must fail the run at the cycle boundary: {deisa._run_failure!r}"
     )
     assert "empty chunk" in str(deisa._run_failure), "the run failure must carry the bridge's cause"
 
@@ -527,7 +532,7 @@ def test_raw_read_refusal_aborts_the_run(fleets, client, monkeypatch, go_event):
             raise
 
     callback_id = register(deisa, callback)
-    deliver(deisa, 0, fleets.menus(0))
+    deliver(deisa, 0, fleets.aggregates(0))
 
     assert isinstance(failures[0], errors.RawFieldReadError)
     assert isinstance(deisa._run_failure, errors.RawFieldReadError), "the refusal must be recorded as the run failure"
@@ -547,7 +552,7 @@ def test_materialization_refusal_aborts_the_run(fleets, client, monkeypatch, go_
         np.asarray(window[-1])
 
     register(deisa, callback)
-    deliver(deisa, 0, fleets.menus(0))
+    deliver(deisa, 0, fleets.aggregates(0))
 
     assert isinstance(deisa._run_failure, errors.MaterializationError)
     with pytest.raises(errors.MaterializationError):
@@ -564,8 +569,8 @@ def test_mixed_timestep_expression_aborts_the_run(fleets, client, monkeypatch, g
         window[-1] - window[-2]
 
     register(deisa, callback, window_size=2)
-    deliver(deisa, 0, fleets.menus(0))
-    deliver(deisa, 1, fleets.menus(1))
+    deliver(deisa, 0, fleets.aggregates(0))
+    deliver(deisa, 1, fleets.aggregates(1))
 
     assert isinstance(deisa._run_failure, errors.UnsupportedReductionError)
     with pytest.raises(errors.UnsupportedReductionError):
@@ -587,7 +592,7 @@ def test_precompute_taxonomy_refusal_aborts_the_run(fleets, client, monkeypatch,
         raise deisa_module.UnsupportedReductionError("the precompute view refused this reduction")
 
     register(deisa, callback)
-    deliver(deisa, 0, fleets.menus(0))
+    deliver(deisa, 0, fleets.aggregates(0))
 
     assert isinstance(deisa._run_failure, deisa_module.UnsupportedReductionError)
     assert not isinstance(deisa._run_failure, deisa_module.OndemandRefusal), "the PRECOMPUTE taxonomy, not the ondemand"
@@ -611,7 +616,7 @@ def test_mutation_probe_without_the_refusal_branch_logs_and_continues(fleets, cl
         window[-1].compute()
 
     callback_id = register(deisa, callback)
-    deliver(deisa, 0, fleets.menus(0))
+    deliver(deisa, 0, fleets.aggregates(0))
 
     assert deisa._run_failure is None, "without the refusal branch nothing records a run failure"
     assert callback_id in deisa._callbacks, "the default handler leaves the callback registered"
@@ -642,7 +647,7 @@ def test_pca_fit_dispatches_a_summary_branch(fleets, client, monkeypatch):
         fitted.append(MergeablePCA(n_components=2).fit(window[-1]))
 
     register(deisa, callback)
-    deliver(deisa, 0, fleets.menus(0))
+    deliver(deisa, 0, fleets.aggregates(0))
 
     estimator = fitted[0]
     reference = reference_components(fleets.fields[0], n_components=2)
@@ -659,7 +664,7 @@ def test_pca_branch_ships_summaries_not_chunks(fleets, client, monkeypatch):
         MergeablePCA(n_components=2).fit(window[-1])
 
     register(deisa, callback)
-    deliver(deisa, 0, fleets.menus(0))
+    deliver(deisa, 0, fleets.aggregates(0))
 
     data_bytes = fleets.fields[0].nbytes
     (plan, reports), *_ = fleets.rounds(0)
@@ -703,7 +708,7 @@ def test_precompute_false_still_receives_the_full_chunk(fleets, client, monkeypa
 
     register(deisa, callback, precompute=False)
     assert not deisa._arrays[ARRAY_NAME].ondemand, "a full-chunk callback declares no on-demand array"
-    deliver(deisa, 0, fleets.menus(0), futures=full_chunk_futures())
+    deliver(deisa, 0, fleets.aggregates(0), futures=full_chunk_futures())
 
     assert len(received) == 1
     assert isinstance(received[0], DeisaArray)
@@ -730,7 +735,7 @@ def test_one_event_serves_both_delivery_modes(fleets, client, monkeypatch):
 
     register(deisa, ondemand_callback)
     register(deisa, full_chunk_callback, precompute=False)
-    deliver(deisa, 0, fleets.menus(0), futures=full_chunk_futures())
+    deliver(deisa, 0, fleets.aggregates(0), futures=full_chunk_futures())
 
     assert len(collections_seen) == 1 and isinstance(collections_seen[0], OndemandDeisaArray)
     assert len(arrays_seen) == 1 and isinstance(arrays_seen[0], DeisaArray)
@@ -738,18 +743,19 @@ def test_one_event_serves_both_delivery_modes(fleets, client, monkeypatch):
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# K7F-01: what the bridge ships depends on BOTH per-array facts -- an on-demand target ships its menu, and it ships the
-# chunk only while something on it reads the chunk. The two facts travel in one handshake read (the file's docstring
-# explains why a second collective is forbidden).
+# K7F-01: what the bridge ships depends on BOTH per-array facts -- an on-demand target ships its aggregates, and
+# it ships the chunk only while something on it reads the chunk. The two facts travel in one handshake read (the
+# file's docstring explains why a second collective is forbidden).
 # ---------------------------------------------------------------------------------------------------------------------
 def test_mixed_array_still_gets_the_full_chunk(fleets, client, monkeypatch):
-    """One array with an on-demand callback AND a legacy one keeps the full-chunk scatter (decision F3's escape hatch).
+    """One array with an on-demand callback AND a legacy one keeps the full-chunk scatter (decision F3's escape
+    hatch).
 
     This is the case that forces the second handshake fact. The on-demand callback alone makes the array a data-free
-    delivery -- the bridge would ship the menu and nothing else -- but the ``precompute=False`` callback on the SAME
-    array reads the chunk, so skipping the scatter would hand it an event with ``futures: []``. Host, handshake actor
-    and bridge are driven end to end here (no cluster): the host files both facts, the actor returns them in ONE dict,
-    and the bridge's send must still scatter.
+    delivery -- the bridge would ship the aggregates and nothing else -- but the ``precompute=False`` callback on
+    the SAME array reads the chunk, so skipping the scatter would hand it an event with ``futures: []``. Host,
+    handshake actor and bridge are driven end to end here (no cluster): the host files both facts, the actor returns
+    them in ONE dict, and the bridge's send must still scatter.
     """
     deisa = make_deisa(fleets, client, monkeypatch)
     register(deisa, lambda window: None)
@@ -793,13 +799,13 @@ def test_mixed_array_still_gets_the_full_chunk(fleets, client, monkeypatch):
     assert len(wire_client.events[0][1]["futures"]) == 1, "the event must still name the full chunk for that reader"
 
 
-def test_ondemand_only_array_ships_its_menu_and_no_data(monkeypatch):
-    """On-demand target with NO legacy reader: no scatter, ``futures: []`` -- the menu is the payload.
+def test_ondemand_only_array_ships_its_aggregates_and_no_data(monkeypatch):
+    """On-demand target with NO legacy reader: no scatter, ``futures: []`` -- the aggregates are the payload.
 
     This is the regression the memory suite measures (``test_ondemand_worker_only_sees_partials``): at HEAD every
     ``precompute=True`` callback cost a 32 MB scatter per bridge per timestep for data nothing read. Three things must
-    hold here -- nothing is scattered, the menu is still folded (it is the ENTIRE payload), and no key reaches the
-    scheduler (an empty ``update_data`` + an empty desire list would be pure round trips).
+    hold here -- nothing is scattered, the aggregates are still folded (they are the ENTIRE payload), and no key
+    reaches the scheduler (an empty ``update_data`` + an empty desire list would be pure round trips).
     """
     bridge, wire_client = _make_send_bridge()
     bridge._delivery = {ARRAY_NAME: DeliveryState(ondemand=True, legacy=False, fetched=True)}
@@ -822,8 +828,8 @@ def test_ondemand_only_array_ships_its_menu_and_no_data(monkeypatch):
     assert scattered == [], "no scatter may happen for an array no callback reads"
     _, payload = wire_client.events[0]
     assert payload["futures"] == [], "the event must not name data that was never shipped"
-    assert len(payload["menu"]) == 1, "the menu IS the payload on the data-free path"
-    assert payload["menu"][0]["values"]["sum"]["data"], "the menu must still be folded, not dropped"
+    assert len(payload["aggregates"]) == 1, "the aggregates ARE the payload on the data-free path"
+    assert payload["aggregates"][0]["values"]["sum"]["data"], "the aggregates must still be folded, not dropped"
     assert wire_client.updates == [], "an empty key set needs no update_data"
     assert wire_client.desired_keys == [], "an empty key set needs no client-desires-keys"
 
@@ -844,13 +850,13 @@ class _WireHandshake:
 def test_first_send_on_lazy_path_ships_no_data():
     """K7F-06: the FIRST send on the lazy path (``wait_for_go=False``) must already be data-free.
 
-    ``test_ondemand_only_array_ships_its_menu_and_no_data`` starts from a WARM cache -- the state the ``wait_for_go``
-    init-time prefetch leaves behind. A deployment that never prefetches is the memory harness's shape
+    ``test_ondemand_only_array_ships_its_aggregates_and_no_data`` starts from a WARM cache -- the state the
+    ``wait_for_go`` init-time prefetch leaves behind. A deployment that never prefetches is the memory harness's shape
     (``test_precompute_memory.py``, which asserts after exactly ONE send), and there the caches are still empty when
     ``send`` runs. Computing ``data_free_delivery`` before ``_ensure_task_state`` filled them made that first send take
-    the full-chunk scatter while still building the menu from the state it had just fetched -- exactly the acceptance
-    log's signature (full-chunk scatter and a built ``EagerMenu`` in the SAME event). The fetch has to come first, so
-    the decision is taken on the state the send itself read.
+    the full-chunk scatter while still building the aggregates from the state it had just fetched -- exactly the
+    acceptance log's signature (full-chunk scatter and a built ``EagerAggregates`` in the SAME event). The fetch has
+    to come first, so the decision is taken on the state the send itself read.
 
     Witness from K7F-06/27f3a68, adapted to the post-K8 surface (no branch machinery left to stub).
     """
@@ -884,8 +890,8 @@ def test_first_send_on_lazy_path_ships_no_data():
     )
     _, payload = wire_client.events[0]
     assert payload["futures"] == [], "the event must not name data that was never shipped"
-    assert len(payload["menu"]) == 1, "the menu IS the payload on the data-free path"
-    assert payload["menu"][0]["values"]["sum"]["data"], "the menu must still be folded, not dropped"
+    assert len(payload["aggregates"]) == 1, "the aggregates ARE the payload on the data-free path"
+    assert payload["aggregates"][0]["values"]["sum"]["data"], "the aggregates must still be folded, not dropped"
     assert wire_client.updates == [], "an empty key set needs no update_data"
     assert wire_client.desired_keys == [], "an empty key set needs no client-desires-keys"
 
@@ -931,7 +937,7 @@ def test_data_free_event_files_no_future_ownership(fleets, client, monkeypatch):
     """
     deisa = make_deisa(fleets, client, monkeypatch)
     register(deisa, lambda window: None)
-    deliver(deisa, 0, fleets.menus(0))
+    deliver(deisa, 0, fleets.aggregates(0))
 
     ops = [payload["op"] for payload in client.desired_keys]
     assert "client-desires-keys" not in ops, f"no key crossed the boundary, so none is desired: {client.desired_keys}"
@@ -953,7 +959,7 @@ def test_full_chunk_event_still_files_future_ownership(fleets, client, monkeypat
         lambda self, blocks, global_shape: da.zeros(global_shape, chunks=CHUNK_SHAPE),
     )
     register(deisa, lambda window: None, precompute=False)
-    deliver(deisa, 0, fleets.menus(0), futures=full_chunk_futures())
+    deliver(deisa, 0, fleets.aggregates(0), futures=full_chunk_futures())
 
     assert [payload["op"] for payload in client.desired_keys] == ["client-desires-keys", "client-releases-keys"]
     desires, releases = client.desired_keys
@@ -981,33 +987,35 @@ def test_departed_ondemand_callback_flips_the_array_off(fleets, client, monkeypa
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# The harness itself: the menus it ships are the delivered shape
+# The harness itself: the aggregates it ships are the delivered shape
 # ---------------------------------------------------------------------------------------------------------------------
-def test_harness_ships_one_eager_menu_per_bridge(fleets):
-    """The menus the harness hands the handler are real ``EagerMenu`` entries, one per bridge, for that timestep."""
-    menus = fleets.menus(0)
-    assert len(menus) == 2, "the (8, 4) field in (4, 4) chunks is a two-bridge grid"
-    for menu in menus:
-        assert isinstance(menu, EagerMenu)
-        assert menu.timestep == 0
-        assert menu.array_name == ARRAY_NAME
-        assert "sum" in menu.values
+def test_harness_ships_one_eager_aggregates_per_bridge(fleets):
+    """The aggregates the harness hands the handler are real ``EagerAggregates`` entries, one per bridge, for
+    that timestep."""
+    aggregates = fleets.aggregates(0)
+    assert len(aggregates) == 2, "the (8, 4) field in (4, 4) chunks is a two-bridge grid"
+    for eager in aggregates:
+        assert isinstance(eager, EagerAggregates)
+        assert eager.timestep == 0
+        assert eager.array_name == ARRAY_NAME
+        assert "sum" in eager.values
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# The wire: the menu the bridge publishes on the topic event (the ``Client.log_event`` msgpack hop)
+# The wire: the aggregates the bridge publishes on the topic event (the ``Client.log_event`` msgpack hop)
 # ---------------------------------------------------------------------------------------------------------------------
-# ``Bridge.send`` ships the eager menu encoded with ``EagerMenu.as_payload`` because the event bus carries msgpack
-# primitives only. Before ``1fbb650`` the live objects went on the wire and the FIRST ``send`` of an on-demand-mode run
-# raised ``TypeError: Message must be msgpack serializable``: the delivery mode was unusable in production. Every test
-# above hands a live ``EagerMenu`` straight to the topic handler, so none of them crosses this hop. These two do.
+# ``Bridge.send`` ships the eager aggregates encoded with ``EagerAggregates.as_payload`` because the event bus
+# carries msgpack primitives only. Before ``1fbb650`` the live objects went on the wire and the FIRST ``send`` of
+# an on-demand-mode run raised ``TypeError: Message must be msgpack serializable``: the delivery mode was unusable in
+# production. Every test above hands a live ``EagerAggregates`` straight to the topic handler, so none of them
+# crosses this hop. These two do.
 WIRE_METADATA = {
     ARRAY_NAME: {
         "global_shape": GLOBAL_SHAPE,
         "chunk_shape": CHUNK_SHAPE,
         "chunk_position": (0, 0),
-        # float32 on purpose: a menu value's dtype is part of the contract (the merge reports it), so a payload that
-        # widened it to float64 would be invisible to every value assertion.
+        # float32 on purpose: an aggregate value's dtype is part of the contract (the merge reports it), so a
+        # payload that widened it to float64 would be invisible to every value assertion.
         "dtype": np.float32,
     }
 }
@@ -1047,7 +1055,7 @@ def _make_send_bridge():
     """Build the ``Bridge.__new__`` stub the tests below drive: one bridge, one array, no scheduler.
 
     Only the scatter is stubbed -- it is ``test_bridge.py``'s subject and needs a scheduler. Everything else (``send``'s
-    on-demand boundary, the eager menu, the plan backlog seam) is the real code.
+    on-demand boundary, the eager aggregates, the plan backlog seam) is the real code.
     """
     bridge = Bridge.__new__(Bridge)
     wire_client = _WireClient()
@@ -1076,8 +1084,8 @@ def _make_send_bridge():
 def send_one_chunk(monkeypatch, chunk):
     """Run the REAL ``Bridge.send`` for a single-bridge array and return the topic payload it published.
 
-    The subject is the encode step (``to_send["menu"] = [menu.as_payload() ...]``) and the eager menu that feeds it, so
-    both run for real.
+    The subject is the encode step (``to_send["aggregates"] = [eager.as_payload() ...]``) and the eager aggregates
+    that feed it, so both run for real.
     """
     bridge, wire_client = _make_send_bridge()
     bridge.send(ARRAY_NAME, chunk, 0)
@@ -1091,29 +1099,30 @@ def send_one_chunk(monkeypatch, chunk):
 
 
 def test_topic_event_from_the_bridge_is_msgpack_serializable(monkeypatch):
-    """Every entry the bridge puts on the wire must survive ``msgpack.packb``; a live ``EagerMenu`` does not.
+    """Every entry the bridge puts on the wire must survive ``msgpack.packb``; a live ``EagerAggregates`` does not.
 
-    Fail-before (the ``1fbb650`` bug, reproduced in ``evidence/probe_msgpack_roundtrip.log`` line 2): with the menu
-    shipped as ``EagerMenu`` objects, ``msgpack.packb`` raises ``TypeError: can not serialize 'EagerMenu' object`` --
-    which is exactly what ``Client.log_event`` does to the first ``send`` of an on-demand-mode run. The line that
-    fails is the ``msgpack.packb(entry)`` inside the loop below.
+    Fail-before (the ``1fbb650`` bug, reproduced in ``evidence/probe_msgpack_roundtrip.log`` line 2): with the
+    aggregates shipped as ``EagerAggregates`` objects, ``msgpack.packb`` raises
+    ``TypeError: can not serialize 'EagerAggregates' object`` -- which is exactly what ``Client.log_event`` does to the
+    first ``send`` of an on-demand-mode run. The line that fails is the ``msgpack.packb(entry)`` inside the loop
+    below.
     """
     chunk = np.random.default_rng(0).normal(size=CHUNK_SHAPE).astype(np.float32)
     payload = send_one_chunk(monkeypatch, chunk)
 
-    # The whole event travels, not just its ``menu`` entry: ``Client.log_event`` packs the payload.
-    entries = payload["menu"]
-    assert len(entries) == 1, "a single-bridge array publishes its one menu"
+    # The whole event travels, not just its ``aggregates`` entry: ``Client.log_event`` packs the payload.
+    entries = payload["aggregates"]
+    assert len(entries) == 1, "a single-bridge array publishes its one aggregates"
     for entry in entries:
         msgpack.packb(entry)
-        assert set(entry["values"]) == set(EAGER_MENU_OPS)
+        assert set(entry["values"]) == set(EAGER_AGGREGATES_OPS)
         assert entry["values"]["sum"]["dtype"] == "float32", "the wire must carry the fold's dtype, not widen it"
         assert entry["array_name"] == ARRAY_NAME and entry["timestep"] == 0
     msgpack.packb(payload)
 
 
-def _assert_same_menu_value(original, rebuilt):
-    """Assert one menu value survived the msgpack round trip: same structure, dtype, shape and numbers.
+def _assert_same_aggregate_value(original, rebuilt):
+    """Assert one aggregate value survived the msgpack round trip: same structure, dtype, shape and numbers.
 
     - ``:param original:`` The value the bridge computed (a numpy scalar/array, or a mapping of them).
     - ``:param rebuilt:`` The value decoded from the payload.
@@ -1122,7 +1131,7 @@ def _assert_same_menu_value(original, rebuilt):
         assert isinstance(rebuilt, dict), f"a dict partial came back as a {type(rebuilt).__name__}"
         assert set(rebuilt) == set(original)
         for key, item in original.items():
-            _assert_same_menu_value(item, rebuilt[key])
+            _assert_same_aggregate_value(item, rebuilt[key])
         return
     assert not isinstance(rebuilt, (list, tuple)), "a partial must not come back as a flattened sequence"
     original_array, rebuilt_array = np.asarray(original), np.asarray(rebuilt)
@@ -1131,34 +1140,34 @@ def _assert_same_menu_value(original, rebuilt):
     assert np.array_equal(rebuilt_array, original_array)
 
 
-def test_menu_round_trip_preserves_keys_values_dtypes_and_stamps(fleets, client, monkeypatch):
-    """``from_payload(unpackb(packb(as_payload())))`` rebuilds the menu EXACTLY, and the delivery serves from it.
+def test_aggregates_round_trip_preserves_keys_values_dtypes_and_stamps(fleets, client, monkeypatch):
+    """``from_payload(unpackb(packb(as_payload())))`` rebuilds the aggregates EXACTLY, and the delivery serves from it.
 
     What a lossy encoding would break, in order of subtlety: the dict partial of ``mean``/``var`` (a flattened list
     would make the aggregation algebra concatenate instead of add), a float32 partial widened to float64 (the merge
     reports the dtype), and the ``timestep``/``rank``/``chunk_position`` stamps (which decide WHICH bridge's chunk a
-    value belongs to, and whether a stale menu may answer). The delivery half then hands the DECODED entries to the
-    real topic handler, so ``_as_eager_menus`` and the merge really consume the rebuilt values.
+    value belongs to, and whether a stale aggregate value may answer). The delivery half then hands the DECODED
+    entries to the real topic handler, so ``_as_eager_aggregates`` and the merge really consume the rebuilt values.
     """
     chunks = [chunk.astype(np.float32) for chunk in fleets.fleets[0].chunks]
     received = []
     for rank, chunk in enumerate(chunks):
         collection = OndemandDeisaArray.from_metadata(ARRAY_NAME, 0, WIRE_METADATA[ARRAY_NAME])
-        menu = build_eager_menu(collection, chunk, rank=rank, chunk_position=chunk_position(rank))
+        aggregates = build_eager_aggregates(collection, chunk, rank=rank, chunk_position=chunk_position(rank))
 
         # The Client.log_event hop: encode, pack, unpack -- and keep the DECODED entry, i.e. what the host receives.
-        entry = msgpack.unpackb(msgpack.packb(menu.as_payload()), raw=False)
+        entry = msgpack.unpackb(msgpack.packb(aggregates.as_payload()), raw=False)
         assert isinstance(entry["values"]["mean"], dict) and "dict" in entry["values"]["mean"], (
             "a dict partial must travel as a mapping, never as a flattened list the mean/moment algebra "
             "would concatenate"
         )
         received.append(entry)
 
-        rebuilt = EagerMenu.from_payload(entry)
+        rebuilt = EagerAggregates.from_payload(entry)
         assert rebuilt.array_name == ARRAY_NAME
-        assert set(rebuilt.values) == set(menu.values)
-        for op_name, value in menu.values.items():
-            _assert_same_menu_value(value, rebuilt.values[op_name])
+        assert set(rebuilt.values) == set(aggregates.values)
+        for op_name, value in aggregates.values.items():
+            _assert_same_aggregate_value(value, rebuilt.values[op_name])
         assert np.asarray(rebuilt.values["sum"]).dtype == np.float32, "a float32 scalar must stay float32"
         assert (rebuilt.timestep, rebuilt.rank, rebuilt.chunk_position) == (0, rank, chunk_position(rank))
 
@@ -1173,14 +1182,14 @@ def test_menu_round_trip_preserves_keys_values_dtypes_and_stamps(fleets, client,
 
     assert len(seen) == 1
     assert seen[0] == pytest.approx(fleets.fields[0].sum(), rel=1e-5, abs=1e-4)
-    assert fleets.rounds(0) == [], "a menu-served fold must not dispatch an on-demand request"
+    assert fleets.rounds(0) == [], "an aggregates-served fold must not dispatch an on-demand request"
 
 
 # ---------------------------------------------------------------------------------------------------------------------
 # ``Bridge.send`` <-> the on-demand transport (K5F-18). Two lines inside one ``if`` in ``send()`` are the ONLY link
 # between the plan transport and the simulation loop: the ``PlanPump.serve`` boundary call and the
 # ``DeliveryState.last_chunk`` retention. Before this pin, deleting either one left this file at 21 passed -- ``std``,
-# every axis reduction and every menu miss could be disconnected from the run with a green suite.
+# every axis reduction and every aggregates miss could be disconnected from the run with a green suite.
 # ---------------------------------------------------------------------------------------------------------------------
 class _RecordingReportQueue:
     """The array's plan report queue, recording what the bridge posts instead of handing it to the host."""

@@ -308,7 +308,7 @@ def test_direct_reduction_plan(op_name, kind, finalize) -> None:
         # Bare full reduction: no discriminator, the stable key every existing deployment groups by.
         pytest.param("result = arr.sum()\nresult.compute()", "f-sum", (), id="full"),
         # A full reduction of a DERIVED operand gets the ``-axisall`` discriminator, so it can never be confused with
-        # the bare array's fold (which the eager menu would answer).
+        # the bare array's fold (which the eager aggregates would answer).
         pytest.param("result = (arr ** 2).sum()\nresult.compute()", "f-sum-axisall", (), id="derived_full"),
         pytest.param("result = (arr * 2).sum(axis=0)\nresult.compute()", "f-sum-axis0", (0,), id="derived_axis"),
     ],
@@ -924,7 +924,7 @@ def test_each_callback_gets_its_own_collection() -> None:
     # stubbed registrations must carry one like a real one does.
     deisa._callbacks = {"cb-1": {"precompute": True}, "cb-2": {"precompute": True}}
 
-    views = deisa._ondemand_views("f", 3, {"menu": []})
+    views = deisa._ondemand_views("f", 3, {"aggregates": []})
 
     assert set(views) == {"cb-1", "cb-2"}
     assert views["cb-1"] is not views["cb-2"]

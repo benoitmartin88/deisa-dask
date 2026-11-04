@@ -37,7 +37,7 @@ Two delivery modes exist and each callback's ``precompute`` argument selects its
   :class:`~deisa.dask.deisa_array.OndemandDeisaArray` per (registered array, timestep). It IS a
   :class:`~deisa.dask.deisa_array.DeisaArray` (the public type the callback's signature names), but it carries no data
   -- its graph is empty by construction and its operator surface is the closed lazy one, so each ``.compute()``
-  dispatches a reduction plan to the bridges, which reduce their OWN chunk. The bridges' eager scalar menu and the
+  dispatches a reduction plan to the bridges, which reduce their OWN chunk. The bridges' eager scalar aggregates and the
   on-demand plan round both arrive through the topic event and the array transport attached to the delivery.
 - **legacy full-chunk scatter** (``precompute=False``): unchanged, and the remedy every refusal message points at: the
   chunk itself reaches the workers, so the callback gets a plain :class:`~deisa.dask.deisa_array.DeisaArray` over the
@@ -85,7 +85,7 @@ from deisa.dask.constants import (
 from deisa.dask.deisa_array import DeisaArray, OndemandDeisaArray
 from deisa.dask.handshake import Handshake
 from deisa.dask.ondemand_dispatch import (
-    EagerMenu,
+    EagerAggregates,
     PlanDispatcher,
     QueuePlanExchange,
     plan_report_queue_name,
@@ -144,7 +144,7 @@ class ArrayMode:
     questions, so they travel together.
 
     - ``:param ondemand:`` At least one ``precompute=True`` callback reads the array, i.e. the bridges must build its
-      eager scalar menu (and may skip the chunk once no legacy reader shares the array).
+      eager scalar aggregates (and may skip the chunk once no legacy reader shares the array).
     - ``:param legacy:`` At least one ``precompute=False`` callback reads the array, so the bridges must keep
       scattering its chunk -- decision F3's escape hatch.
     - ``:param latest_timestep:`` The newest timestep this host delivered for the array, or ``None`` before the first
@@ -198,16 +198,17 @@ class Deisa(IDeisa):
         self._execute_callbacks_called = False
         # array_name -> exchange callable of the on-demand reduction path (one request/reports round trip over the
         # array's sub-comm). Internal, never a user parameter: the delivery attaches the collection's compute boundary
-        # from here, and an array without an entry still serves its eager menu and refuses the rest.
+        # from here, and an array without an entry still serves its eager aggregates and refuses the rest.
         self._ondemand_transports: Dict[str, Callable[[Any], Any]] = {}
         # One record per array for BOTH delivery facts and the newest delivered timestep. A ``precompute=True``
         # callback files ``ondemand`` (declared to the bridges over the handshake by
-        # ``_flush_delivery_state_to_handshake``, because an eager scalar menu for an array no callback subscribes to is
-        # six chunk folds per bridge per timestep of pure critical-path cost); a ``precompute=False`` callback files
-        # ``legacy``, i.e. the array that still needs the LEGACY full-chunk scatter. An on-demand array WITHOUT a
-        # legacy reader needs no data shipped at all (its menu and its on-demand plans answer every callback), while
-        # one WITH a legacy reader must keep the chunk -- that is decision F3's escape hatch. Default-constructed on
-        # first touch: only registered arrays ever reach this table.
+        # ``_flush_delivery_state_to_handshake``, because eager scalar aggregates for an array no callback
+        # subscribes to are six chunk folds per bridge per timestep of pure critical-path cost); a
+        # ``precompute=False`` callback files ``legacy``, i.e. the array that still needs the LEGACY full-chunk
+        # scatter. An on-demand array WITHOUT a legacy reader needs no data shipped at all (its aggregates and its
+        # on-demand plans answer every callback), while one WITH a legacy reader must keep the chunk -- that is
+        # decision F3's escape hatch. Default-constructed on first touch: only registered arrays ever reach this
+        # table.
         self._arrays: Dict[str, ArrayMode] = defaultdict(ArrayMode)
         # First on-demand refusal a callback raised; ``execute_callbacks`` re-raises it so the run fails instead of
         # logging once per timestep. None while the run is healthy.
@@ -280,9 +281,9 @@ class Deisa(IDeisa):
 
                 Every callback is served by on-demand reduction delivery by default: the bridges reduce their own chunk
                 and the callback receives one data-free collection per array and timestep, whose reductions answer
-                from an eager scalar menu or an on-demand plan round. A callback that needs the whole field -- a raw
-                read, a reduction whose input is a derived expression the closed surface cannot express -- registers
-                with ``precompute=False`` and receives the legacy full-chunk scatter instead.
+                from eager scalar aggregates or an on-demand plan round. A callback that needs the whole field -- a
+                raw read, a reduction whose input is a derived expression the closed surface cannot express --
+                registers with ``precompute=False`` and receives the legacy full-chunk scatter instead.
 
                 Delivery state filing contract: registration declares its arrays as on-demand targets to the
                 handshake actor immediately (required: a bridge on the wait_for_go=False path fetches the state lazily
@@ -411,7 +412,7 @@ class Deisa(IDeisa):
             for array_name in array_names:
                 self._arrays[array_name].legacy = True
         else:
-            # These arrays are on-demand targets: the bridges need to know, because an eager scalar menu for an
+            # These arrays are on-demand targets: the bridges need to know, because an eager scalar aggregates for an
             # array no callback reads is six chunk folds per bridge per timestep of pure critical-path cost. Filed
             # with the handshake actor here and at the per-cycle boundary, like the rest of the delivery state.
             for array_name in array_names:
@@ -505,7 +506,7 @@ class Deisa(IDeisa):
         Two per-array facts travel to the bridges, over the ONE broadcast each of them already enters per array (see
         :meth:`deisa.dask.handshake.Handshake.get_task_state`):
 
-        - whether the array is an on-demand target, i.e. whether the eager scalar menu it computes has any
+        - whether the array is an on-demand target, i.e. whether the eager scalar aggregates it computes has any
           reader at all, and
         - whether the array still has a legacy (``precompute=False``) reader, i.e. whether its chunk must be scattered
           even though an on-demand callback on it needs no data.
@@ -613,9 +614,10 @@ class Deisa(IDeisa):
                 # filing branches it is empty by construction.
                 ondemand_views: Dict[Any, Any] = {}
                 if _weak_self._has_ondemand_callbacks(array_name):
-                    # The bridges' eager menu is the zero-round-trip half of the reduction path, so its failure is the
-                    # RUN's failure: recorded once per event, before any collection is built on top of it.
-                    _weak_self._record_menu_failure(payload)
+                    # The bridges' eager aggregates are the zero-round-trip half of the reduction path, so their
+                    # failure is the RUN's failure: recorded once per event, before any collection is built on
+                    # top of it.
+                    _weak_self._record_aggregates_failure(payload)
                     ondemand_views = _weak_self._ondemand_views(array_name, iteration, payload)
 
                 full_chunk_darr: List[Any] = []
@@ -679,30 +681,31 @@ class Deisa(IDeisa):
 
         return topic_handler
 
-    def _record_menu_failure(self, payload: Mapping[str, Any]) -> None:
-        """Record a bridge's eager-menu failure as the RUN failure, so the cycle boundary raises it.
+    def _record_aggregates_failure(self, payload: Mapping[str, Any]) -> None:
+        """Record a bridge's eager-aggregates failure as the RUN failure, so the cycle boundary raises it.
 
-        A menu entry that cannot fold a chunk (an empty chunk is enough: ``np.min`` of it raises) used to escape
-        ``Bridge.send()`` as an uncaught error and break the simulation's send loop. The bridge now ships the failure
-        with the event and keeps the legacy scatter going, and the run fails HERE -- at the boundary the caller already
-        blocks on -- rather than degrading into a silently menu-less delivery that looks healthy for the whole run.
+        An aggregates entry that cannot fold a chunk (an empty chunk is enough: ``np.min`` of it raises) used to
+        escape ``Bridge.send()`` as an uncaught error and break the simulation's send loop. The bridge now ships the
+        failure with the event and keeps the legacy scatter going, and the run fails HERE -- at the boundary the
+        caller already blocks on -- rather than degrading into a silently aggregates-less delivery that looks
+        healthy for the whole run.
 
-        - ``:param payload:`` The topic event; its ``menu_error`` entry is absent unless a bridge failed to build its
-          menu for this timestep.
+        - ``:param payload:`` The topic event; its ``aggregates_error`` entry is absent unless a bridge failed to
+          build its aggregates for this timestep.
         """
-        detail = payload.get("menu_error")
+        detail = payload.get("aggregates_error")
         if not detail:
             return
-        failure = ondemand_errors.ondemand_invariant("the bridge eager menu", str(detail))
+        failure = ondemand_errors.ondemand_invariant("the bridge eager aggregates", str(detail))
         if getattr(self, "_run_failure", None) is None:
             self._run_failure = failure
-        logger.error(f"the bridge eager menu failed for array {payload.get('array_name')!r}: {detail}")
+        logger.error(f"the bridge eager aggregates failed for array {payload.get('array_name')!r}: {detail}")
 
     def _has_ondemand_callbacks(self, array_name: str) -> bool:
         """Whether ANY callback registered on ``array_name`` is served by on-demand delivery.
 
         The topic handler reads this once per event: with no on-demand callback there is nobody to hand a collection
-        to, so the event carries no menu worth recording and no view worth building.
+        to, so the event carries no aggregates worth recording and no view worth building.
 
         - ``:param array_name:`` Registered array the topic event is for.
         """
@@ -715,7 +718,7 @@ class Deisa(IDeisa):
 
         - ``:param array_name:`` Registered array the topic event is for.
         - ``:param iteration:`` Timestep the event delivered.
-        - ``:param payload:`` The topic event, read for the bridges' eager menus and for a menu failure.
+        - ``:param payload:`` The topic event, read for the bridges' eager aggregates and for an aggregates failure.
 
         One instance per callback, not one per (array, timestep): an operand is mutable metadata (``name``,
         ``timestep``, ``chunk_shape`` ... are plain attributes), so a callback that writes an attribute -- by accident
@@ -731,29 +734,31 @@ class Deisa(IDeisa):
         be a delivery nobody consumes.
         """
         self._arrays[array_name].latest_timestep = int(iteration)
-        menus = None if payload.get("menu_error") else payload.get("menu")
+        aggregates = None if payload.get("aggregates_error") else payload.get("aggregates")
         return {
-            callback_id: self._ondemand_array(array_name, iteration, menus)
+            callback_id: self._ondemand_array(array_name, iteration, aggregates)
             for callback_id in list(self._callbacks_by_array.get(array_name, ()))
             if self._callbacks.get(callback_id, {}).get("precompute", True)
         }
 
-    def _ondemand_array(self, array_name: str, iteration: int, menus: Any = None) -> OndemandDeisaArray:
+    def _ondemand_array(self, array_name: str, iteration: int, aggregates: Any = None) -> OndemandDeisaArray:
         """Build the operand a callback receives for ``array_name`` at ``iteration``.
 
-        The compute boundary is attached here and nowhere else. It carries the bridges' eager menu, so a scalar full
-        fold costs no round trip, and the array's transport, so anything else can dispatch on demand. Without a
-        transport the menu still serves, and a menu miss refuses with the no-transport refusal -- never a gather.
+        The compute boundary is attached here and nowhere else. It carries the bridges' eager aggregates, so a
+        scalar full fold costs no round trip, and the array's transport, so anything else can dispatch on demand.
+        Without a transport the aggregates still serve, and an aggregates miss refuses with the no-transport
+        refusal -- never a gather.
 
         - ``:param array_name:`` Registered array the operand describes.
         - ``:param iteration:`` Timestep the operand is delivered for.
-        - ``:param menus:`` The eager menu entries the bridges shipped with this event (one per bridge), if any.
+        - ``:param aggregates:`` The eager aggregates entries the bridges shipped with this event (one per bridge),
+          if any.
         """
         metadata = self.arrays_metadata.get(array_name, {})
         dispatcher = PlanDispatcher(
             self._ondemand_transports.get(array_name),
             bridge_count=_grid_size_from_metadata(metadata),
-            menu=_as_eager_menus(menus),
+            aggregates=_as_eager_aggregates(aggregates),
             latest_timestep=lambda: self._arrays[array_name].latest_timestep,
         )
         return OndemandDeisaArray.from_metadata(array_name, iteration, metadata, dispatcher=dispatcher)
@@ -971,18 +976,19 @@ class Deisa(IDeisa):
         return f"{when}|" + "|".join(sorted(arrays))
 
 
-def _as_eager_menus(menus: Any) -> List[EagerMenu]:
-    """Normalize the topic event's menu entries into :class:`EagerMenu` objects.
+def _as_eager_aggregates(aggregates: Any) -> List[EagerAggregates]:
+    """Normalize the topic event's aggregates entries into :class:`EagerAggregates` objects.
 
-    The bridges ship ``EagerMenu`` instances encoded as msgpack-safe mappings (``EagerMenu.as_payload``), because the
-    topic event bus is ``Client.log_event``; a transport is free to hand over live objects instead, so both shapes are
-    accepted here instead of at every call site.
+    The bridges ship ``EagerAggregates`` instances encoded as msgpack-safe mappings
+    (``EagerAggregates.as_payload``), because the topic event bus is ``Client.log_event``; a transport is free to
+    hand over live objects instead, so both shapes are accepted here instead of at every call site.
 
-    - ``:param menus:`` The event's ``menu`` entry: ``None``, or a sequence of ``EagerMenu``/mapping entries.
+    - ``:param aggregates:`` The event's ``aggregates`` entry: ``None``, or a sequence of
+      ``EagerAggregates``/mapping entries.
     """
-    normalized: List[EagerMenu] = []
-    for entry in menus or ():
-        normalized.append(entry if isinstance(entry, EagerMenu) else EagerMenu.from_payload(dict(entry)))
+    normalized: List[EagerAggregates] = []
+    for entry in aggregates or ():
+        normalized.append(entry if isinstance(entry, EagerAggregates) else EagerAggregates.from_payload(dict(entry)))
     return normalized
 
 

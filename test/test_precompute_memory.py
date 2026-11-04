@@ -3,7 +3,7 @@
 #
 # Goal: prove that a callback that reduces the delivered operand never makes the
 # FULL array chunk land on a dask worker. Only the small per-bridge payload (a
-# scalar from the eager menu, or a chunk-local partial from an on-demand plan)
+# scalar from the eager aggregates, or a chunk-local partial from an on-demand plan)
 # should appear in worker memory.
 #
 # This file used to measure the AST precompute path: the analyzer planned the
@@ -11,7 +11,7 @@
 # event, and the test asserted that the worker store held only ~8-byte scalars.
 # The on-demand path plans nothing from the source -- the callback receives a
 # lazily-reducible ``OndemandDeisaArray`` and its reductions either read the eager
-# menu shipped with the delivery or dispatch an on-demand plan -- so the SAME
+# aggregates shipped with the delivery or dispatch an on-demand plan -- so the SAME
 # callback bodies are measured here against the on-demand delivery. What changes
 # is what the callback is handed (a collection describing the WHOLE array, not a
 # ``(n_bridges,)`` stack of partials), which is why the shape assertions below
@@ -175,11 +175,11 @@ class TestOndemandReductionMemory:
     def test_ondemand_worker_only_sees_partials(self, env_setup_2workers, op):
         """A ``arr.<op>().compute()`` callback leaves only chunk-local payloads on the workers (~8-16 bytes).
 
-        The full chunk (~32 MB) must NOT appear. Parametrized over the EAGER-MENU reductions (``sum`` / ``mean`` /
-        ``var``): the menu is the zero-round-trip half of the on-demand delivery, so one send is enough to answer a full
-        reduction. ``std`` and every AXIS reduction are NOT menu entries -- they take the on-demand path, whose answer
-        arrives at the NEXT send boundary -- so their payloads are measured directly (no cluster sample can see them
-        in a one-send run) by ``test_on_demand_payloads_are_chunk_local`` below.
+        The full chunk (~32 MB) must NOT appear. Parametrized over the EAGER-AGGREGATES reductions (``sum`` / ``mean``
+        / ``var``): the aggregates are the zero-round-trip half of the on-demand delivery, so one send is enough to
+        answer a full reduction. ``std`` and every AXIS reduction are NOT aggregates entries -- they take the
+        on-demand path, whose answer arrives at the NEXT send boundary -- so their payloads are measured directly (no
+        cluster sample can see them in a one-send run) by ``test_on_demand_payloads_are_chunk_local`` below.
 
         The callback result is asserted against the true global value computed from the same data ``generate_data``
         returned (a loose ``x >= 0.0`` predicate would accept a buggy ``0.0`` result).
@@ -414,11 +414,11 @@ class TestOndemandReductionMemory:
     def test_same_op_two_axes_have_distinct_keys_and_chunk_local_payloads(self):
         """``arr.sum()`` and ``arr.sum(axis=0)`` carry DIFFERENT keys and different chunk-local partials.
 
-        The e2e half of this test cannot run in a one-send harness: an AXIS reduction is not an eager-menu entry, so it
-        takes the on-demand path, whose answer the bridge serves at the NEXT send boundary (``send`` ->
-        ``PlanPump.serve``; the two-send transport behaviour is pinned in ``test_ondemand_transport.py``). What the
-        memory invariant needs -- the SIZE of what crosses -- is fully determined by the composed request, so it is
-        measured here without a cluster.
+        The e2e half of this test cannot run in a one-send harness: an AXIS reduction is not an
+        eager-aggregates entry, so it takes the on-demand path, whose answer the bridge serves at the NEXT send
+        boundary (``send`` -> ``PlanPump.serve``; the two-send transport behaviour is pinned in
+        ``test_ondemand_transport.py``). What the memory invariant needs -- the SIZE of what crosses -- is fully
+        determined by the composed request, so it is measured here without a cluster.
 
         Two attempts that shared a key would collapse in the bridge's output-key index and one reduction would answer
         with the other's partial.
@@ -512,9 +512,9 @@ class TestOndemandReductionMemory:
         assert "raw data" in str(refusal.value)
 
     def test_on_demand_payloads_are_chunk_local(self):
-        """``std`` and the AXIS reductions are NOT menu entries: they ship a chunk-local partial, never the chunk.
+        """``std`` and the AXIS reductions are NOT aggregates entries: they ship a chunk-local partial, never the chunk.
 
-        The eager menu covers :data:`EAGER_MENU_OPS` (full folds only), so ``arr.std()`` and every
+        The eager aggregates cover :data:`EAGER_AGGREGATES_OPS` (full folds only), so ``arr.std()`` and every
         ``arr.<op>(axis=...)`` take the on-demand path. The bridge answers those at the NEXT send boundary (``send`` ->
         ``PlanPump.serve``), so a one-send worker-store sample cannot observe them; the payload is fully
         determined by the composed request, and it is measured here:
@@ -525,7 +525,7 @@ class TestOndemandReductionMemory:
 
         Everything that crosses is therefore under the 64 KB budget, and the chunk is never of them.
         """
-        from deisa.dask.ondemand_dispatch import EAGER_MENU_OPS
+        from deisa.dask.ondemand_dispatch import EAGER_AGGREGATES_OPS
 
         chunk_shape = (2048, 2048)
         chunk_bytes = int(np.prod(chunk_shape) * 8)
@@ -533,10 +533,10 @@ class TestOndemandReductionMemory:
             "temperature", 1, {"global_shape": (chunk_shape[0] * 2, chunk_shape[1]), "chunk_shape": chunk_shape}
         )
 
-        # The menu is full folds only -- this is WHY std/axis need the on-demand path (and why the one-send harness
-        # cannot sample them).
-        assert set(EAGER_MENU_OPS) == {"sum", "min", "max", "mean", "var", "prod"}
-        assert "std" not in EAGER_MENU_OPS
+        # The aggregates are full folds only -- this is WHY std/axis need the on-demand path (and why the one-send
+        # harness cannot sample them).
+        assert set(EAGER_AGGREGATES_OPS) == {"sum", "min", "max", "mean", "var", "prod"}
+        assert "std" not in EAGER_AGGREGATES_OPS
 
         for expression, expected_shape in (
             (collection.std(), (1, 1)),

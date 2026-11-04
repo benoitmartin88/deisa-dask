@@ -48,11 +48,11 @@ from deisa.dask.branch import _combine_two_phase
 from deisa.dask.deisa_array import OndemandDeisaArray
 from deisa.dask.ondemand_compose import compose_request
 from deisa.dask.ondemand_dispatch import (
-    EAGER_MENU_OPS,
+    EAGER_AGGREGATES_OPS,
     PlanDispatcher,
     PlanRequest,
     PlanResponder,
-    build_eager_menu,
+    build_eager_aggregates,
     dispatch_plan_over_comm,
     merge_partials,
     serve_plan_requests,
@@ -158,12 +158,12 @@ def make_collection(bridge, dispatcher=None, timestep=None):
     )
 
 
-def dispatched(bridge, exchange=None, menu=None):
+def dispatched(bridge, exchange=None, aggregates=None):
     """A collection whose reductions dispatch over the fleet (the state the delivery path will hand a callback)."""
     dispatcher = PlanDispatcher(
         exchange if exchange is not None else bridge.exchange,
         bridge_count=len(bridge.chunks),
-        menu=menu,
+        aggregates=aggregates,
     )
     return make_collection(bridge, dispatcher=dispatcher)
 
@@ -469,18 +469,18 @@ class TestPickleContract:
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Eager menu (the zero-round-trip half of the transfer strategy)
+# Eager aggregates (the zero-round-trip half of the transfer strategy)
 # ---------------------------------------------------------------------------------------------------------------------
-class TestEagerMenu:
-    def build_menus(self, bridges):
+class TestEagerAggregates:
+    def build_aggregates(self, bridges):
         collection = make_collection(bridges)
         return [
-            build_eager_menu(collection, chunk, rank=rank, chunk_position=chunk_position(rank))
+            build_eager_aggregates(collection, chunk, rank=rank, chunk_position=chunk_position(rank))
             for rank, chunk in enumerate(bridges.chunks)
         ]
 
-    def test_menu_covers_exactly_the_scalar_full_folds(self):
-        assert EAGER_MENU_OPS == ("sum", "min", "max", "mean", "var", "prod")
+    def test_aggregates_covers_exactly_the_scalar_full_folds(self):
+        assert EAGER_AGGREGATES_OPS == ("sum", "min", "max", "mean", "var", "prod")
 
     @pytest.mark.parametrize(
         "builder,expected",
@@ -493,38 +493,38 @@ class TestEagerMenu:
             pytest.param(lambda c: c.prod(), lambda d: np.prod(d), id="prod"),
         ],
     )
-    def test_menu_values_merge_without_a_round_trip(self, fleet, builder, expected):
+    def test_aggregates_values_merge_without_a_round_trip(self, fleet, builder, expected):
         data, bridges = fleet
 
         def never_called(plan):  # pragma: no cover - reaching this is the failure
-            raise AssertionError("an eager menu value must not need a round trip")
+            raise AssertionError("an eager aggregate value must not need a round trip")
 
-        collection = dispatched(bridges, exchange=never_called, menu=self.build_menus(bridges))
+        collection = dispatched(bridges, exchange=never_called, aggregates=self.build_aggregates(bridges))
         value = builder(collection).compute()
         assert np.allclose(np.asarray(value, dtype=float), np.asarray(expected(data), dtype=float))
         assert bridges.rounds == []
 
-    def test_on_demand_serves_what_the_menu_does_not(self, fleet):
+    def test_on_demand_serves_what_the_aggregates_does_not(self, fleet):
         data, bridges = fleet
-        collection = dispatched(bridges, menu=self.build_menus(bridges))
+        collection = dispatched(bridges, aggregates=self.build_aggregates(bridges))
         assert np.allclose(collection.sum(axis=0).compute(), np.sum(data, axis=0))
         assert np.isclose(collection.std().compute(), np.std(data))
         assert len(bridges.rounds) == 2
 
-    def test_a_menu_value_is_the_partial_the_on_demand_path_returns(self, fleet):
+    def test_a_aggregates_value_is_the_partial_the_on_demand_path_returns(self, fleet):
         _, bridges = fleet
-        menus = self.build_menus(bridges)
+        aggregates = self.build_aggregates(bridges)
         collection = dispatched(bridges)
         collection.sum().compute()
         _, reports = bridges.rounds[-1]
-        for menu, report in zip(menus, reports):
-            assert np.allclose(np.asarray(menu.values["sum"]), np.asarray(report.partial))
+        for aggregates, report in zip(aggregates, reports):
+            assert np.allclose(np.asarray(aggregates.values["sum"]), np.asarray(report.partial))
 
-    def test_a_menu_of_another_timestep_is_not_used(self, fleet):
-        """The menu lookup is keyed by timestep, so a stale menu cannot answer a newer timestep."""
+    def test_a_aggregates_of_another_timestep_is_not_used(self, fleet):
+        """The aggregates lookup is keyed by timestep, so a stale aggregates cannot answer a newer timestep."""
         data, bridges = fleet
-        menus = self.build_menus(bridges)
-        collection = dispatched(bridges, menu=menus)  # bridge timestep is 0
+        aggregates = self.build_aggregates(bridges)
+        collection = dispatched(bridges, aggregates=aggregates)  # bridge timestep is 0
         later = make_collection(bridges, dispatcher=collection.dispatcher, timestep=bridges.timestep + 1)
         with pytest.raises(errors.PrecomputeRuntimeError):
             later.sum().compute()

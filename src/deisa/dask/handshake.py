@@ -54,12 +54,12 @@ class Handshake:
             self.feedback_queue_size = 1024
             self.timestep: Optional[int] = None
             # Arrays the analytics host delivers to at least one on-demand callback. The bridge reads this to
-            # decide whether its eager scalar menu has a reader at all: a menu for an array nobody subscribes to is
-            # six chunk folds per bridge per timestep of pure critical-path cost.
+            # decide whether its eager scalar aggregates have a reader at all: aggregates for an array nobody
+            # subscribes to are six chunk folds per bridge per timestep of pure critical-path cost.
             self.ondemand_arrays = set()
             # Arrays with at least one LEGACY (``precompute=False``) reader, i.e. a callback that reads the chunk
             # itself. The bridge reads this to decide whether it must scatter the chunk at all: an on-demand
-            # array with no such reader is answered entirely by its menu and its on-demand plans, so shipping the
+            # array with no such reader is answered entirely by its aggregates and its on-demand plans, so shipping the
             # chunk as well would send 32 MB per bridge per timestep for data nobody reads.
             self.legacy_arrays = set()
 

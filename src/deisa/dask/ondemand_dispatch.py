@@ -68,17 +68,19 @@ is supported today; failing fast on the last one needs an end-of-run signal the 
 
 **Which window element may be reduced on demand.** The bridges retain ONE chunk per array -- the timestep they last
 sent -- so on-demand plans are served for the LATEST delivered timestep only. A callback's window keeps older
-collections alive (and their menu still answers ``sum``/``min``/``max``/``mean``/``prod``/``std`` on the bare array,
-because the menu travels with the delivery), but an on-demand reduction rooted in an older element is refused at
-compose time by :func:`~deisa.dask.ondemand_errors.stale_timestep`, with the remedy in the message. Serving the whole
-window on demand would need one retained chunk per window slot per bridge -- a v2 memory decision, not a v1 one.
+collections alive (and their aggregates still answer ``sum``/``min``/``max``/``mean``/``prod``/``std`` on the bare
+array, because the aggregates travel with the delivery), but an on-demand reduction rooted in an older element is
+refused at compose time by :func:`~deisa.dask.ondemand_errors.stale_timestep`, with the remedy in the message.
+Serving the whole window on demand would need one retained chunk per window slot per bridge -- a v2 memory
+decision, not a v1 one.
 
-:class:`EagerMenu` is the eager half of the transfer strategy: the six tiny scalar full folds a bridge computes once for
-its chunk, so the common scalar reduction costs no round trip. A menu value IS the payload an on-demand request for the
-same operation would return (same composed callable, same chunk) -- **for a reduction of the bare registered array**,
-which is the program the menu is built from. A derived operand (``(collection * 2).sum()``) needs partials computed
-from its own program, so it never reads the menu and always dispatches on demand; :class:`PlanDispatcher` gates the
-menu path on the operand program for exactly that reason.
+:class:`EagerAggregates` is the eager half of the transfer strategy: the six tiny scalar full folds a bridge computes
+once for its chunk, so the common scalar reduction costs no round trip. An aggregate value IS the payload an
+on-demand request for the same operation would return (same composed callable, same chunk) -- **for a reduction of
+the bare registered array**, which is the program the aggregates are built from. A derived operand
+(``(collection * 2).sum()``) needs partials computed from its own program, so it never reads the aggregates and
+always dispatches on demand; :class:`PlanDispatcher` gates the aggregates path on the operand program for exactly
+that reason.
 
 The same exchange carries the estimator-side PCA branch: :meth:`PlanDispatcher.compute_pca` dispatches a
 :class:`~deisa.dask.ondemand_compose.PCARequest`, whose per-bridge partial is a mergeable
@@ -103,17 +105,17 @@ from deisa.dask.ondemand_compose import OndemandRequest, PCARequest, compose_req
 from deisa.dask.ondemand_expr import _CHUNK_PROGRAM, KIND_BOOLEAN, KIND_COUNT, KIND_SCALAR
 
 __all__ = [
-    "EAGER_MENU_OPS",
-    "EagerMenu",
+    "EAGER_AGGREGATES_OPS",
+    "EagerAggregates",
     "PartialReport",
     "PlanDispatcher",
     "PlanRequest",
     "PlanRequestBacklog",
     "PlanResponder",
     "QueuePlanExchange",
-    "build_eager_menu",
+    "build_eager_aggregates",
     "dispatch_plan_over_comm",
-    "eager_menu_requests",
+    "eager_aggregates_requests",
     "merge_partials",
     "plan_report_queue_name",
     "plan_report_timeout",
@@ -140,9 +142,9 @@ _FOLD_KINDS = frozenset({KIND_SCALAR, KIND_BOOLEAN, KIND_COUNT})
 # The post-combine step the wire request may ask for (``sqrt`` for a standard deviation).
 _SQRT_FINALIZE = "sqrt"
 
-# The eager scalar menu: the full folds small enough that a bridge can compute them once per timestep and ship them
-# unprompted. ``mean``/``var`` travel as their dict partials, exactly as an on-demand request for them would.
-EAGER_MENU_OPS: Tuple[str, ...] = ("sum", "min", "max", "mean", "var", "prod")
+# The eager scalar aggregates: the full folds small enough that a bridge can compute them once per timestep and ship
+# them unprompted. ``mean``/``var`` travel as their dict partials, exactly as an on-demand request for them would.
+EAGER_AGGREGATES_OPS: Tuple[str, ...] = ("sum", "min", "max", "mean", "var", "prod")
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -193,16 +195,16 @@ class PartialReport:
 
 
 def _value_payload(value: Any) -> Dict[str, Any]:
-    """Encode ONE menu value as a msgpack-safe tree, keeping its dtype and shape.
+    """Encode ONE aggregate value as a msgpack-safe tree, keeping its dtype and shape.
 
     The topic event bus is ``distributed.Client.log_event``, which carries msgpack primitives only: it rejects the
-    dataclass, and it rejects a numpy scalar or array too. A menu value is either a numpy scalar or the
+    dataclass, and it rejects a numpy scalar or array too. A aggregate value is either a numpy scalar or the
     ``{n, total[, M]}`` partial of the mean/moment chunk stages, so each leaf travels as
     ``{"dtype": ..., "shape": ..., "data": ...}`` and :func:`_value_from_payload` rebuilds it EXACTLY -- widening a
     float32 partial to a Python float would change the dtype the merge reports, and a list-valued total would make the
     aggregation algebra concatenate instead of add.
 
-    - ``:param value:`` One menu value: a numpy scalar/array, or a mapping of them.
+    - ``:param value:`` One aggregate value: a numpy scalar/array, or a mapping of them.
     """
     if isinstance(value, Mapping):
         return {"dict": {str(key): _value_payload(item) for key, item in value.items()}}
@@ -213,7 +215,7 @@ def _value_payload(value: Any) -> Dict[str, Any]:
 def _value_from_payload(payload: Mapping[str, Any]) -> Any:
     """Rebuild the numpy value :func:`_value_payload` encoded, dtype and shape included.
 
-    - ``:param payload:`` One encoded menu value.
+    - ``:param payload:`` One encoded aggregate value.
     """
     if "dict" in payload:
         return {key: _value_from_payload(item) for key, item in payload["dict"].items()}
@@ -222,22 +224,22 @@ def _value_from_payload(payload: Mapping[str, Any]) -> Any:
 
 
 @dataclass(frozen=True)
-class EagerMenu:
-    """The eager scalar menu of ONE bridge for ONE timestep (the zero-round-trip half of the transfer strategy).
+class EagerAggregates:
+    """The eager scalar aggregates of ONE bridge for ONE timestep (the zero-round-trip half of the transfer strategy).
 
-    Every value is a full fold of the BARE registered array's chunk (the identity program), so the menu answers a
+    Every value is a full fold of the BARE registered array's chunk (the identity program), so the aggregates answer a
     reduction of the bare collection and nothing else: a reduction of a derived operand (``(c * 2).sum()``) must be
     dispatched, because its partials are folds of a different program.
 
-    The menu rides the topic event, whose bus is msgpack (``Client.log_event``), so a bridge ships
-    :meth:`as_payload` and the delivery rebuilds the menu with :meth:`from_payload`; the values a callback's reduction
-    merges are then the objects this bridge computed, not a lossy rendering of them.
+    The aggregates ride the topic event, whose bus is msgpack (``Client.log_event``), so a bridge ships
+    :meth:`as_payload` and the delivery rebuilds the aggregates with :meth:`from_payload`; the values a callback's
+    reduction merges are then the objects this bridge computed, not a lossy rendering of them.
 
-    - ``:param array_name:`` Registered array the menu was computed for.
+    - ``:param array_name:`` Registered array the aggregates were computed for.
     - ``:param timestep:`` Timestep the bridge's chunk belonged to.
     - ``:param rank:`` Rank of the bridge inside the array's communicator.
     - ``:param chunk_position:`` MPI coordinates of the bridge's chunk.
-    - ``:param values:`` ``op_name -> partial`` for every entry of :data:`EAGER_MENU_OPS`.
+    - ``:param values:`` ``op_name -> partial`` for every entry of :data:`EAGER_AGGREGATES_OPS`.
     """
 
     array_name: str
@@ -247,7 +249,7 @@ class EagerMenu:
     values: Mapping[str, Any]
 
     def as_payload(self) -> Dict[str, Any]:
-        """This menu as a msgpack-safe mapping, i.e. the shape it travels in on the topic event."""
+        """This aggregates as a msgpack-safe mapping, i.e. the shape it travels in on the topic event."""
         return {
             "array_name": self.array_name,
             "timestep": int(self.timestep),
@@ -257,8 +259,8 @@ class EagerMenu:
         }
 
     @classmethod
-    def from_payload(cls, payload: Mapping[str, Any]) -> "EagerMenu":
-        """Rebuild the menu a bridge encoded with :meth:`as_payload`.
+    def from_payload(cls, payload: Mapping[str, Any]) -> "EagerAggregates":
+        """Rebuild the aggregates a bridge encoded with :meth:`as_payload`.
 
         - ``:param payload:`` The decoded topic-event entry.
         """
@@ -372,18 +374,18 @@ class PlanResponder:
         )
 
 
-def build_eager_menu(
+def build_eager_aggregates(
     collection: Any,
     chunk: Any,
     rank: int = 0,
     chunk_position: Sequence[int] = (),
-) -> EagerMenu:
-    """Compute the eager scalar menu on this bridge's own chunk.
+) -> EagerAggregates:
+    """Compute the eager scalar aggregates on this bridge's own chunk.
 
-    The menu composes the SAME slim requests an on-demand call would (one per :data:`EAGER_MENU_OPS` entry, full folds
-    only) and runs them on the local chunk, so a menu value is byte-for-byte the partial the on-demand path returns and
-    the merge cannot tell the two apart. The failure contract is the fail-loud one: a menu entry that raises aborts the
-    menu instead of shipping a hole.
+    The aggregates compose the SAME slim requests an on-demand call would (one per :data:`EAGER_AGGREGATES_OPS`
+    entry, full folds only) and run them on the local chunk, so an aggregate value is byte-for-byte the partial the
+    on-demand path returns and the merge cannot tell the two apart. The failure contract is the fail-loud one: an
+    aggregates entry that raises aborts the aggregates instead of shipping a hole.
 
     - ``:param collection:`` The :class:`~deisa.dask.deisa_array.OndemandDeisaArray` describing this bridge's array.
     - ``:param chunk:`` The bridge's own numpy chunk.
@@ -391,14 +393,14 @@ def build_eager_menu(
     - ``:param chunk_position:`` MPI coordinates of this bridge's chunk.
     """
     values = {}
-    for op_name, request in zip(EAGER_MENU_OPS, eager_menu_requests(collection)):
+    for op_name, request in zip(EAGER_AGGREGATES_OPS, eager_aggregates_requests(collection)):
         try:
             values[op_name] = request.branch_func(chunk)
         except Exception as exc:
             raise errors.ondemand_invariant(
-                "build_eager_menu", f"the {op_name!r} menu entry failed on the local chunk: {exc!r}"
+                "build_eager_aggregates", f"the {op_name!r} aggregates entry failed on the local chunk: {exc!r}"
             ) from exc
-    return EagerMenu(
+    return EagerAggregates(
         array_name=collection.name,
         timestep=collection.timestep,
         rank=int(rank),
@@ -407,12 +409,12 @@ def build_eager_menu(
     )
 
 
-def eager_menu_requests(collection: Any) -> Tuple[OndemandRequest, ...]:
-    """The slim requests of the eager scalar menu, in :data:`EAGER_MENU_OPS` order.
+def eager_aggregates_requests(collection: Any) -> Tuple[OndemandRequest, ...]:
+    """The slim requests of the eager scalar aggregates, in :data:`EAGER_AGGREGATES_OPS` order.
 
-    - ``:param collection:`` The :class:`~deisa.dask.deisa_array.OndemandDeisaArray` to compose the menu for.
+    - ``:param collection:`` The :class:`~deisa.dask.deisa_array.OndemandDeisaArray` to compose the aggregates for.
     """
-    return tuple(compose_request(getattr(collection, op_name)()) for op_name in EAGER_MENU_OPS)
+    return tuple(compose_request(getattr(collection, op_name)()) for op_name in EAGER_AGGREGATES_OPS)
 
 
 def dispatch_plan_over_comm(comm: Any, plan: PlanRequest, responder: PlanResponder) -> List[PartialReport]:
@@ -742,20 +744,20 @@ def _finish(value: Any) -> Any:
 
 
 class PlanDispatcher:
-    """The analytics-host side of the compute boundary: compose, dispatch (or read the menu), match, merge.
+    """The analytics-host side of the compute boundary: compose, dispatch (or read the aggregates), match, merge.
 
     ``exchange`` is the only transport knob: it takes one :class:`PlanRequest` and returns the reports every bridge
     produced for it. Keeping it a callable means this class owns no communicator dialect -- the same dispatcher is
     driven over the array's sub-comm in production and over a test communicator in the suite. It may be ``None``: a
-    delivery that attaches the eager menu but no transport still serves every menu operation, and refuses the rest
-    with the no-transport refusal instead of gathering anything.
+    delivery that attaches the eager aggregates but no transport still serves every aggregates operation, and refuses
+    the rest with the no-transport refusal instead of gathering anything.
 
     - ``:param exchange:`` Callable performing one request/reports round trip, or ``None`` when the delivery has no
       bridge transport.
     - ``:param bridge_count:`` Number of bridges that own a chunk of the array, when known. A round that returns another
       number of reports is refused: a missing partial would silently shrink the merged value.
-    - ``:param menu:`` Optional eager menus already computed for the current timestep. A full fold of a menu operation
-      is merged from them without touching ``exchange``.
+    - ``:param aggregates:`` Optional eager aggregates already computed for the current timestep. A full fold of an
+      aggregates operation is merged from them without touching ``exchange``.
     - ``:param latest_timestep:`` Callable returning the newest timestep delivered for the root array, or ``None`` when
       the delivery does not track it. A collection keeps living in a callback's window after its timestep, but the
       bridges only retain ONE chunk per array (the one they last sent), so an on-demand reduction of an older window
@@ -768,15 +770,15 @@ class PlanDispatcher:
         self,
         exchange: Optional[Callable[[PlanRequest], Sequence[PartialReport]]] = None,
         bridge_count: Optional[int] = None,
-        menu: Optional[Sequence[EagerMenu]] = None,
+        aggregates: Optional[Sequence[EagerAggregates]] = None,
         latest_timestep: Optional[Callable[[], Optional[int]]] = None,
     ) -> None:
         self._exchange = exchange
         self._bridge_count = None if bridge_count is None else int(bridge_count)
         self._latest_timestep = latest_timestep
-        self._menus: Dict[Tuple[str, int], List[EagerMenu]] = {}
-        for eager in menu or ():
-            self._menus.setdefault((eager.array_name, int(eager.timestep)), []).append(eager)
+        self._aggregates: Dict[Tuple[str, int], List[EagerAggregates]] = {}
+        for eager in aggregates or ():
+            self._aggregates.setdefault((eager.array_name, int(eager.timestep)), []).append(eager)
 
     def compute(self, reduction: Any) -> Any:
         """Deliver the concrete value of ``reduction``.
@@ -785,23 +787,24 @@ class PlanDispatcher:
         """
         request = compose_request(reduction)
         ndim = reduction.operand.ndim
-        menus = self._menus.get((request.input_name, reduction.root.timestep))
-        # The menu holds the BARE registered array's partials (``build_eager_menu`` composes the identity program), so
-        # it may only answer a reduction whose operand IS the bare chunk program. A derived operand (``(c * 2).sum()``)
-        # needs its own partials computed from the derived program: answering it from the menu would silently return
-        # the un-derived field's value, with no round trip and no exception.
+        aggregates = self._aggregates.get((request.input_name, reduction.root.timestep))
+        # The aggregates hold the BARE registered array's partials (``build_eager_aggregates`` composes the identity
+        # program), so they may only answer a reduction whose operand IS the bare chunk program. A derived operand
+        # (``(c * 2).sum()``) needs its own partials computed from the derived program: answering it from the
+        # aggregates would silently return the un-derived field's value, with no round trip and no exception.
         if (
-            menus
+            aggregates
             and not request.axes
             and reduction.operand.program == _CHUNK_PROGRAM
-            and all(reduction.op_name in eager.values for eager in menus)
+            and all(reduction.op_name in eager.values for eager in aggregates)
         ):
-            reports = self._menu_reports(menus, reduction.op_name)
+            reports = self._aggregates_reports(aggregates, reduction.op_name)
             if self._bridge_count is not None and len(reports) != self._bridge_count:
                 raise errors.ondemand_invariant(
                     "PlanDispatcher",
-                    f"the eager menu of array {request.input_name!r} at timestep {reduction.root.timestep} covers "
-                    f"{len(reports)} bridge(s) but the array has {self._bridge_count}",
+                    f"the eager aggregates of array {request.input_name!r} at timestep "
+                    f"{reduction.root.timestep} cover {len(reports)} bridge(s) but the array has "
+                    f"{self._bridge_count}",
                 )
         else:
             self._refuse_stale(reduction, request)
@@ -859,8 +862,8 @@ class PlanDispatcher:
     def _refuse_stale(self, reduction: Any, request: Any) -> None:
         """Refuse an on-demand reduction whose operand is older than the newest delivered timestep.
 
-        Only the on-demand path is guarded: the menu path is decided before this call and is served from the menus
-        shipped WITH the delivery, so it stays valid for every element of a callback's window.
+        Only the on-demand path is guarded: the aggregates path is decided before this call and is served from the
+        aggregates shipped WITH the delivery, so it stays valid for every element of a callback's window.
 
         - ``:param reduction:`` The :class:`~deisa.dask.ondemand_expr.ReductionExpr` being computed.
         - ``:param request:`` Its composed wire request (read for the root array's name).
@@ -896,22 +899,22 @@ class PlanDispatcher:
             )
         return _validate_reports(plan, self._exchange(plan), expected=self._bridge_count)
 
-    def _menu_reports(self, menus: Sequence[EagerMenu], op_name: str) -> List[PartialReport]:
-        """Turn every bridge's ``op_name`` menu value into the report the on-demand path would have produced.
+    def _aggregates_reports(self, aggregates: Sequence[EagerAggregates], op_name: str) -> List[PartialReport]:
+        """Turn every bridge's ``op_name`` aggregate value into the report the on-demand path would have produced.
 
         No exchange happens: the values were computed on the bridges' own chunks and handed over with the timestep, so
-        the staleness question is settled by the lookup that found these menus.
+        the staleness question is settled by the lookup that found these aggregates.
 
-        - ``:param menus:`` The eager menus of ONE array at ONE timestep (one per bridge).
-        - ``:param op_name:`` The menu operation the reduction asks for.
+        - ``:param aggregates:`` The eager aggregates of ONE array at ONE timestep (one per bridge).
+        - ``:param op_name:`` The aggregates operation the reduction asks for.
         """
         reports = []
-        for eager in menus:
+        for eager in aggregates:
             partial = eager.values[op_name]
             shape, dtype = _partial_shape_dtype(partial)
             reports.append(
                 PartialReport(
-                    request_id=EAGER_MENU_REQUEST_ID,
+                    request_id=EAGER_AGGREGATES_REQUEST_ID,
                     array_name=eager.array_name,
                     timestep=int(eager.timestep),
                     rank=eager.rank,
@@ -924,6 +927,6 @@ class PlanDispatcher:
         return reports
 
 
-# The synthetic request id every eager-menu value is reported under: a menu value answers the operation, not a request
-# id, so it is deliberately not a uuid and can never collide with a dispatched request.
-EAGER_MENU_REQUEST_ID = "eager-menu"
+# The synthetic request id every eager-aggregates value is reported under: an aggregate value answers the operation,
+# not a request id, so it is deliberately not a uuid and can never collide with a dispatched request.
+EAGER_AGGREGATES_REQUEST_ID = "eager-aggregates"

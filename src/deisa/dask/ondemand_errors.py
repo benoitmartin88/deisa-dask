@@ -311,8 +311,9 @@ def no_dispatch_transport(symbol: str) -> PrecomputeRuntimeError:
 
 
 _STALE_TIMESTEP_REMEDY = (
-    "reduce window[-1] (the latest delivered timestep), or use a menu operation -- sum, min, max, mean, prod or std on "
-    "the bare array -- which is served from the menu shipped with the delivery and works on any element of the window."
+    "reduce window[-1] (the latest delivered timestep), or use an aggregates operation -- sum, min, max, mean, prod "
+    "or std on the bare array -- which is served from the aggregates shipped with the delivery and works on any "
+    "element of the window."
 )
 
 
@@ -321,8 +322,8 @@ def stale_timestep(symbol: str, *, array_name: str, requested: int, latest: int)
 
     The on-demand path answers from the chunk a bridge LAST SENT (one retained chunk per array per bridge), so a plan
     stamped with an older timestep has no chunk to fold and the bridge can only answer with an error. Refusing at
-    compose time keeps that out of the run: the same expression on ``window[-1]`` is served, and every menu operation
-    is still answered for any retained window element, because the menu travels with the delivery.
+    compose time keeps that out of the run: the same expression on ``window[-1]`` is served, and every aggregates
+    operation is still answered for any retained window element, because the aggregates travel with the delivery.
     """
     return UnsupportedReductionError(
         f"{symbol} reduces array {array_name!r} at timestep {requested}, but the newest timestep delivered for that "

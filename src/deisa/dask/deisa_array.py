@@ -499,8 +499,8 @@ class OndemandDeisaArray(LazyOperand, DeisaArray):
     ) -> "OndemandDeisaArray":
         """Build the operand from the array metadata the handshake already exposes.
 
-        The delivery site (the topic handler, the bridge's menu step) has the metadata dict, not a shape: reading it
-        here keeps the key spelling in one place instead of at every call site.
+        The delivery site (the topic handler, the bridge's aggregates step) has the metadata dict, not a shape:
+        reading it here keeps the key spelling in one place instead of at every call site.
 
         - ``:param name:`` Registered array name.
         - ``:param timestep:`` Timestep the operand is delivered for.

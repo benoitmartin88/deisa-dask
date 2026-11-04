@@ -30,17 +30,18 @@
 
 Two delivery modes coexist on this side, and only the analytics host decides which one a callback gets:
 
-- the on-demand reduction path (the delivery mode of ``precompute=True``): ``send`` ships an eager scalar menu per
-  timestep and answers on-demand plan requests at its ``send`` boundary. When no callback on the array reads the
-  chunk itself, ``send`` ships NO data at all -- the menu is the whole payload and the chunk is only retained for
-  on-demand plans;
+- the on-demand reduction path (the delivery mode of ``precompute=True``): ``send`` ships an eager scalar
+  aggregates per timestep and answers on-demand plan requests at its ``send`` boundary. When no callback on the
+  array reads the chunk itself, ``send`` ships NO data at all -- the aggregates are the whole payload and the
+  chunk is only retained for on-demand plans;
 - the LEGACY full-chunk scatter path (``precompute=False``): ``send`` ships the chunk itself, unchanged.
 
-**The eager menu is the only fold site.** ``_build_ondemand_menu`` is where a bridge computes a reduction, and it sits
-after the reduce step and before the first scatter so the chunk never travels to convey a menu value. Nothing on the
-delivery path executes a user callable any more: the branch machinery that used to duplicate the menu's folds
-(``_execute_operations_on_chunk``, ``_scatter_partials``) is gone, and a callback's arbitrary reductions arrive as
-on-demand plan requests answered at the next ``send`` boundary by :class:`~deisa.dask.ondemand_dispatch.PlanResponder`.
+**The eager aggregates are the only fold site.** ``_build_ondemand_aggregates`` is where a bridge computes a
+reduction, and it sits after the reduce step and before the first scatter, so the chunk never travels to convey
+an aggregate value. Nothing on the delivery path executes a user callable any more: the branch machinery that
+used to duplicate the aggregates' folds (``_execute_operations_on_chunk``, ``_scatter_partials``) is gone, and a
+callback's arbitrary reductions arrive as on-demand plan requests answered at the next ``send`` boundary by
+:class:`~deisa.dask.ondemand_dispatch.PlanResponder`.
 """
 
 import asyncio
@@ -65,10 +66,10 @@ from deisa.dask.constants import CLIENT_KEY, FEEDBACK_QUEUE_PREFIX, KEY_PREFIX, 
 from deisa.dask.deisa_array import OndemandDeisaArray
 from deisa.dask.handshake import Handshake
 from deisa.dask.ondemand_dispatch import (
-    EagerMenu,
+    EagerAggregates,
     PlanRequestBacklog,
     PlanResponder,
-    build_eager_menu,
+    build_eager_aggregates,
     plan_report_queue_name,
     plan_request_queue_name,
 )
@@ -95,7 +96,7 @@ class DeliveryState:
     set.
 
     - ``:param ondemand:`` The host declared a ``precompute=True`` callback on the array, i.e. the array is an
-      on-demand target: its eager menu and its on-demand plans answer its callbacks.
+      on-demand target: its eager aggregates and its on-demand plans answer its callbacks.
     - ``:param legacy:`` The host declared a ``precompute=False`` callback on the array, i.e. something reads the chunk
       itself.
     - ``:param fetched:`` Whether ``ondemand``/``legacy`` have been read out of the handshake actor yet -- THE fetch
@@ -501,8 +502,8 @@ class Bridge(IBridge):
         and updates the scheduler directly.
 
         The delivery is dispatched to ONE of three regimes, chosen from the array's own delivery state right
-        after the boundary: ``_send_data_free`` (an on-demand target nothing reads the data of: the eager menu
-        is the whole payload), ``_send_ondemand`` (an on-demand target that still has a chunk reader: menu AND
+        after the boundary: ``_send_data_free`` (an on-demand target nothing reads the data of: the eager aggregates
+        is the whole payload), ``_send_ondemand`` (an on-demand target that still has a chunk reader: aggregates AND
         chunk) and ``_send_legacy`` (no on-demand reader: the chunk alone). The boundary above the dispatch --
         the plan-pump collective and the K7F-06 fetch-before-decide -- stays HERE: every rank of the array
         enters the same collectives in the same order before any regime is entered.
@@ -565,8 +566,8 @@ class Bridge(IBridge):
         ondemand_delivery = state is not None and state.ondemand
 
         # Whether the chunk has to be shipped at all: an on-demand array with no legacy reader is answered
-        # entirely by the menu and by the on-demand plans served above, so nothing on the workers ever reads its data.
-        # Everything else keeps the previous behaviour.
+        # entirely by the aggregates and by the on-demand plans served above, so nothing on the workers ever
+        # reads its data. Everything else keeps the previous behaviour.
         if not self._needs_chunk_delivery(array_name):
             self._send_data_free(array_name, chunk, timestep, sub_comm)
         elif ondemand_delivery:
@@ -626,35 +627,35 @@ class Bridge(IBridge):
         return workers
 
     def _send_data_free(self, array_name: str, chunk: np.ndarray, timestep: int, sub_comm: Any) -> None:
-        """On-demand-only delivery: the eager menu IS the payload and no data leaves the bridge.
+        """On-demand-only delivery: the eager aggregates ARE the payload and no data leaves the bridge.
 
-        Every callback on this array reads the menu or dispatches an on-demand plan, and the plans were served from
-        the retained chunk at the boundary above, so nothing on the workers ever reads the data.
+        Every callback on this array reads the aggregates or dispatches an on-demand plan, and the plans were
+        served from the retained chunk at the boundary above, so nothing on the workers ever reads the data.
 
         - ``:param array_name:`` Registered array the send is for.
         - ``:param chunk:`` This bridge's own numpy chunk, which stays here.
         - ``:param timestep:`` The current timestep.
         - ``:param sub_comm:`` The array's sub-communicator on this rank.
         """
-        # The menu is folded HERE, on the local numpy chunk and before ANY scatter, for the reason spelled out in
+        # The aggregates are folded HERE, on the local numpy chunk and before ANY scatter, for the reason spelled out in
         # ``_send_ondemand``: on this path it is the ENTIRE payload, so it must still be built.
-        menu, menu_error = self._build_ondemand_menu(array_name, chunk, timestep)
+        aggregates, aggregates_error = self._build_ondemand_aggregates(array_name, chunk, timestep)
 
         logger.debug(
             f"[{self.id}] send() on-demand-only delivery: no data shipped for array={array_name}, "
             f"chunk shape={chunk.shape} stays on the bridge"
         )
         res = {"future": [], "who_has": {}, "nbytes": {}}
-        self._publish(array_name, res, chunk, timestep, sub_comm, menu, menu_error, data_free=True)
+        self._publish(array_name, res, chunk, timestep, sub_comm, aggregates, aggregates_error, data_free=True)
 
     def _send_ondemand(
         self, array_name: str, chunk: np.ndarray, timestep: int, sub_comm: Any, workers: List[str]
     ) -> None:
-        """On-demand delivery that still needs the chunk: the eager menu AND the full-chunk scatter.
+        """On-demand delivery that still needs the chunk: the eager aggregates AND the full-chunk scatter.
 
         A ``precompute=False`` callback shares the array with a ``precompute=True`` one, so the chunk has to cross the
-        boundary for that reader while the menu answers the on-demand callback -- decision F3's escape hatch. The
-        menu is still folded first, on the local chunk and before the scatter.
+        boundary for that reader while the aggregates answer the on-demand callback -- decision F3's escape hatch. The
+        aggregates are still folded first, on the local chunk and before the scatter.
 
         - ``:param array_name:`` Registered array the send is for.
         - ``:param chunk:`` This bridge's own numpy chunk.
@@ -662,23 +663,23 @@ class Bridge(IBridge):
         - ``:param sub_comm:`` The array's sub-communicator on this rank.
         - ``:param workers:`` The single worker the chunk is scattered to.
         """
-        # Eager scalar menu (the zero-round-trip half of the transfer strategy): computed HERE, on the local numpy
-        # chunk and before ANY scatter, so the menu values are chunk-local reductions and the chunk itself is never
+        # Eager scalar aggregates (the zero-round-trip half of the transfer strategy): computed HERE, on the local numpy
+        # chunk and before ANY scatter, so the aggregate values are chunk-local reductions and the chunk itself is never
         # shipped to convey them. Nothing below may run before this line without breaking the ordering invariant.
-        menu, menu_error = self._build_ondemand_menu(array_name, chunk, timestep)
+        aggregates, aggregates_error = self._build_ondemand_aggregates(array_name, chunk, timestep)
 
         # The only scatter site left: the full chunk (the legacy ``precompute=False`` delivery path).
         logger.debug(f"[{self.id}] send() scattering full chunk shape={chunk.shape}")
         res = self._scatter_full(chunk, workers=workers, hash=False)
-        self._publish(array_name, res, chunk, timestep, sub_comm, menu, menu_error, data_free=False)
+        self._publish(array_name, res, chunk, timestep, sub_comm, aggregates, aggregates_error, data_free=False)
 
     def _send_legacy(
         self, array_name: str, chunk: np.ndarray, timestep: int, sub_comm: Any, workers: List[str]
     ) -> None:
-        """Full-chunk delivery with NO menu: the chunk alone crosses the boundary.
+        """Full-chunk delivery with NO aggregates: the chunk alone crosses the boundary.
 
         This is the ``precompute=False`` path, and the fallback for an array whose delivery state this bridge cannot
-        know. No callback declared a ``precompute=True`` reader on the array, so the eager menu would have no
+        know. No callback declared a ``precompute=True`` reader on the array, so the eager aggregates would have no
         consumer: its folds are skipped entirely rather than computed and dropped.
 
         - ``:param array_name:`` Registered array the send is for.
@@ -698,22 +699,23 @@ class Bridge(IBridge):
         chunk: np.ndarray,
         timestep: int,
         sub_comm: Any,
-        menu: Optional[EagerMenu],
-        menu_error: Optional[str],
+        aggregates: Optional[EagerAggregates],
+        aggregates_error: Optional[str],
         data_free: bool,
     ) -> None:
         """Publish one timestep's topic event: the single-bridge fast path, or the sub-comm gather and rank-0 merge.
 
-        Shared by the three regimes -- the ONLY thing they differ in is what they scattered and whether they built a
-        menu, so the payload assembly (and the ``futures``/``menu``/``menu_error`` contract) lives in exactly one place.
+        Shared by the three regimes -- the ONLY thing they differ in is what they scattered and whether they built
+        aggregates, so the payload assembly (and the ``futures``/``aggregates``/``aggregates_error`` contract) lives
+        in exactly one place.
 
         - ``:param array_name:`` Registered array the event is for.
         - ``:param res:`` The scatter result (``{"future", "who_has", "nbytes"}``); on the data-free path an empty one.
         - ``:param chunk:`` This bridge's own numpy chunk, read for the payload's shape/dtype.
         - ``:param timestep:`` The current timestep, carried as the event's ``iteration``.
         - ``:param sub_comm:`` The array's sub-communicator on this rank; the gather runs on it when it has peers.
-        - ``:param menu:`` This bridge's eager menu for ``timestep``, or ``None`` when no menu was built.
-        - ``:param menu_error:`` The cause of a failed menu build, or ``None``.
+        - ``:param aggregates:`` This bridge's eager aggregates for ``timestep``, or ``None`` when none were built.
+        - ``:param aggregates_error:`` The cause of a failed aggregates build, or ``None``.
         - ``:param data_free:`` True when nothing was scattered: nothing to register, nothing to desire, no future to
           name.
         """
@@ -729,8 +731,8 @@ class Bridge(IBridge):
                 chunk,
                 timestep,
                 precomputed_meta=precomputed_meta,
-                menu=menu,
-                menu_error=menu_error,
+                aggregates=aggregates,
+                aggregates_error=aggregates_error,
                 data_free=data_free,
             )
             return
@@ -739,10 +741,10 @@ class Bridge(IBridge):
             "future-info": res,
             "chunk_position": self.arrays_metadata[array_name]["chunk_position"],
             "precomputed": precomputed_meta,
-            "menu": menu,
+            "aggregates": aggregates,
         }
-        if menu_error is not None:
-            to_send["menu_error"] = menu_error
+        if aggregates_error is not None:
+            to_send["aggregates_error"] = aggregates_error
         logger.debug(f"[{self.id}] send() gather: to_send={to_send}")
 
         gathered_data = sub_comm.gather(to_send, root=0)
@@ -759,11 +761,11 @@ class Bridge(IBridge):
             # misalign when a bridge shipped no partials, letting one bridge's partial inherit another bridge's
             # coordinates (or under-count the grid) and corrupt the combine.
             all_partials_meta: List[Dict[str, Any]] = []
-            menus: List[EagerMenu] = []
-            menu_errors: List[str] = []
+            aggregates: List[EagerAggregates] = []
+            aggregates_errors: List[str] = []
             for d in gathered_data:
-                if d.get("menu_error") is not None:
-                    menu_errors.append(d["menu_error"])
+                if d.get("aggregates_error") is not None:
+                    aggregates_errors.append(d["aggregates_error"])
                 who_has.update(d["future-info"]["who_has"])
                 nbytes.update(d["future-info"]["nbytes"])
                 future_field = d["future-info"]["future"]
@@ -773,8 +775,8 @@ class Bridge(IBridge):
                     keys.append(future_field)
                 if d.get("precomputed"):
                     all_partials_meta.append({"precomputed": d["precomputed"], "chunk_position": d["chunk_position"]})
-                if d.get("menu") is not None:
-                    menus.append(d["menu"])
+                if d.get("aggregates") is not None:
+                    aggregates.append(d["aggregates"])
 
             # only update the scheduler with who has what and register the futures once. Skipped on the data-free
             # path: an empty update + an empty desire list are pure scheduler round trips.
@@ -790,7 +792,7 @@ class Bridge(IBridge):
             futures_payload: List[Dict[str, Any]]
             if data_free:
                 # No key crossed the boundary, so there is nothing to register, nothing to desire and no future to
-                # name: the menus ARE the payload (an ``update_data({})`` would be an empty scheduler round trip).
+                # name: the aggregates ARE the payload (an ``update_data({})`` would be an empty scheduler round trip).
                 futures_payload = []
             elif all_partials_meta:
                 # One entry per (bridge, reduction). ``chunk_position`` is the contributing bridge's MPI coords
@@ -824,16 +826,18 @@ class Bridge(IBridge):
                 "precomputed": True if all_partials_meta else None,
                 "futures": futures_payload,
             }
-            if menus:
-                # Every participating bridge's eager menu, carried with the timestep it was computed for. Absent from
-                # the payload on the legacy path, so that payload stays byte-identical there. Encoded with
-                # ``EagerMenu.as_payload`` because the event bus (``Client.log_event``) carries msgpack primitives only:
-                # a live ``EagerMenu`` (and the numpy scalars/arrays its values hold) would be refused by the client.
-                to_send["menu"] = [menu.as_payload() for menu in menus]
-            if menu_errors:
-                # A bridge could not build its menu for this timestep: the payload carries the cause so the analytics
-                # side fails the RUN at its cycle boundary instead of serving a silently menu-less delivery.
-                to_send["menu_error"] = " | ".join(menu_errors)
+            if aggregates:
+                # Every participating bridge's eager aggregates, carried with the timestep it was computed for.
+                # Absent from the payload on the legacy path, so that payload stays byte-identical there. Encoded
+                # with ``EagerAggregates.as_payload`` because the event bus (``Client.log_event``) carries msgpack
+                # primitives only: a live ``EagerAggregates`` (and the numpy scalars/arrays its values hold) would
+                # be refused by the client.
+                to_send["aggregates"] = [eager.as_payload() for eager in aggregates]
+            if aggregates_errors:
+                # A bridge could not build its aggregates for this timestep: the payload carries the cause so the
+                # analytics side fails the RUN at its cycle boundary instead of serving a silently aggregates-less
+                # delivery.
+                to_send["aggregates_error"] = " | ".join(aggregates_errors)
             logger.debug(
                 f"[{self.id}] send() log_event: array={array_name}, "
                 f"timestep={timestep}, n_futures={len(futures_payload)}"
@@ -883,34 +887,34 @@ class Bridge(IBridge):
             pump.close()
         pumps.clear()
 
-    def _build_ondemand_menu(
+    def _build_ondemand_aggregates(
         self,
         array_name: str,
         chunk: np.ndarray,
         timestep: int,
-    ) -> Tuple[Optional[EagerMenu], Optional[str]]:
-        """Build this bridge's eager scalar menu for one timestep: ``(menu, error)``.
+    ) -> Tuple[Optional[EagerAggregates], Optional[str]]:
+        """Build this bridge's eager scalar aggregates for one timestep: ``(aggregates, error)``.
 
-        The menu is computed on the bridge's OWN numpy chunk, so it obeys the standing invariant: what leaves this
-        method is a handful of chunk-local scalars and the two small ``{n, total[, M]}`` dict partials, never the chunk.
-        It is called from ``send()`` before the first scatter.
+        The aggregates are computed on the bridge's OWN numpy chunk, so it obeys the standing invariant: what leaves
+        this method is a handful of chunk-local scalars and the two small ``{n, total[, M]}`` dict partials, never
+        the chunk. It is called from ``send()`` before the first scatter.
 
         One gate, deliberate: the array must be an on-demand target, i.e. the host declared (over the handshake)
         that at least one callback registered with ``precompute=True`` reads it. A deployment whose callbacks are all
         ``precompute=False``, or that registered callbacks on other arrays, would otherwise pay six chunk folds per
-        bridge per timestep for a menu nobody could read (measured at 2.8-45.2 ms per bridge per timestep at
+        bridge per timestep for aggregates nobody could read (measured at 2.8-45.2 ms per bridge per timestep at
         2-32 MB).
 
-        The failure contract is fail-loud but NOT fail-the-send: a menu entry that cannot fold its chunk (an empty
-        chunk, a numeric edge) is returned as ``error`` and shipped with the topic event, where the analytics side
-        records it as the run failure and raises it at the cycle boundary. Raising here instead would abort the
-        simulation's send loop with no diagnostic on the analytics side, and dropping it silently would deliver a
-        menu-less timestep that looks healthy.
+        The failure contract is fail-loud but NOT fail-the-send: an aggregates entry that cannot fold its chunk
+        (an empty chunk, a numeric edge) is returned as ``error`` and shipped with the topic event, where the
+        analytics side records it as the run failure and raises it at the cycle boundary. Raising here instead
+        would abort the simulation's send loop with no diagnostic on the analytics side, and dropping it silently
+        would deliver an aggregates-less timestep that looks healthy.
 
         - ``:param array_name:`` Registered array the chunk belongs to.
         - ``:param chunk:`` The bridge's own numpy chunk, already available at ``send()``.
-        - ``:param timestep:`` Timestep the chunk belongs to; every menu value is stamped with it, which is what lets
-          the analytics side refuse a menu value of an earlier timestep.
+        - ``:param timestep:`` Timestep the chunk belongs to; every aggregate value is stamped with it, which is
+          what lets the analytics side refuse an aggregate value of an earlier timestep.
         """
         state = self._delivery.get(array_name)
         if state is None or not state.ondemand:
@@ -921,7 +925,7 @@ class Bridge(IBridge):
         rank = 0 if sub_comm is None or sub_comm is _COMM_NULL else sub_comm.Get_rank()
         try:
             return (
-                build_eager_menu(
+                build_eager_aggregates(
                     collection,
                     chunk,
                     rank=rank,
@@ -930,7 +934,9 @@ class Bridge(IBridge):
                 None,
             )
         except Exception as exc:  # the fail-loud path: ship the cause, abort at the cycle boundary
-            logger.error(f"[{self.id}] eager menu failed for array {array_name!r} at timestep {timestep}: {exc!r}")
+            logger.error(
+                f"[{self.id}] eager aggregates failed for array {array_name!r} at timestep {timestep}: {exc!r}"
+            )
             return None, f"array {array_name!r} at timestep {timestep}, bridge {rank}: {exc!r}"
 
     def _direct_send(
@@ -940,8 +946,8 @@ class Bridge(IBridge):
         chunk: np.ndarray,
         timestep: int,
         precomputed_meta: Optional[Dict[str, Dict]] = None,
-        menu: Optional[EagerMenu] = None,
-        menu_error: Optional[str] = None,
+        aggregates: Optional[EagerAggregates] = None,
+        aggregates_error: Optional[str] = None,
         data_free: bool = False,
     ) -> None:
         """
@@ -958,11 +964,13 @@ class Bridge(IBridge):
             (``{output_key: {"future", "shape", "dtype"}}``); only set on the
             precompute path. When provided, the topic event's ``futures`` list
             carries the partials' reduced shapes instead of the full-chunk shape.
-        - ``:param menu:`` This bridge's eager scalar menu for ``timestep``, or ``None`` when the on-demand path is off.
-            A single-bridge array is its own whole grid, so the one menu is also the complete menu of the array.
-        - ``:param menu_error:`` The cause of a failed menu build, carried so the host fails the run at its boundary.
+        - ``:param aggregates:`` This bridge's eager scalar aggregates for ``timestep``, or ``None`` when the
+            on-demand path is off. A single-bridge array is its own whole grid, so the one bridge's aggregates
+            are also the complete aggregates of the array.
+        - ``:param aggregates_error:`` The cause of a failed aggregates build, carried so the host fails the run
+            at its boundary.
         - ``:param data_free:`` True when nothing was scattered because no callback reads this array's data: the event
-            then carries ``futures: []``, the menu being the entire payload.
+            then carries ``futures: []``, the aggregates being the entire payload.
         """
         assert self.client is not None, "client cannot be None for single-bridge send."
 
@@ -1002,10 +1010,10 @@ class Bridge(IBridge):
             "precomputed": True if precomputed_meta else None,
             "futures": futures_payload,
         }
-        if menu is not None:
-            to_send["menu"] = [menu.as_payload()]
-        if menu_error is not None:
-            to_send["menu_error"] = menu_error
+        if aggregates is not None:
+            to_send["aggregates"] = [aggregates.as_payload()]
+        if aggregates_error is not None:
+            to_send["aggregates_error"] = aggregates_error
         self.client.log_event(array_name, to_send)
 
     def get(self, key: str, timestep: Optional[int] = None, default: Any = None) -> Optional[Union[Deque, Any]]:
@@ -1129,7 +1137,7 @@ class Bridge(IBridge):
         """Whether ``send`` must scatter this array's data at all.
 
         Only an on-demand target can skip it, and only while nothing reads the chunk: every callback on such an
-        array either reads the eager menu, dispatches an on-demand plan, or both. An array with a legacy
+        array either reads the eager aggregates, dispatches an on-demand plan, or both. An array with a legacy
         (``precompute=False``) reader always needs the chunk -- that is decision F3's escape hatch -- and so does an
         array nobody declared, whose delivery mode this bridge cannot know. A record that exists but has never been
         fetched (``last_chunk`` was retained on it) is NOT a declared state either: it serves the chunk.

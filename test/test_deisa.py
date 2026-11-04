@@ -169,7 +169,7 @@ class TestDeisaRegistration:
         The topic handler can only fire a callback whose payload lives in ``_callbacks``; it must be stored once every
         step that can raise has succeeded. The payload carries the delivery mode the callback registered with (decision
         F3: the mode is per CALLBACK, not per run), and the array is filed with the handshake actor as an
-        on-demand target -- which is what the bridges gate their eager scalar menu on now that registration no
+        on-demand target -- which is what the bridges gate their eager scalar aggregates on now that registration no
         longer files branches.
         """
         d = _make_deisa_stub()

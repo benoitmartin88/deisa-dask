@@ -294,9 +294,9 @@ class TestPrecomputeRegressions:
     def test_send_non_participating_rank_skips_delivery_work(self, env_setup):
         """A rank whose sub-comm for the array is _COMM_NULL does no delivery work.
 
-        The ``_COMM_NULL`` early return comes FIRST: such a rank never fetches the array's delivery state, never folds
-        the eager menu on the chunk and never scatters it -- it owns nothing the workers asked for. (The per-rank fold
-        the retired ``_scatter_partials`` used to guard lives on the same early return.)
+        The ``_COMM_NULL`` early return comes FIRST: such a rank never fetches the array's delivery state, never
+        folds the eager aggregates on the chunk and never scatters it -- it owns nothing the workers asked for.
+        (The per-rank fold the retired ``_scatter_partials`` used to guard lives on the same early return.)
         """
         client, cluster = env_setup
         state = FakeComm.State(2)
@@ -311,28 +311,28 @@ class TestPrecomputeRegressions:
         # Merged-metadata scenario: the array is known to this bridge but its
         # sub-comm for it is _COMM_NULL (it does not own it).
         b1.arrays_metadata["temperature"] = meta0["temperature"]
-        calls = {"state": 0, "menu": 0, "scatter": 0}
+        calls = {"state": 0, "aggregates": 0, "scatter": 0}
         orig_state = b1._ensure_task_state
-        orig_menu = b1._build_ondemand_menu
+        orig_aggregates = b1._build_ondemand_aggregates
         orig_scatter = b1._scatter_full
 
         def spy_state(array_name):
             calls["state"] += 1
             return orig_state(array_name)
 
-        def spy_menu(array_name, chunk, timestep):
-            calls["menu"] += 1
-            return orig_menu(array_name, chunk, timestep)
+        def spy_aggregates(array_name, chunk, timestep):
+            calls["aggregates"] += 1
+            return orig_aggregates(array_name, chunk, timestep)
 
         def spy_scatter(data, workers=None, hash=False):
             calls["scatter"] += 1
             return orig_scatter(data, workers=workers, hash=hash)
 
         b1._ensure_task_state = spy_state
-        b1._build_ondemand_menu = spy_menu
+        b1._build_ondemand_aggregates = spy_aggregates
         b1._scatter_full = spy_scatter
         b1.send("temperature", np.ones(4), timestep=0)
-        assert calls == {"state": 0, "menu": 0, "scatter": 0}
+        assert calls == {"state": 0, "aggregates": 0, "scatter": 0}
 
         async_close_bridges([b0, b1], 0)
 

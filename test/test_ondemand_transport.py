@@ -183,7 +183,7 @@ def register_callback(deisa, callback, window_size=1):
 
 def deliver(deisa, timestep):
     """Push one production topic event through the array's handler and wait for the callback task."""
-    payload = {"iteration": timestep, "futures": [], "menu": None}
+    payload = {"iteration": timestep, "futures": [], "aggregates": None}
     handler = deisa._topic_handlers[ARRAY_NAME]
     deisa.client.sync(lambda: handler((None, payload)))
     deisa.client.sync(lambda: _drain(deisa._tasks))
@@ -359,8 +359,8 @@ def test_window_reduction_older_than_the_delivery_is_refused_at_compose_time(cli
 
     The bridges retain ONE chunk per array -- the timestep they last sent -- so a plan stamped with an older timestep
     can only come back as an error report and abort the run at the merge. Refusing before the plan is dispatched keeps
-    the failure on the host, names what to do instead, and is what makes the window honest: menu operations on an
-    older element still work (the menu travels with the delivery), on-demand ones do not.
+    the failure on the host, names what to do instead, and is what makes the window honest: aggregates operations on an
+    older element still work (the aggregates travel with the delivery), on-demand ones do not.
     """
     dispatched = []
 
