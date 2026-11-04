@@ -25,7 +25,7 @@ from dask.array.reductions import mean_agg, moment_agg
 from deisa.dask import ondemand_errors as errors
 from deisa.dask.branch import _FULL_FOLD_FINALIZERS as LEGACY_FULL_FOLD_FINALIZERS
 from deisa.dask.branch import _chain_branch_func
-from deisa.dask.collection import DeisaCollection
+from deisa.dask.deisa_array import OndemandDeisaArray
 from deisa.dask.ondemand_compose import FULL_FOLD_FINALIZERS, compose_request, probe_partial
 from deisa.dask.ondemand_expr import (
     KIND_BOOLEAN,
@@ -75,7 +75,7 @@ SCALAR_FOLD = {
 
 def make_collection(name="f", timestep=0, shape=ROOT_SHAPE, dtype=np.float64, chunk_shape=CHUNK_SHAPE):
     """Build a collection describing one array whose only chunk is ``chunk_shape``."""
-    return DeisaCollection(name=name, timestep=timestep, shape=shape, dtype=dtype, chunk_shape=chunk_shape)
+    return OndemandDeisaArray(name=name, timestep=timestep, shape=shape, dtype=dtype, chunk_shape=chunk_shape)
 
 
 def make_chunk(shape=CHUNK_SHAPE, dtype=np.float64, seed=0, zeros=True):
@@ -306,9 +306,15 @@ class TestMaterializationGuards:
         assert "precompute=False" in str(excinfo.value)
 
     def test_guard_refuses_before_dask_can_embed_the_collection(self):
-        """An external dask graph must fail fast -- refusal, not a silent gather."""
+        """An external dask graph must fail fast -- refusal, not a silent gather.
+
+        K13C: the delivered operand IS a ``dask.array.Array`` -- that is the public contract, a callback gets a
+        ``DeisaArray`` -- so dask's own ``from_array`` guard fires first and the refusal class moves from DEISA's
+        ``UnsupportedReductionError`` to dask's ``ValueError``. It is still a hard refusal: nothing is embedded and
+        nothing is gathered.
+        """
         collection = make_collection()
-        with pytest.raises(errors.UnsupportedReductionError):
+        with pytest.raises(ValueError, match="already a dask array"):
             da.from_array(collection)
 
 
@@ -323,8 +329,6 @@ class TestOffSurfaceMatrix:
             pytest.param(lambda c: c.rechunk((2, 2)), errors.UnsupportedReductionError, id="rechunk"),
             pytest.param(lambda c: c.map_blocks(np.abs), errors.UnsupportedReductionError, id="map_blocks"),
             pytest.param(lambda c: c.reshape((64,)), errors.UnsupportedReductionError, id="reshape"),
-            pytest.param(lambda c: da.from_array(c), errors.UnsupportedReductionError, id="dask-from_array"),
-            pytest.param(lambda c: dfft.fft2(c), errors.UnsupportedReductionError, id="fft"),
             pytest.param(lambda c: da.tensordot(c, c, axes=1), errors.UnsupportedReductionError, id="tensordot"),
             pytest.param(lambda c: np.sqrt(c), errors.MaterializationError, id="numpy-ufunc"),
             pytest.param(lambda c: c - c.mean(axis=0), errors.UnsupportedReductionError, id="cross-reduction"),
@@ -349,6 +353,16 @@ class TestOffSurfaceMatrix:
         message = str(excinfo.value)
         assert "precompute=False" in message
         assert not isinstance(excinfo.value, AssertionError)
+
+    def test_dask_entry_point_refuses_a_chunk_split_fft_before_deisa_can_speak(self):
+        """``dfft.fft2`` refuses the operand inside dask: the operand is a ``dask.array.Array`` now.
+
+        K13C forced delta. The public contract makes the delivered array a ``dask.array.Array`` subclass, so dask's own
+        entry points run before any DEISA operator and raise ``ValueError`` instead of ``UnsupportedReductionError``.
+        Nothing is gathered -- the refusal happens on the chunk layout, before a graph is built.
+        """
+        with pytest.raises(ValueError, match="single chunk"):
+            dfft.fft2(make_collection())
 
     def test_non_associative_refusal_is_not_reported_as_a_raw_read(self):
         """The misdiagnosis this fixes: median/argmax used to be refused as raw field reads."""
@@ -550,18 +564,18 @@ class TestCollectionMetadata:
 
     def test_declared_bridge_count_must_agree_with_the_metadata(self):
         with pytest.raises(errors.PrecomputeRuntimeError) as excinfo:
-            DeisaCollection("f", 0, ROOT_SHAPE, np.float64, CHUNK_SHAPE, bridge_count=7)
+            OndemandDeisaArray("f", 0, ROOT_SHAPE, np.float64, CHUNK_SHAPE, bridge_count=7)
         assert "7" in str(excinfo.value)
 
     def test_from_metadata_reads_the_handshake_keys(self):
-        collection = DeisaCollection.from_metadata("f", 3, {"global_shape": (8, 8), "chunk_shape": (4, 4)})
+        collection = OndemandDeisaArray.from_metadata("f", 3, {"global_shape": (8, 8), "chunk_shape": (4, 4)})
         assert (collection.shape, collection.chunk_shape, collection.bridge_count) == ((8, 8), (4, 4), 4)
         assert collection.timestep == 3
         assert collection.dtype == np.dtype(np.float64)
 
     def test_from_metadata_requires_a_global_shape(self):
         with pytest.raises(errors.PrecomputeRuntimeError):
-            DeisaCollection.from_metadata("f", 0, {"chunk_shape": (4, 4)})
+            OndemandDeisaArray.from_metadata("f", 0, {"chunk_shape": (4, 4)})
 
     def test_shape_and_dtype_propagate_through_the_surface(self):
         collection = make_collection()

@@ -950,19 +950,19 @@ class MergeablePCA:
 
     @staticmethod
     def _is_ondemand_collection(X) -> bool:
-        """Whether ``X`` is a DEISA on-demand collection, i.e. a data-free operand the delivery path handed a callback.
+        """Whether ``X`` is a DEISA on-demand operand, i.e. a data-free array the delivery path handed a callback.
 
-        The import is deferred so this module's import chain does not pull the delivery stack back in: the collection
-        module pulls ``ondemand_errors`` and the on-demand compose/dispatch modules, and this module sits at the
-        bottom of that chain. The check is an ``isinstance`` against that class rather than a duck
-        check on attributes: ``DeisaCollection`` is the only operand the delivery produces, and a false positive here
-        would dispatch a PCA branch for something a bridge never described.
+        The import is deferred so this module's import chain does not pull the delivery stack back in: the array module
+        pulls ``ondemand_errors`` and the on-demand compose/dispatch modules, and this module sits at the bottom of that
+        chain. The check is an ``isinstance`` against that class rather than a duck check on attributes:
+        ``OndemandDeisaArray`` is the only operand the analytic delivery produces, and a false positive here would
+        dispatch a PCA branch for something a bridge never described.
 
         - ``:param X:`` The object a callback passed to :meth:`fit`.
         """
-        from deisa.dask.collection import DeisaCollection
+        from deisa.dask.deisa_array import OndemandDeisaArray
 
-        return isinstance(X, DeisaCollection)
+        return isinstance(X, OndemandDeisaArray)
 
     def _bridge_policy(self) -> dict:
         """The bridge-side axis policy this estimator summarizes under.
@@ -991,7 +991,7 @@ class MergeablePCA:
         uses, and :meth:`PlanDispatcher.compute_pca` merges those summaries with the balanced pairwise tree. Nothing
         chunk-shaped crosses the boundary.
 
-        - ``:param collection:`` The :class:`~deisa.dask.collection.DeisaCollection` a callback received.
+        - ``:param collection:`` The :class:`~deisa.dask.deisa_array.OndemandDeisaArray` a callback received.
         """
         from deisa.dask import ondemand_errors as errors
         from deisa.dask.ondemand_compose import compose_pca_request

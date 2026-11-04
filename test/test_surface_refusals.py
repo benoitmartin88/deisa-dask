@@ -28,7 +28,8 @@
 # =============================================================================
 """The closed surface a callback meets, and the refusals outside it.
 
-A callback RUNS against a lazily-reducible :class:`~deisa.dask.collection.DeisaCollection`: the reductions it computes
+A callback RUNS against a lazily-reducible
+:class:`~deisa.dask.deisa_array.OndemandDeisaArray`: the reductions it computes
 are planned, and everything else is ordinary Python over metadata. This file pins the other half of that contract --
 the spellings that are OUTSIDE the surface, the class each refusal raises, and the boundary cases where refusing would
 be wrong (sibling reductions, predicate builtins, metadata reads, plain Python control flow).

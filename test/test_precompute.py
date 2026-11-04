@@ -31,7 +31,7 @@ The reduction planner a callback's ``.compute()`` goes through.
 
 The retired AST precompute analyzer walked the callback source symbolically, evaluated dask stubs without executing the
 callback, and read hints off each dask task graph. The v1 on-demand path plans nothing from the source at all -- the
-callback RUNS against a lazily-reducible :class:`~deisa.dask.collection.DeisaCollection`, and every reduction it
+callback RUNS against a lazily-reducible :class:`~deisa.dask.deisa_array.OndemandDeisaArray`, and every reduction it
 computes carries its own ``op_name`` / ``axes`` / ``kind`` / ``finalize``, from which
 :func:`~deisa.dask.ondemand_compose.compose_request` builds the slim wire request. This file is the fixture suite for
 that planner.
@@ -77,8 +77,8 @@ from utils import (
 )
 
 from deisa.dask import ondemand_errors as errors
-from deisa.dask.collection import DeisaCollection
 from deisa.dask.deisa import ArrayMode, Deisa
+from deisa.dask.deisa_array import OndemandDeisaArray
 from deisa.dask.ondemand_dispatch import PlanDispatcher, PlanResponder
 
 # The chunk every branch callable is exercised on: mixed signs, so max/min/mean/var distinguish the ops.
@@ -644,8 +644,13 @@ def test_dask_module_call_is_off_surface() -> None:
 
 
 def test_fft_is_off_surface() -> None:
-    """``da.fft.fft2(collection)`` is refused: FFT is out of the v1 surface (its input is the raw chunk)."""
-    with pytest.raises(errors.UnsupportedReductionError):
+    """``da.fft.fft2(collection)`` is refused: FFT is out of the v1 surface (its input is the raw chunk).
+
+    K13C: the delivered operand is a ``dask.array.Array`` (the public contract), so dask's own single-chunk
+    precondition fires before DEISA's refusal can. The outcome is the same hard refusal -- nothing is built and
+    nothing is gathered -- so the expected class is dask's ``ValueError``.
+    """
+    with pytest.raises(ValueError, match="single chunk"):
         _run_callback("phi = da.fft.fft2(arr)\nphi.compute()")
 
 
@@ -808,7 +813,7 @@ def _gysela_delivery(field, name="f"):
         ]
 
     dispatcher = _RecordingPlanDispatcher(PlanDispatcher(exchange, bridge_count=len(tiles)))
-    return DeisaCollection.from_metadata(name, 0, meta[name], dispatcher=dispatcher), dispatcher
+    return OndemandDeisaArray.from_metadata(name, 0, meta[name], dispatcher=dispatcher), dispatcher
 
 
 def test_gysela_density_helper_plans_the_5d_axis_tuple_and_delivers_the_value() -> None:
@@ -933,11 +938,11 @@ def test_each_callback_gets_its_own_collection() -> None:
 # ---------------------------------------------------------------------------------------------------------------------
 def test_harness_collection_is_the_delivered_object() -> None:
     """The harness hands the callback a collection with the registered metadata and a compute boundary."""
-    from deisa.dask.collection import DeisaCollection
+    from deisa.dask.deisa_array import OndemandDeisaArray
 
     boundary = RecordingDispatcher()
     collection = _collection("f", dispatcher=boundary)
-    assert isinstance(collection, DeisaCollection)
+    assert isinstance(collection, OndemandDeisaArray)
     assert collection.shape == (8, 8)
     assert collection.chunk_shape == (4, 4)
     assert collection.dispatcher is boundary

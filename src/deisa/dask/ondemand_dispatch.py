@@ -385,7 +385,7 @@ def build_eager_menu(
     the merge cannot tell the two apart. The failure contract is the fail-loud one: a menu entry that raises aborts the
     menu instead of shipping a hole.
 
-    - ``:param collection:`` The :class:`~deisa.dask.collection.DeisaCollection` describing this bridge's array.
+    - ``:param collection:`` The :class:`~deisa.dask.deisa_array.OndemandDeisaArray` describing this bridge's array.
     - ``:param chunk:`` The bridge's own numpy chunk.
     - ``:param rank:`` Rank of this bridge inside the array's communicator.
     - ``:param chunk_position:`` MPI coordinates of this bridge's chunk.
@@ -410,7 +410,7 @@ def build_eager_menu(
 def eager_menu_requests(collection: Any) -> Tuple[OndemandRequest, ...]:
     """The slim requests of the eager scalar menu, in :data:`EAGER_MENU_OPS` order.
 
-    - ``:param collection:`` The :class:`~deisa.dask.collection.DeisaCollection` to compose the menu for.
+    - ``:param collection:`` The :class:`~deisa.dask.deisa_array.OndemandDeisaArray` to compose the menu for.
     """
     return tuple(compose_request(getattr(collection, op_name)()) for op_name in EAGER_MENU_OPS)
 

@@ -190,17 +190,17 @@ def _collection(
     timestep: int = 0,
     dispatcher: Any = None,
 ) -> Any:
-    """One live :class:`~deisa.dask.collection.DeisaCollection`, i.e. what a callback receives.
+    """One live :class:`~deisa.dask.deisa_array.OndemandDeisaArray`, i.e. what a callback receives.
 
     - ``:param name:`` Registered array name.
     - ``:param meta:`` Registry metadata (defaults to :data:`DEFAULT_META`).
     - ``:param timestep:`` Timestep the collection was delivered for.
     - ``:param dispatcher:`` The compute boundary to attach.
     """
-    from deisa.dask.collection import DeisaCollection
+    from deisa.dask.deisa_array import OndemandDeisaArray
 
     registry = DEFAULT_META if meta is None else meta
-    return DeisaCollection.from_metadata(name, timestep, registry[name], dispatcher=dispatcher)
+    return OndemandDeisaArray.from_metadata(name, timestep, registry[name], dispatcher=dispatcher)
 
 
 def _run_callback(
@@ -289,7 +289,7 @@ def _dispatched(
     - ``:param grid:`` Chunk-grid extent.
     - ``:param timestep:`` Timestep of the delivery.
     """
-    from deisa.dask.collection import DeisaCollection
+    from deisa.dask.deisa_array import OndemandDeisaArray
     from deisa.dask.ondemand_dispatch import PlanDispatcher
 
     field = np.asarray(field)
@@ -301,7 +301,7 @@ def _dispatched(
         bridge_count=len(chunks),
     )
     meta = {name: {"global_shape": field.shape, "chunk_shape": chunk_shape}}
-    return DeisaCollection.from_metadata(name, timestep, meta[name], dispatcher=dispatcher)
+    return OndemandDeisaArray.from_metadata(name, timestep, meta[name], dispatcher=dispatcher)
 
 
 class FakeComm(ICommunicator):

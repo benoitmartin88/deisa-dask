@@ -45,7 +45,7 @@ from utils import FakeComm
 
 from deisa.dask import ondemand_errors as errors
 from deisa.dask.branch import _combine_two_phase
-from deisa.dask.collection import DeisaCollection
+from deisa.dask.deisa_array import OndemandDeisaArray
 from deisa.dask.ondemand_compose import compose_request
 from deisa.dask.ondemand_dispatch import (
     EAGER_MENU_OPS,
@@ -148,7 +148,7 @@ def fleet():
 
 def make_collection(bridge, dispatcher=None, timestep=None):
     """The collection a callback would receive, with or without the compute boundary attached."""
-    return DeisaCollection(
+    return OndemandDeisaArray(
         name=ARRAY_NAME,
         timestep=bridge.timestep if timestep is None else timestep,
         shape=GLOBAL_SHAPE,

@@ -39,7 +39,7 @@ import dask
 import dask.array as da
 import numpy as np
 import pytest
-from deisa.core.types import DeisaArray, Window
+from deisa.core.types import Window
 from distributed import Client, LocalCluster, Queue, Variable
 from TestSimulator import TestSimulation
 from utils import (
@@ -55,6 +55,7 @@ from utils import (
 
 from deisa.dask import Bridge, Deisa
 from deisa.dask.deisa import DEFAULT_SLIDING_WINDOW_SIZE, ArrayMode, _is_run_aborting
+from deisa.dask.deisa_array import DeisaArray
 from deisa.dask.precompute_errors import RawFieldReadError, UnsupportedReductionError
 from deisa.dask.utils import build_deisa_array
 

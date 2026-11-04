@@ -268,8 +268,8 @@ def compose_pca_request(collection: Any, policy: Optional[Mapping[str, Any]] = N
     The composed callable is a ``functools.partial`` over module-level functions, exactly like a reduction's: the
     request is pickled to the bridge process, where a closure has no name to resolve.
 
-    - ``:param collection:`` The :class:`~deisa.dask.collection.DeisaCollection` (or any operand carrying ``name`` and
-      ``timestep``) the estimator was fitted on.
+    - ``:param collection:`` The :class:`~deisa.dask.deisa_array.OndemandDeisaArray` (or any operand carrying
+      ``name`` and ``timestep``) the estimator was fitted on.
     - ``:param policy:`` The estimator's bridge-side axis policy; see :class:`PCARequest`.
     """
     resolved = dict(policy or {})

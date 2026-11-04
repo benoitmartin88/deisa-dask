@@ -10,7 +10,7 @@
 # reductions at registration, the bridges shipped their partials with the topic
 # event, and the test asserted that the worker store held only ~8-byte scalars.
 # The on-demand path plans nothing from the source -- the callback receives a
-# lazily-reducible ``DeisaCollection`` and its reductions either read the eager
+# lazily-reducible ``OndemandDeisaArray`` and its reductions either read the eager
 # menu shipped with the delivery or dispatch an on-demand plan -- so the SAME
 # callback bodies are measured here against the on-demand delivery. What changes
 # is what the callback is handed (a collection describing the WHOLE array, not a
@@ -43,7 +43,7 @@ from utils import wait_for
 
 from deisa.dask import Deisa
 from deisa.dask import ondemand_errors as errors
-from deisa.dask.collection import DeisaCollection
+from deisa.dask.deisa_array import OndemandDeisaArray
 from deisa.dask.ondemand_compose import compose_request, probe_partial
 
 logging.basicConfig(level=logging.DEBUG)
@@ -161,7 +161,7 @@ class TestOndemandReductionMemory:
     never crosses the bridge -> worker boundary on the on-demand reduction path.
 
     Everything the analyzer-era file measured still holds; what changed is the
-    OBJECT the callback receives. ``window[-1]`` is now a ``DeisaCollection``
+    OBJECT the callback receives. ``window[-1]`` is now a ``OndemandDeisaArray``
     describing the whole array, whose ``.compute()`` on a reduction returns the
     combined FINAL value -- so a delivered ``(2,)`` partial stack no longer
     exists, and the per-test discriminator is the collection's global shape plus
@@ -343,7 +343,7 @@ class TestOndemandReductionMemory:
                     tuple(x.shape),
                     tuple(y.shape),
                     (x.name, y.name),
-                    (isinstance(x, DeisaCollection), isinstance(y, DeisaCollection)),
+                    (isinstance(x, OndemandDeisaArray), isinstance(y, OndemandDeisaArray)),
                 )
             )
 
@@ -425,7 +425,7 @@ class TestOndemandReductionMemory:
         """
         chunk_shape = (2048, 2048)
         chunk_bytes = int(np.prod(chunk_shape) * 8)
-        collection = DeisaCollection.from_metadata(
+        collection = OndemandDeisaArray.from_metadata(
             "temperature", 1, {"global_shape": (chunk_shape[0] * 2, chunk_shape[1]), "chunk_shape": chunk_shape}
         )
 
@@ -529,7 +529,7 @@ class TestOndemandReductionMemory:
 
         chunk_shape = (2048, 2048)
         chunk_bytes = int(np.prod(chunk_shape) * 8)
-        collection = DeisaCollection.from_metadata(
+        collection = OndemandDeisaArray.from_metadata(
             "temperature", 1, {"global_shape": (chunk_shape[0] * 2, chunk_shape[1]), "chunk_shape": chunk_shape}
         )
 

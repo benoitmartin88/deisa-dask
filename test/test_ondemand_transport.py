@@ -67,8 +67,8 @@ from deisa.dask import deisa as deisa_module
 from deisa.dask import ondemand_dispatch as ondemand_dispatch_module
 from deisa.dask import ondemand_errors as errors
 from deisa.dask.bridge import Bridge, DeliveryState, PlanPump
-from deisa.dask.collection import DeisaCollection
 from deisa.dask.deisa import ArrayMode, Deisa
+from deisa.dask.deisa_array import OndemandDeisaArray
 from deisa.dask.ondemand_compose import compose_request
 from deisa.dask.ondemand_dispatch import (
     PlanRequest,
@@ -114,7 +114,7 @@ def chunk_position(rank):
 
 def make_plan(timestep=0, axes=(0,)):
     """A real composed plan for one reduction of the bare collection."""
-    collection = DeisaCollection.from_metadata(ARRAY_NAME, timestep, METADATA[ARRAY_NAME])
+    collection = OndemandDeisaArray.from_metadata(ARRAY_NAME, timestep, METADATA[ARRAY_NAME])
     request = compose_request(collection.sum(axis=axes))
     return PlanRequest(request_id=uuid.uuid4().hex, array_name=ARRAY_NAME, timestep=timestep, request=request)
 

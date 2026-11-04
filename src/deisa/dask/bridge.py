@@ -61,8 +61,8 @@ from distributed.utils_comm import scatter_to_workers
 from tlz import valmap
 
 from dask.tokenize import tokenize
-from deisa.dask.collection import DeisaCollection
 from deisa.dask.constants import CLIENT_KEY, FEEDBACK_QUEUE_PREFIX, KEY_PREFIX, WAIT_FOR_EXECUTE_CB_EVENT
+from deisa.dask.deisa_array import OndemandDeisaArray
 from deisa.dask.handshake import Handshake
 from deisa.dask.ondemand_dispatch import (
     EagerMenu,
@@ -916,7 +916,7 @@ class Bridge(IBridge):
         if state is None or not state.ondemand:
             return None, None
         metadata = self.arrays_metadata[array_name]
-        collection = DeisaCollection.from_metadata(array_name, timestep, metadata)
+        collection = OndemandDeisaArray.from_metadata(array_name, timestep, metadata)
         sub_comm = self._array_comms.get(array_name)
         rank = 0 if sub_comm is None or sub_comm is _COMM_NULL else sub_comm.Get_rank()
         try:

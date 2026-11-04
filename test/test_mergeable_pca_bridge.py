@@ -69,8 +69,8 @@ import pytest
 from deisa.core.types import Window
 from utils import _make_callback
 
-from deisa.dask.collection import DeisaCollection
 from deisa.dask.deisa import ArrayMode, Deisa
+from deisa.dask.deisa_array import OndemandDeisaArray
 from deisa.dask.mergeable_pca import MergeablePCA, PCASummary, local_pca, merge_tree
 from deisa.dask.ondemand_compose import compose_pca_request
 
@@ -130,9 +130,9 @@ def _collection(
     dispatcher: Any = None,
     name: str = "f",
     timestep: int = 0,
-) -> DeisaCollection:
+) -> OndemandDeisaArray:
     """The collection the topic handler delivers for one array and timestep."""
-    return DeisaCollection(name, timestep, shape, chunk_shape=chunk_shape, dispatcher=dispatcher)
+    return OndemandDeisaArray(name, timestep, shape, chunk_shape=chunk_shape, dispatcher=dispatcher)
 
 
 # ------------------------------------------------------------------------------ a Deisa stub that accepts registrations

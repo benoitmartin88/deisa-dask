@@ -54,8 +54,8 @@ FACTORY_CASES = [
         lambda: errors.no_precomputable_reduction("the callback 'cb'"), ["the callback 'cb'"], id="no-reduction"
     ),
     pytest.param(
-        lambda: errors.ondemand_invariant("DeisaCollection", "the metadata is inconsistent"),
-        ["DeisaCollection", "the metadata is inconsistent"],
+        lambda: errors.ondemand_invariant("OndemandDeisaArray", "the metadata is inconsistent"),
+        ["OndemandDeisaArray", "the metadata is inconsistent"],
         id="invariant",
     ),
 ]

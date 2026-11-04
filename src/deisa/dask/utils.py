@@ -31,10 +31,11 @@ import logging
 import os
 import threading
 
-from deisa.core import DeisaArray, ICommunicator
+from deisa.core import ICommunicator
 from distributed import Client, Lock, Variable
 
 import dask.array as da
+from deisa.dask.deisa_array import DeisaArray
 
 logger = logging.getLogger(__name__)
 

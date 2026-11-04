@@ -47,14 +47,13 @@ import dask.array as da
 import msgpack
 import numpy as np
 import pytest
-from deisa.core.types import DeisaArray
 from utils import FakeComm
 
 from deisa.dask import deisa as deisa_module
 from deisa.dask import ondemand_errors as errors
 from deisa.dask.bridge import Bridge, DeliveryState, PlanPump
-from deisa.dask.collection import DeisaCollection
 from deisa.dask.deisa import ArrayMode, Deisa
+from deisa.dask.deisa_array import DeisaArray, OndemandDeisaArray
 from deisa.dask.handshake import Handshake
 from deisa.dask.mergeable_pca import MergeablePCA, PCASummary
 from deisa.dask.ondemand_compose import PCARequest, compose_request
@@ -136,7 +135,7 @@ class BridgeFleet:
 
     def menus(self):
         """The eager menu every bridge of this fleet would ship with its timestep event."""
-        collection = DeisaCollection.from_metadata(self.array_name, self.timestep, METADATA[self.array_name])
+        collection = OndemandDeisaArray.from_metadata(self.array_name, self.timestep, METADATA[self.array_name])
         return [
             build_eager_menu(collection, chunk, rank=rank, chunk_position=chunk_position(rank))
             for rank, chunk in enumerate(self.chunks)
@@ -386,7 +385,7 @@ def test_scalar_fold_is_served_from_the_eager_menu(fleets, client, monkeypatch):
     seen = []
 
     def callback(window):
-        assert isinstance(window[-1], DeisaCollection), "the on-demand delivery must hand over collections"
+        assert isinstance(window[-1], OndemandDeisaArray), "the on-demand delivery must hand over collections"
         seen.append(window[-1].sum().compute())
 
     register(deisa, callback)
@@ -676,7 +675,7 @@ def test_pca_branch_ships_summaries_not_chunks(fleets, client, monkeypatch):
 
 def test_pca_fit_without_a_transport_refuses(client):
     """A collection without a compute boundary refuses the fit instead of gathering the field."""
-    collection = DeisaCollection(ARRAY_NAME, 0, GLOBAL_SHAPE, chunk_shape=CHUNK_SHAPE)
+    collection = OndemandDeisaArray(ARRAY_NAME, 0, GLOBAL_SHAPE, chunk_shape=CHUNK_SHAPE)
     with pytest.raises(errors.PrecomputeRuntimeError) as refusal:
         MergeablePCA(n_components=2).fit(collection)
     assert "precompute=False" in str(refusal.value)
@@ -708,7 +707,7 @@ def test_precompute_false_still_receives_the_full_chunk(fleets, client, monkeypa
 
     assert len(received) == 1
     assert isinstance(received[0], DeisaArray)
-    assert not isinstance(received[0], DeisaCollection)
+    assert not isinstance(received[0], OndemandDeisaArray)
     assert received[0].shape == GLOBAL_SHAPE
 
 
@@ -733,9 +732,9 @@ def test_one_event_serves_both_delivery_modes(fleets, client, monkeypatch):
     register(deisa, full_chunk_callback, precompute=False)
     deliver(deisa, 0, fleets.menus(0), futures=full_chunk_futures())
 
-    assert len(collections_seen) == 1 and isinstance(collections_seen[0], DeisaCollection)
+    assert len(collections_seen) == 1 and isinstance(collections_seen[0], OndemandDeisaArray)
     assert len(arrays_seen) == 1 and isinstance(arrays_seen[0], DeisaArray)
-    assert not isinstance(arrays_seen[0], DeisaCollection)
+    assert not isinstance(arrays_seen[0], OndemandDeisaArray)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -1144,7 +1143,7 @@ def test_menu_round_trip_preserves_keys_values_dtypes_and_stamps(fleets, client,
     chunks = [chunk.astype(np.float32) for chunk in fleets.fleets[0].chunks]
     received = []
     for rank, chunk in enumerate(chunks):
-        collection = DeisaCollection.from_metadata(ARRAY_NAME, 0, WIRE_METADATA[ARRAY_NAME])
+        collection = OndemandDeisaArray.from_metadata(ARRAY_NAME, 0, WIRE_METADATA[ARRAY_NAME])
         menu = build_eager_menu(collection, chunk, rank=rank, chunk_position=chunk_position(rank))
 
         # The Client.log_event hop: encode, pack, unpack -- and keep the DECODED entry, i.e. what the host receives.
@@ -1241,7 +1240,7 @@ def test_send_serves_pending_plans_then_retains_the_chunk_by_reference():
     assert retained_chunk is first, "the retained chunk must be the object passed in, not a copy"
 
     # A request for timestep 0 lands between the two sends: the host asks for the chunk the bridges last delivered.
-    request = compose_request(DeisaCollection.from_metadata(ARRAY_NAME, 0, WIRE_METADATA[ARRAY_NAME]).sum())
+    request = compose_request(OndemandDeisaArray.from_metadata(ARRAY_NAME, 0, WIRE_METADATA[ARRAY_NAME]).sum())
     pump.backlog.put(PlanRequest(request_id="req-0", array_name=ARRAY_NAME, timestep=0, request=request))
 
     # Send 2: the boundary answers from the PREVIOUS chunk, then the retention takes this one.

@@ -34,19 +34,21 @@ callbacks, and the cycle boundary (``execute_callbacks``).
 Two delivery modes exist and each callback's ``precompute`` argument selects its own (decision F3):
 
 - **on-demand reduction delivery** (``precompute=True``, the default): the callback receives one
-  :class:`~deisa.dask.collection.DeisaCollection` per (registered array, timestep) instead of an array. The collection
-  is not a dask collection and carries no data -- it exposes the closed reduction surface and dispatches each
-  ``.compute()`` to the bridges, which reduce their OWN chunk. The bridges' eager scalar menu and the on-demand plan
-  round both arrive through the topic event and the array transport attached to the delivery.
-- **legacy full-chunk scatter** (``precompute=False``): unchanged. The chunk itself reaches the workers, which is the
-  remedy every refusal message points at.
+  :class:`~deisa.dask.deisa_array.OndemandDeisaArray` per (registered array, timestep). It IS a
+  :class:`~deisa.dask.deisa_array.DeisaArray` (the public type the callback's signature names), but it carries no data
+  -- its graph is empty by construction and its operator surface is the closed lazy one, so each ``.compute()``
+  dispatches a reduction plan to the bridges, which reduce their OWN chunk. The bridges' eager scalar menu and the
+  on-demand plan round both arrive through the topic event and the array transport attached to the delivery.
+- **legacy full-chunk scatter** (``precompute=False``): unchanged, and the remedy every refusal message points at: the
+  chunk itself reaches the workers, so the callback gets a plain :class:`~deisa.dask.deisa_array.DeisaArray` over the
+  real graph of gathered chunk futures.
 
 Delivery mode is per CALLBACK, not per run: two callbacks on the same array may be registered one way each, so the
 topic handler dispatches each callback down its own path within a single event.
 
 Window semantics under on-demand delivery: the callback's argument is an ordinary Python list with one entry per array,
-so ``window[-1]`` is list indexing and delivers the current timestep's collection and ``window[-2]`` the previous
-one. A callback written against the old stub model that indexed the ARGUMENT as if it were the array (``def cb(a):
+so ``window[-1]`` is list indexing and delivers the current timestep's operand and ``window[-2]`` the previous one. A
+callback written against the old stub model that indexed the ARGUMENT as if it were the array (``def cb(a):
 return a[-1].sum()``) therefore keeps working and now reads ``a[-1]`` as "the latest timestep" -- the on-demand reading,
 which is what the stub model was approximating. Anyone who needs the old array reading uses ``precompute=False``.
 
@@ -66,13 +68,12 @@ from dataclasses import dataclass
 from typing import Any, Callable, Collection, Dict, List, Literal, Mapping, Optional, Set, Tuple
 
 import numpy as np
-from deisa.core import CallbackArgs, DeisaArray, Window
+from deisa.core import CallbackArgs, Window
 from deisa.core.interface import IDeisa
 from distributed import Client, Event, Future, Queue
 
 import dask.array as da
 from deisa.dask import ondemand_errors as ondemand_errors
-from deisa.dask.collection import DeisaCollection
 from deisa.dask.constants import (
     CALLBACK_PREFIX,
     CLIENT_KEY,
@@ -81,6 +82,7 @@ from deisa.dask.constants import (
     KEY_PREFIX,
     WAIT_FOR_EXECUTE_CB_EVENT,
 )
+from deisa.dask.deisa_array import DeisaArray, OndemandDeisaArray
 from deisa.dask.handshake import Handshake
 from deisa.dask.ondemand_dispatch import (
     EagerMenu,
@@ -709,13 +711,13 @@ class Deisa(IDeisa):
         )
 
     def _ondemand_views(self, array_name: str, iteration: int, payload: Mapping[str, Any]) -> Dict[Any, Any]:
-        """Build the on-demand delivery view of one array for one timestep: a FRESH collection per callback.
+        """Build the on-demand delivery view of one array for one timestep: a FRESH operand per callback.
 
         - ``:param array_name:`` Registered array the topic event is for.
         - ``:param iteration:`` Timestep the event delivered.
         - ``:param payload:`` The topic event, read for the bridges' eager menus and for a menu failure.
 
-        One instance per callback, not one per (array, timestep): a collection is mutable metadata (``name``,
+        One instance per callback, not one per (array, timestep): an operand is mutable metadata (``name``,
         ``timestep``, ``chunk_shape`` ... are plain attributes), so a callback that writes an attribute -- by accident
         or through a helper that "normalizes" its argument -- would poison every sibling callback on that
         array/timestep AND the retained window history, and every later refusal would name the wrong array/timestep.
@@ -723,28 +725,28 @@ class Deisa(IDeisa):
         independent objects.
 
         The newest timestep of the array is recorded here, before the views are built, so a dispatcher held by an
-        OLDER collection in a callback's window can tell that its timestep is no longer the one the bridges retain.
+        OLDER operand in a callback's window can tell that its timestep is no longer the one the bridges retain.
 
-        ``precompute=False`` callbacks are skipped: they read the full-chunk scatter, so a collection for them would
+        ``precompute=False`` callbacks are skipped: they read the full-chunk scatter, so an operand for them would
         be a delivery nobody consumes.
         """
         self._arrays[array_name].latest_timestep = int(iteration)
         menus = None if payload.get("menu_error") else payload.get("menu")
         return {
-            callback_id: self._ondemand_collection(array_name, iteration, menus)
+            callback_id: self._ondemand_array(array_name, iteration, menus)
             for callback_id in list(self._callbacks_by_array.get(array_name, ()))
             if self._callbacks.get(callback_id, {}).get("precompute", True)
         }
 
-    def _ondemand_collection(self, array_name: str, iteration: int, menus: Any = None) -> DeisaCollection:
-        """Build the collection a callback receives for ``array_name`` at ``iteration``.
+    def _ondemand_array(self, array_name: str, iteration: int, menus: Any = None) -> OndemandDeisaArray:
+        """Build the operand a callback receives for ``array_name`` at ``iteration``.
 
         The compute boundary is attached here and nowhere else. It carries the bridges' eager menu, so a scalar full
         fold costs no round trip, and the array's transport, so anything else can dispatch on demand. Without a
         transport the menu still serves, and a menu miss refuses with the no-transport refusal -- never a gather.
 
-        - ``:param array_name:`` Registered array the collection describes.
-        - ``:param iteration:`` Timestep the collection is delivered for.
+        - ``:param array_name:`` Registered array the operand describes.
+        - ``:param iteration:`` Timestep the operand is delivered for.
         - ``:param menus:`` The eager menu entries the bridges shipped with this event (one per bridge), if any.
         """
         metadata = self.arrays_metadata.get(array_name, {})
@@ -754,7 +756,7 @@ class Deisa(IDeisa):
             menu=_as_eager_menus(menus),
             latest_timestep=lambda: self._arrays[array_name].latest_timestep,
         )
-        return DeisaCollection.from_metadata(array_name, iteration, metadata, dispatcher=dispatcher)
+        return OndemandDeisaArray.from_metadata(array_name, iteration, metadata, dispatcher=dispatcher)
 
     def _process_callback(self, callback_id, cb_data, array_name: str, darr: da.Array | DeisaArray, iteration: int):
         state = cb_data["state"]
@@ -767,9 +769,7 @@ class Deisa(IDeisa):
                 f"{iteration} which is before last seen iteration "
                 f"{entry['last_iteration']}. Iterations must be monotonically increasing."
             )
-        entry["window"].append(
-            darr if isinstance(darr, (DeisaArray, DeisaCollection)) else build_deisa_array(darr, iteration)
-        )
+        entry["window"].append(darr if isinstance(darr, DeisaArray) else build_deisa_array(darr, iteration))
         entry["changed"] = True
         entry["last_iteration"] = iteration
 
