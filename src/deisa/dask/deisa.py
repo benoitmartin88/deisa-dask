@@ -135,27 +135,73 @@ def _is_run_aborting(ex: BaseException) -> bool:
     return isinstance(ex, (OndemandRefusal, *_LEGACY_RUN_ABORTING))
 
 
+def _derive_delivery_flags(analytic: bool, legacy: bool) -> str:
+    """Collapse the two ``precompute`` facts into the ONE delivery mode string.
+
+    - analytic AND legacy → ``"mixed"``: aggregates are folded AND the chunk is scattered (Ben's ruling keeps the
+      mixed regime);
+    - analytic alone → ``"data_free"``: the aggregates and the plans answer everything, nothing ships;
+    - anything else (no analytic reader, whatever the legacy side says) → ``"plain"``: the chunk alone is scattered.
+    """
+    if analytic and legacy:
+        return "mixed"
+    if analytic:
+        return "data_free"
+    return "plain"
+
+
+def _derive_delivery(current: "ArrayMode", precompute: bool) -> str:
+    """Fold ONE newly registered callback's ``precompute`` flag into an array's delivery mode.
+
+    The registration fixes the underlying facts on the record; the ONE fact (the ``delivery`` string) is derived
+    from them by the same rule the prune path uses (:func:`_derive_delivery_flags`), so no ordering of registrations
+    can leave the mode stale.
+    """
+    if not precompute:
+        current.legacy = True
+    else:
+        current.analytic = True
+    return _derive_delivery_flags(current.analytic, current.legacy)
+
+
 @dataclass
 class ArrayMode:
     """One array's delivery mode on the HOST side: one record per registered array, in ``Deisa._arrays``.
 
-    The three facts used to live in three parallel containers (``_ondemand_arrays``, ``_legacy_arrays``,
-    ``_ondemand_latest_timestep``) that only ever agreed on their key set; they are the same array's answer to three
-    questions, so they travel together.
+    The underlying facts (which kinds of callback survive on the array) and the ONE derived delivery fact, plus the
+    newest delivered timestep, travel together as the same array's answers.
 
-    - ``:param ondemand:`` At least one ``precompute=True`` callback reads the array, i.e. the bridges must build its
-      eager scalar aggregates (and may skip the chunk once no legacy reader shares the array).
-    - ``:param legacy:`` At least one ``precompute=False`` callback reads the array, so the bridges must keep
-      scattering its chunk -- decision F3's escape hatch.
+    - ``:param analytic:`` At least one surviving callback delivers with ``precompute=True``: the eager scalar
+      aggregates have a reader, and the on-demand plans may be dispatched.
+    - ``:param legacy:`` At least one surviving callback delivers with ``precompute=False``, i.e. reads the chunk
+      itself, so the bridges must keep scattering it (Ben's ruling keeps the mixed regime alive).
+    - ``:param delivery:`` The ONE fact the handshake files and the bridges read (``get_task_state`` ->
+      ``DeliveryState``), derived from the two facts above:
+
+      * ``"plain"`` -- no analytic reader: the chunk alone is scattered;
+      * ``"mixed"`` -- an analytic reader AND a chunk reader: aggregates are folded AND the chunk is scattered;
+      * ``"data_free"`` -- an analytic reader, no chunk reader: the aggregates and the plans answer everything,
+        nothing ships.
+
     - ``:param latest_timestep:`` The newest timestep this host delivered for the array, or ``None`` before the first
       delivery. Read by every live dispatcher, including the ones held by OLDER collections in a callback's window:
       the bridges retain one chunk per array, so an on-demand reduction of an older window element is refused at
       compose time instead of aborting the run.
     """
 
-    ondemand: bool = False
+    analytic: bool = False
     legacy: bool = False
     latest_timestep: Optional[int] = None
+
+    @property
+    def delivery(self) -> str:
+        """The ONE delivery mode string (see the class docstring): derived, never stored stale."""
+        return _derive_delivery_flags(self.analytic, self.legacy)
+
+    @property
+    def ondemand(self) -> bool:
+        """Whether one of the aggregates/plans paths serves this array (the mixed and data_free modes)."""
+        return self.delivery != "plain"
 
 
 class Deisa(IDeisa):
@@ -402,23 +448,18 @@ class Deisa(IDeisa):
         # own expression at its compute boundary, so there is no upfront AST pass to fail. A raw read is therefore
         # refused at the FIRST compute boundary -- which fails the run -- instead of at registration.
 
-        if not precompute:
-            logger.warning(
-                f"_register_callback_impl: callback {callback.__name__!r} registered "
-                f"with precompute=False -- the bridge will use the legacy full-chunk scatter path."
-            )
-            # A legacy reader means this array's chunk really is read: the bridges must keep scattering it even when a
-            # ``precompute=True`` callback on the same array needs no data at all.
-            for array_name in array_names:
-                self._arrays[array_name].legacy = True
-        else:
-            # These arrays are on-demand targets: the bridges need to know, because an eager scalar aggregates for an
-            # array no callback reads is six chunk folds per bridge per timestep of pure critical-path cost. Filed
-            # with the handshake actor here and at the per-cycle boundary, like the rest of the delivery state.
-            for array_name in array_names:
-                self._arrays[array_name].ondemand = True
+        # ``delivery`` is re-derived from the surviving callbacks' ``precompute`` flags below: registration flips one
+        # flag in, unregistration prunes one flag out, and ONE fact (plain/mixed/data_free) travels to the bridges.
+        for array_name in array_names:
+            if not precompute:
+                logger.warning(
+                    f"_register_callback_impl: callback {callback.__name__!r} registered "
+                    f"with precompute=False -- the bridge will use the legacy full-chunk scatter path."
+                )
+            mode = self._arrays[array_name]
+            _derive_delivery(mode, precompute)  # fixes mode.analytic/mode.legacy; delivery re-derives itself
 
-        # Both per-array facts travel in ONE handshake read, so they are filed together whatever the mode.
+        # The per-array fact travels in ONE handshake write, whatever the mode.
         self._flush_delivery_state_to_handshake()
 
         # create the topic handler and subscribe for EVERY array in a callback (both precompute=True and
@@ -448,20 +489,20 @@ class Deisa(IDeisa):
         return callback_id
 
     def _prune_delivery_flags(self, array_name: str) -> None:
-        """Recompute both per-array delivery facts from the surviving callbacks.
+        """Re-derive the ONE per-array delivery fact from the surviving callbacks.
 
-        - ``ondemand``: at least one callback registered on the array delivers with ``precompute=True``;
-        - ``legacy``: at least one callback registered on the array delivers with ``precompute=False``, i.e. reads the
-          chunk itself, so the bridges must keep scattering it.
+        ``delivery`` is ``"mixed"`` when the surviving callbacks agree to disagree (a ``precompute=True`` AND a
+        ``precompute=False`` one), ``"data_free"`` when only ``precompute=True`` readers survive, ``"plain"`` when no
+        analytic reader survives at all (or nothing survives: an array with no callback is served by the plain path).
 
-        This only touches memory: the changed sets reach the bridges at the next flush point
+        This only touches memory: the changed mode reaches the bridges at the next flush point
         (``execute_callbacks``), never from inside the async topic handler where the unregistration may run.
 
         - ``:param array_name:`` Registered array the removed callback was registered on.
         """
         surviving = [self._callbacks.get(cid, {}) for cid in self._callbacks_by_array.get(array_name, ())]
         mode = self._arrays[array_name]
-        mode.ondemand = any(payload.get("precompute", True) for payload in surviving)
+        mode.analytic = any(payload.get("precompute", True) for payload in surviving)
         mode.legacy = any(not payload.get("precompute", True) for payload in surviving)
 
     def unregister_callback(self, callback_id: Callback_id) -> None:
@@ -503,21 +544,17 @@ class Deisa(IDeisa):
     def _flush_delivery_state_to_handshake(self) -> None:
         """File every array's current delivery state with the handshake actor.
 
-        Two per-array facts travel to the bridges, over the ONE broadcast each of them already enters per array (see
-        :meth:`deisa.dask.handshake.Handshake.get_task_state`):
-
-        - whether the array is an on-demand target, i.e. whether the eager scalar aggregates it computes has any
-          reader at all, and
-        - whether the array still has a legacy (``precompute=False``) reader, i.e. whether its chunk must be scattered
-          even though an on-demand callback on it needs no data.
+        ONE per-array fact travels to the bridges, over the ONE broadcast each of them already enters per array (see
+        :meth:`deisa.dask.handshake.Handshake.get_task_state`): the array's delivery mode, ``"plain"`` (chunk alone),
+        ``"mixed"`` (aggregates AND chunk) or ``"data_free"`` (aggregates only, nothing ships). The tests at
+        :meth:`ArrayMode.delivery` derive it from the surviving callbacks' ``precompute`` flags.
 
         Called by ``register_callback`` (a bridge on the wait_for_go=False path fetches lazily on first send(),
         possibly before the next cycle) and by ``execute_callbacks`` (before the bridges are unblocked).
         ``unregister_callback`` never files: an actor call inside the async topic handler stalls the handler loop. The
         pruned state is filed at the next flush point.
         """
-        self.handshake.set_ondemand_arrays(sorted(name for name, mode in self._arrays.items() if mode.ondemand))
-        self.handshake.set_legacy_arrays(sorted(name for name, mode in self._arrays.items() if mode.legacy))
+        self.handshake.set_delivery_modes({name: mode.delivery for name, mode in self._arrays.items()})
 
     def execute_callbacks(self) -> None:
         """

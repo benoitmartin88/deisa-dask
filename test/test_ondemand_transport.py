@@ -177,7 +177,7 @@ def register_callback(deisa, callback, window_size=1):
         },
     }
     deisa._callbacks_by_array.setdefault(ARRAY_NAME, set()).add(callback_id)
-    deisa._arrays[ARRAY_NAME].ondemand = True
+    deisa._arrays[ARRAY_NAME].analytic = True
     return callback_id
 
 

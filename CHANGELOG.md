@@ -50,6 +50,11 @@ Types of changes:
 
 ### Changed
 
+- The per-array delivery registration is ONE fact now (`K13A`): the handshake files a single
+  `delivery` mode per array -- `"plain"` (chunk alone), `"mixed"` (aggregates AND chunk; the mixed regime stays) or
+  `"data_free"` (aggregates only, nothing ships) -- derived host-side from the surviving callbacks' `precompute`
+  flags. `set_ondemand_arrays`/`set_legacy_arrays` and the two-set handshake are gone; `Handshake.set_delivery_modes`
+  files the dict in one call, `get_task_state` returns one key, and the bridge's `DeliveryState` carries the mode.
 - `mpi4py` is now a required dependency.
 - `Deisa.add_callback(..., precompute=...)` now selects the delivery mode only. `precompute=True` (the default) hands
   each callback one `DeisaCollection` per array and timestep, carrying the reductions the runtime planner dispatched to

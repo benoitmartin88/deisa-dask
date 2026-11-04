@@ -154,14 +154,10 @@ class _FakeHandshake:
     """The handshake surface registration touches: filing the per-array delivery state."""
 
     def __init__(self) -> None:
-        self.ondemand_arrays: list = []
-        self.legacy_arrays: list = []
+        self.delivery_modes: dict = {}
 
-    def set_ondemand_arrays(self, array_names: list) -> None:
-        self.ondemand_arrays = list(array_names)
-
-    def set_legacy_arrays(self, array_names: list) -> None:
-        self.legacy_arrays = list(array_names)
+    def set_delivery_modes(self, modes: dict) -> None:
+        self.delivery_modes = dict(modes)
 
 
 def _ondemand_names(d: Deisa) -> set:
@@ -224,7 +220,9 @@ def test_registration_accepts_the_documented_motivating_example():
     assert cid in d._callbacks, "the callback must be registered, not refused"
     assert d._callbacks[cid]["precompute"] is True, "the payload must carry the delivery mode selected per callback"
     assert _ondemand_names(d) == {"f"}, f"the array must be filed as an on-demand target, got {_ondemand_names(d)}"
-    assert d.handshake.ondemand_arrays == ["f"], "registration files the on-demand arrays with the handshake actor"
+    assert d.handshake.delivery_modes.get("f") == "data_free", (
+        "registration files the delivery mode with the handshake actor"
+    )
 
 
 def test_the_bridge_policy_carries_only_the_leaf_relevant_fields():

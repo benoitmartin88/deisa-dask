@@ -81,14 +81,10 @@ class _FakeHandshake:
     """Minimal handshake surface used by Deisa._register_callback_impl."""
 
     def __init__(self):
-        self.ondemand_arrays: list = []
-        self.legacy_arrays: list = []
+        self.delivery_modes: dict = {}
 
-    def set_ondemand_arrays(self, array_names):  # noqa: D102
-        self.ondemand_arrays = list(array_names)
-
-    def set_legacy_arrays(self, array_names):  # noqa: D102
-        self.legacy_arrays = list(array_names)
+    def set_delivery_modes(self, modes):  # noqa: D102
+        self.delivery_modes = dict(modes)
 
 
 def _ondemand_names(d: Deisa) -> set:
@@ -185,7 +181,7 @@ class TestDeisaRegistration:
         # The delivery state is filed immediately (a bridge on the wait_for_go=False path fetches it lazily on its
         # first send(), possibly before the next cycle).
         assert _ondemand_names(d) == {"a"}
-        assert d.handshake.ondemand_arrays == ["a"]
+        assert d.handshake.delivery_modes.get("a") == "data_free"
 
     def test_registration_failure_leaves_no_trace(self):
         """A registration that raises leaks no payload.

@@ -257,15 +257,11 @@ class _FakeHandshake:
     """The handshake surface ``execute_callbacks`` touches."""
 
     def __init__(self):
-        self.ondemand_arrays = set()
-        self.legacy_arrays = set()
+        self.delivery_modes = {}
         self.finished = 0
 
-    def set_ondemand_arrays(self, array_names):  # noqa: D102
-        self.ondemand_arrays = set(array_names)
-
-    def set_legacy_arrays(self, array_names):  # noqa: D102
-        self.legacy_arrays = set(array_names)
+    def set_delivery_modes(self, modes):  # noqa: D102
+        self.delivery_modes = dict(modes)
 
     def wait_for_bridges_to_finish(self):  # noqa: D102
         self.finished += 1
@@ -333,7 +329,7 @@ def register(deisa, callback, window_size=2, when="OR", exception_handler=None, 
     }
     deisa._callbacks_by_array.setdefault(ARRAY_NAME, set()).add(callback_id)
     if precompute:
-        deisa._arrays[ARRAY_NAME].ondemand = True
+        deisa._arrays[ARRAY_NAME].analytic = True
     else:
         deisa._arrays[ARRAY_NAME].legacy = True
     return callback_id
@@ -751,33 +747,31 @@ def test_mixed_array_still_gets_the_full_chunk(fleets, client, monkeypatch):
     """One array with an on-demand callback AND a legacy one keeps the full-chunk scatter (decision F3's escape
     hatch).
 
-    This is the case that forces the second handshake fact. The on-demand callback alone makes the array a data-free
-    delivery -- the bridge would ship the aggregates and nothing else -- but the ``precompute=False`` callback on
-    the SAME array reads the chunk, so skipping the scatter would hand it an event with ``futures: []``. Host,
-    handshake actor and bridge are driven end to end here (no cluster): the host files both facts, the actor returns
-    them in ONE dict, and the bridge's send must still scatter.
+    This is the case that keeps the mixed regime alive (Ben's ruling). The on-demand callback alone makes the array
+    a data-free delivery -- the bridge would ship the aggregates and nothing else -- but the ``precompute=False``
+    callback on the SAME array reads the chunk, so skipping the scatter would hand it an event with
+    ``futures: []``. Host, handshake actor and bridge are driven end to end here (no cluster): the host files the
+    ONE mode, the actor returns it in ONE dict, and the bridge's send must still scatter.
     """
     deisa = make_deisa(fleets, client, monkeypatch)
     register(deisa, lambda window: None)
     register(deisa, lambda window: None, precompute=False)
     deisa._flush_delivery_state_to_handshake()
 
-    assert deisa.handshake.ondemand_arrays == {ARRAY_NAME}
-    assert deisa.handshake.legacy_arrays == {ARRAY_NAME}, "the legacy reader must be filed next to the on-demand flag"
+    assert deisa.handshake.delivery_modes == {ARRAY_NAME: "mixed"}, "the ONE mode carries both facts"
 
     # The actor's read: the shape the bridge consumes, with both facts in one dict.
     actor = Handshake.HandshakeActor.__new__(Handshake.HandshakeActor)
-    actor.ondemand_arrays = deisa.handshake.ondemand_arrays
-    actor.legacy_arrays = deisa.handshake.legacy_arrays
+    actor.delivery_modes = deisa.handshake.delivery_modes
     state = actor.get_task_state(ARRAY_NAME)
-    assert state == {"ondemand": True, "legacy": True}, state
+    assert state == {"delivery": "mixed"}, state
 
     bridge, wire_client = _make_send_bridge()
     # Start from an empty cache, like a bridge taking its state from the handshake read.
     bridge._delivery = {}
     bridge.handshake = _WireHandshake(state)
     bridge._ensure_task_state(ARRAY_NAME)
-    assert bridge._delivery[ARRAY_NAME] == DeliveryState(ondemand=True, legacy=True, fetched=True)
+    assert bridge._delivery[ARRAY_NAME] == DeliveryState(delivery="mixed", fetched=True)
     assert bridge._needs_chunk_delivery(ARRAY_NAME), "a legacy reader on the array keeps the chunk delivery"
 
     scattered = []
@@ -808,7 +802,7 @@ def test_ondemand_only_array_ships_its_aggregates_and_no_data(monkeypatch):
     reaches the scheduler (an empty ``update_data`` + an empty desire list would be pure round trips).
     """
     bridge, wire_client = _make_send_bridge()
-    bridge._delivery = {ARRAY_NAME: DeliveryState(ondemand=True, legacy=False, fetched=True)}
+    bridge._delivery = {ARRAY_NAME: DeliveryState(delivery="data_free", fetched=True)}
     scattered = []
 
     def recording_scatter(*args, **kwargs):
@@ -862,9 +856,9 @@ def test_first_send_on_lazy_path_ships_no_data():
     """
     bridge, wire_client = _make_send_bridge()
     # The lazy-path state at the first send: nothing prefetched, so the state cache is empty and the handshake is the
-    # only source. On-demand target with no legacy reader -- the data-free shape.
+    # only source. Data-free target: the aggregates answer everything and nothing ships.
     bridge._delivery = {}
-    handshake = _WireHandshake({"ondemand": True, "legacy": False})
+    handshake = _WireHandshake({"delivery": "data_free"})
     bridge.handshake = handshake
 
     scattered = []
@@ -885,7 +879,7 @@ def test_first_send_on_lazy_path_ships_no_data():
 
     assert handshake.reads == [ARRAY_NAME], "the first send must read the array's delivery state"
     assert scattered == [], "the FIRST send of an on-demand-only array must not scatter the chunk"
-    assert bridge._delivery[ARRAY_NAME] == DeliveryState(ondemand=True, legacy=False, fetched=True), (
+    assert bridge._delivery[ARRAY_NAME] == DeliveryState(delivery="data_free", fetched=True), (
         "the fetch must fill the cache the decision needs"
     )
     _, payload = wire_client.events[0]
@@ -976,14 +970,16 @@ def test_departed_ondemand_callback_flips_the_array_off(fleets, client, monkeypa
     ondemand_id = register(deisa, lambda window: None)
     assert deisa._arrays[ARRAY_NAME].ondemand
     deisa._flush_delivery_state_to_handshake()
-    assert deisa.handshake.ondemand_arrays == {ARRAY_NAME}
+    assert deisa.handshake.delivery_modes == {ARRAY_NAME: "data_free"}
 
     register(deisa, lambda window: None, precompute=False)
     deisa.unregister_callback(ondemand_id)
 
     assert not deisa._arrays[ARRAY_NAME].ondemand, "no on-demand callback is left on the array"
     deisa.execute_callbacks()
-    assert deisa.handshake.ondemand_arrays == set(), "the pruned set is re-filed at the cycle boundary"
+    assert deisa.handshake.delivery_modes.get(ARRAY_NAME, "plain") == "plain", (
+        "the pruned mode is re-filed at the cycle boundary"
+    )
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -1068,7 +1064,7 @@ def _make_send_bridge():
     # The cached delivery state, as the init-time prefetch leaves it: an on-demand target AND a legacy
     # (chunk-reading) array, so these tests keep measuring the full-chunk payload. The data-free path (on-demand target
     # and no legacy reader) has its own test below.
-    bridge._delivery = {ARRAY_NAME: DeliveryState(ondemand=True, legacy=True, fetched=True)}
+    bridge._delivery = {ARRAY_NAME: DeliveryState(delivery="mixed", fetched=True)}
     # No handshake: the state above is already the cached result, so ``send`` must find the array fetched and never
     # enter the per-array broadcast (``DeliveryState.fetched`` is the fetch marker).
     bridge.handshake = None

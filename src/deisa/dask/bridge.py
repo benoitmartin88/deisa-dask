@@ -91,25 +91,22 @@ except Exception:
 class DeliveryState:
     """One array's delivery state on the BRIDGE side: one record per participating array, in ``Bridge._delivery``.
 
-    Everything ``send`` knows about the array's delivery lives here, so the three facts that used to sit in three
-    parallel dicts (the fetched ``{ondemand, legacy}`` pair and the retained chunk) can never disagree about their key
-    set.
+    Everything ``send`` knows about the array's delivery lives here, so the ONE filed mode and the retained chunk can
+    never disagree about their key set.
 
-    - ``:param ondemand:`` The host declared a ``precompute=True`` callback on the array, i.e. the array is an
-      on-demand target: its eager aggregates and its on-demand plans answer its callbacks.
-    - ``:param legacy:`` The host declared a ``precompute=False`` callback on the array, i.e. something reads the chunk
-      itself.
-    - ``:param fetched:`` Whether ``ondemand``/``legacy`` have been read out of the handshake actor yet -- THE fetch
-      marker. It cannot be presence in the dict: ``send`` records ``last_chunk`` on the same record BEFORE it fetches
-      the state (the K7F-06 order), so a record may exist while nothing has been fetched. An unfetched record is
-      therefore NOT a cached result, and its empty flags must never be read as one.
+    - ``:param delivery:`` The ONE fact the host filed: ``"plain"`` (chunk alone), ``"mixed"`` (aggregates AND chunk)
+      or ``"data_free"`` (aggregates only, nothing ships). Derived host-side from the surviving callbacks'
+      ``precompute`` flags; the bridge only chooses how to serve.
+    - ``:param fetched:`` Whether ``delivery`` has been read out of the handshake actor yet -- THE fetch marker. It
+      cannot be presence in the dict: ``send`` records ``last_chunk`` on the same record BEFORE it fetches the state
+      (the K7F-06 order), so a record may exist while nothing has been fetched. An unfetched record is therefore NOT
+      a cached result, and its default ``"plain"`` must never be read as one.
     - ``:param last_chunk:`` The ``(timestep, chunk)`` this bridge last sent for the array, or ``(None, None)`` when it
       has sent nothing yet. Retained by reference (the pump only reads it) so an on-demand request for timestep N
       folds the chunk the host is asking about.
     """
 
-    ondemand: bool = False
-    legacy: bool = False
+    delivery: str = "plain"
     fetched: bool = False
     last_chunk: Tuple[Optional[int], Any] = (None, None)
 
@@ -563,7 +560,7 @@ class Bridge(IBridge):
         self._ensure_task_state(array_name)
 
         state = self._delivery.get(array_name)
-        ondemand_delivery = state is not None and state.ondemand
+        ondemand_delivery = state is not None and state.delivery != "plain"
 
         # Whether the chunk has to be shipped at all: an on-demand array with no legacy reader is answered
         # entirely by the aggregates and by the on-demand plans served above, so nothing on the workers ever
@@ -917,7 +914,7 @@ class Bridge(IBridge):
           what lets the analytics side refuse an aggregate value of an earlier timestep.
         """
         state = self._delivery.get(array_name)
-        if state is None or not state.ondemand:
+        if state is None or state.delivery == "plain":
             return None, None
         metadata = self.arrays_metadata[array_name]
         collection = OndemandDeisaArray.from_metadata(array_name, timestep, metadata)
@@ -1136,23 +1133,23 @@ class Bridge(IBridge):
     def _needs_chunk_delivery(self, array_name: str) -> bool:
         """Whether ``send`` must scatter this array's data at all.
 
-        Only an on-demand target can skip it, and only while nothing reads the chunk: every callback on such an
-        array either reads the eager aggregates, dispatches an on-demand plan, or both. An array with a legacy
-        (``precompute=False``) reader always needs the chunk -- that is decision F3's escape hatch -- and so does an
-        array nobody declared, whose delivery mode this bridge cannot know. A record that exists but has never been
-        fetched (``last_chunk`` was retained on it) is NOT a declared state either: it serves the chunk.
+        Only a ``"data_free"`` target can skip it, and only after the fetch: every callback on such an array either
+        reads the eager aggregates, dispatches an on-demand plan, or both. Every other mode -- ``"plain"`` and
+        ``"mixed"`` alike -- keeps scattering the chunk (Ben's ruling keeps the mixed regime), and so does an array
+        nobody declared, whose delivery mode this bridge cannot know. A record that exists but has never been fetched
+        (``last_chunk`` was retained on it) is NOT a declared state either: it serves the chunk.
 
         - ``:param array_name:`` Registered array the send is for.
         """
         state = self._delivery.get(array_name)
         if state is None or not state.fetched:
             return True
-        return state.legacy or not state.ondemand
+        return state.delivery != "data_free"
 
     def _ensure_task_state(self, array_name: str) -> None:
         """Fetch this array's delivery state once and cache it in ``_delivery``.
 
-        The bridge reads ``{"ondemand", "legacy"}`` from the handshake actor on sub-comm rank 0 and broadcasts it to the
+        The bridge reads ``{"delivery": mode}`` from the handshake actor on sub-comm rank 0 and broadcasts it to the
         other participating ranks. Every fact travels in ONE collective on purpose: a second broadcast would have to be
         entered in the same order on every rank of the sub-comm, i.e. one more way to hang the array for one dict entry.
         After one fetch, sends never touch the handshake: the explicit ``DeliveryState.fetched`` flag -- not the arrival
@@ -1175,8 +1172,7 @@ class Bridge(IBridge):
             state = sub_comm.bcast(None, root=0)
         if state is not None:
             record = self._delivery.setdefault(array_name, DeliveryState())
-            record.ondemand = bool(state.get("ondemand"))
-            record.legacy = bool(state.get("legacy"))
+            record.delivery = state.get("delivery", "plain")
             record.fetched = True
 
     def _prefetch_task_state(self) -> None:

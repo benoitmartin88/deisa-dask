@@ -52,16 +52,13 @@ class Handshake:
             self.arrays_metadata = {}
             self.bridges_ready = False
             self.feedback_queue_size = 1024
+            # ONE delivery fact per array: ``"plain"`` (chunk alone), ``"mixed"`` (aggregates AND chunk) or
+            # ``"data_free"`` (aggregates only, nothing ships). The bridge reads this to decide whether to fold the
+            # eager scalar aggregates and whether to scatter the chunk at all: for an array nobody reads, both costs
+            # would be pure critical-path waste. An array the host never filed -- nobody registered a callback on it --
+            # is ``"plain"``: the full-chunk scatter is the DEFAULT, not a registration fact.
+            self.delivery_modes: dict = {}
             self.timestep: Optional[int] = None
-            # Arrays the analytics host delivers to at least one on-demand callback. The bridge reads this to
-            # decide whether its eager scalar aggregates have a reader at all: aggregates for an array nobody
-            # subscribes to are six chunk folds per bridge per timestep of pure critical-path cost.
-            self.ondemand_arrays = set()
-            # Arrays with at least one LEGACY (``precompute=False``) reader, i.e. a callback that reads the chunk
-            # itself. The bridge reads this to decide whether it must scatter the chunk at all: an on-demand
-            # array with no such reader is answered entirely by its aggregates and its on-demand plans, so shipping the
-            # chunk as well would send 32 MB per bridge per timestep for data nobody reads.
-            self.legacy_arrays = set()
 
         def set_bridges_ready(self, nb_bridges: int, arrays_metadata: dict) -> None:
             logger.debug(
@@ -94,30 +91,21 @@ class Handshake:
         def get_feedback_queue_size(self) -> int | Future:
             return self.feedback_queue_size
 
-        def set_ondemand_arrays(self, array_names: list) -> None:
-            logger.debug(f"set_ondemand_arrays(): array_names={array_names}")
-            self.ondemand_arrays = set(array_names)
-
-        def set_legacy_arrays(self, array_names: list) -> None:
-            logger.debug(f"set_legacy_arrays(): array_names={array_names}")
-            self.legacy_arrays = set(array_names)
+        def set_delivery_modes(self, modes: dict) -> None:
+            logger.debug(f"set_delivery_modes(): modes={modes}")
+            self.delivery_modes = dict(modes)
 
         def get_task_state(self, array_name: str) -> dict | Future:
-            """Every per-array scheduling fact in one read.
+            """Every per-array scheduling fact in one read: the ONE delivery mode of the array.
 
-            The bridge fetches this over a single per-array broadcast: the on-demand flag and the
-            legacy-reader flag must arrive in the same collective, because a second, separate broadcast would have
-            to be entered in the same order on every rank of the sub-comm -- two maskable sources of a hang for one
-            dict entry.
+            The bridge fetches this over a single per-array broadcast: the mode must arrive in the same collective
+            across the sub-comm, because a second, separate broadcast would have to be entered in the same order on
+            every rank -- two maskable sources of a hang for one dict entry.
 
-            ``legacy`` is what keeps the escape hatch (decision F3) working: an on-demand array that ALSO has a
-            ``precompute=False`` callback still needs its chunk scattered, so the bridge may skip the data only when
-            ``ondemand`` is true AND ``legacy`` is false.
+            ``"plain"`` is the default: an array the host never declared is served by the plain full-chunk scatter,
+            so the bridge's path for an unknown array matches today's behaviour exactly.
             """
-            return {
-                "ondemand": array_name in self.ondemand_arrays,
-                "legacy": array_name in self.legacy_arrays,
-            }
+            return {"delivery": self.delivery_modes.get(array_name, "plain")}
 
         def __go(self) -> None:
             logger.debug("Handshake go !")
@@ -168,13 +156,9 @@ class Handshake:
         assert self.__handshake_actor is not None
         return self.__handshake_actor.get_nb_bridges().result()
 
-    def set_ondemand_arrays(self, array_names: list) -> None:
+    def set_delivery_modes(self, modes: dict) -> None:
         assert self.__handshake_actor is not None
-        self.__handshake_actor.set_ondemand_arrays(array_names).result()
-
-    def set_legacy_arrays(self, array_names: list) -> None:
-        assert self.__handshake_actor is not None
-        self.__handshake_actor.set_legacy_arrays(array_names).result()
+        self.__handshake_actor.set_delivery_modes(modes).result()
 
     def get_task_state(self, array_name: str) -> dict:
         assert self.__handshake_actor is not None
