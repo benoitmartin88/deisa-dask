@@ -50,6 +50,13 @@ Types of changes:
 
 ### Changed
 
+- The on-demand reduction plan no longer uses a pair of `distributed.Queue` objects (`K13B`): the request is filed
+  with the ONE handshake actor the run already starts (`Handshake.put_plan`, one slot per array, taken once per
+  `send` boundary), and the partial reports return on the event the array root already publishes, under the new
+  `plan_reports` key, which the host's collector merges per request id. `QueuePlanExchange`,
+  `plan_request_queue_name`, `plan_report_queue_name` and `PlanPump.open_queues` are gone; nothing is spawned, no
+  scheduler-held queue remains for this path, and the fold-at-boundary collective (broadcast request, fold, gather
+  partials) is unchanged.
 - The per-array delivery registration is ONE fact now (`K13A`): the handshake files a single
   `delivery` mode per array -- `"plain"` (chunk alone), `"mixed"` (aggregates AND chunk; the mixed regime stays) or
   `"data_free"` (aggregates only, nothing ships) -- derived host-side from the surviving callbacks' `precompute`

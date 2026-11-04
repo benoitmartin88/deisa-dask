@@ -1187,15 +1187,22 @@ def test_aggregates_round_trip_preserves_keys_values_dtypes_and_stamps(fleets, c
 # ``DeliveryState.last_chunk`` retention. Before this pin, deleting either one left this file at 21 passed -- ``std``,
 # every axis reduction and every aggregates miss could be disconnected from the run with a green suite.
 # ---------------------------------------------------------------------------------------------------------------------
-class _RecordingReportQueue:
-    """The array's plan report queue, recording what the bridge posts instead of handing it to the host."""
+class _RecordingPlanHandshake:
+    """The array root's handshake handle, handing over the plans the test parks and nothing else.
+
+    ``take_plans`` is the production shape (``[]`` or ``[plan]``, never a wait), so the boundary's take is exercised
+    without a scheduler: what the test asserts is the EVENT the served reports ride.
+    """
 
     def __init__(self):
-        self.reports = []
+        self.plans = []
+        self.taken = 0
 
-    def put(self, report):
-        """- ``:param report:`` One ``PartialReport`` posted by the rank that roots the array."""
-        self.reports.append(report)
+    def take_plans(self, array_name):
+        """- ``:param array_name:`` Registered array whose slot is taken."""
+        self.taken += 1
+        plans, self.plans = self.plans, []
+        return plans
 
 
 def test_send_serves_pending_plans_then_retains_the_chunk_by_reference():
@@ -1212,12 +1219,12 @@ def test_send_serves_pending_plans_then_retains_the_chunk_by_reference():
     """
     first = np.random.default_rng(0).normal(size=CHUNK_SHAPE).astype(np.float32)
     second = np.random.default_rng(1).normal(size=CHUNK_SHAPE).astype(np.float32)
-    bridge, _ = _make_send_bridge()
+    bridge, wire_client = _make_send_bridge()
     # The production shape of a participating bridge: one pump for the array (its presence is what makes ``send`` enter
     # the boundary), owning the backlog the root's boundary poll fills and the array's report queue.
     pump = PlanPump(ARRAY_NAME, bridge._array_comms[ARRAY_NAME], chunk_position(0), bridge.id)
-    reports = _RecordingReportQueue()
-    pump.report_queue = reports
+    handshake = _RecordingPlanHandshake()
+    pump.attach_handshake(handshake)
     bridge._plan_pumps = {ARRAY_NAME: pump}
 
     boundary_calls = []
@@ -1244,9 +1251,9 @@ def test_send_serves_pending_plans_then_retains_the_chunk_by_reference():
     assert retained_timestep == 0
     assert retained_chunk is first, "the retained chunk must be the object passed in, not a copy"
 
-    # A request for timestep 0 lands between the two sends: the host asks for the chunk the bridges last delivered.
+    # A request for timestep 0 lands between the two sends: the host puts it in the actor the root takes from.
     request = compose_request(OndemandDeisaArray.from_metadata(ARRAY_NAME, 0, WIRE_METADATA[ARRAY_NAME]).sum())
-    pump.backlog.put(PlanRequest(request_id="req-0", array_name=ARRAY_NAME, timestep=0, request=request))
+    handshake.plans.append(PlanRequest(request_id="req-0", array_name=ARRAY_NAME, timestep=0, request=request))
 
     # Send 2: the boundary answers from the PREVIOUS chunk, then the retention takes this one.
     bridge.send(ARRAY_NAME, second, 1)
@@ -1254,9 +1261,14 @@ def test_send_serves_pending_plans_then_retains_the_chunk_by_reference():
 
     assert len(boundary_calls) == 2, "the boundary runs once per send"
     assert boundary_calls[1] == (0, first), "the boundary must fold the PREVIOUS chunk, entered before the retention"
+    assert handshake.taken == 2, "the boundary takes the actor slot once per send, empty or not"
     retained_timestep, retained_chunk = bridge._delivery[ARRAY_NAME].last_chunk
     assert retained_timestep == 1
     assert retained_chunk is second, "the retention must follow the boundary, keeping THIS timestep's chunk"
-    # The answer belongs to timestep 0: ``first`` was still the retained chunk when the plan was served.
-    assert [report.timestep for report in reports.reports] == [0]
-    assert float(reports.reports[0].partial) == pytest.approx(float(np.sum(first)), rel=1e-5)
+    # The answer belongs to timestep 0 -- ``first`` was still the retained chunk when the plan was served -- and it
+    # leaves on the event the SAME send publishes, encoded (the bus is msgpack).
+    _, payload = wire_client.events[-1]
+    reported = payload["plan_reports"]
+    assert [entry["request_id"] for entry in reported] == ["req-0"]
+    assert [entry["timestep"] for entry in reported] == [0]
+    assert reported[0]["partial"]["value"]["data"][0] == pytest.approx(float(np.sum(first)), rel=1e-5)

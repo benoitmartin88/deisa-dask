@@ -86,10 +86,10 @@ from deisa.dask.deisa_array import DeisaArray, OndemandDeisaArray
 from deisa.dask.handshake import Handshake
 from deisa.dask.ondemand_dispatch import (
     EagerAggregates,
+    PartialReport,
     PlanDispatcher,
-    QueuePlanExchange,
-    plan_report_queue_name,
-    plan_request_queue_name,
+    PlanEventExchange,
+    PlanReportCollector,
 )
 from deisa.dask.ondemand_errors import OndemandRefusal
 from deisa.dask.precompute_errors import (
@@ -207,6 +207,14 @@ class ArrayMode:
 class Deisa(IDeisa):
     Callback_id = str
 
+    def __new__(cls, *args, **kwargs):
+        # Create the per-host report collector on every instance from birth -- including instances a test stub builds
+        # via ``__new__`` with ``__init__`` skipped, which is exactly where the None-attribute class default would
+        # surface as an AttributeError deep inside the topic handler.
+        obj = super().__new__(cls)
+        obj._plan_reports = PlanReportCollector()
+        return obj
+
     def __init__(self, feedback_queue_size: int = 1024, *args, **kwargs) -> None:
         """
         Initializes a class instance, configuring the client and setting up the necessary infrastructure for
@@ -242,10 +250,14 @@ class Deisa(IDeisa):
         self._tasks = set()
         # True once execute_callbacks() has run; no new callbacks may be registered after the cycle has started.
         self._execute_callbacks_called = False
-        # array_name -> exchange callable of the on-demand reduction path (one request/reports round trip over the
-        # array's sub-comm). Internal, never a user parameter: the delivery attaches the collection's compute boundary
-        # from here, and an array without an entry still serves its eager aggregates and refuses the rest.
+        # array_name -> exchange callable of the on-demand reduction path (one request/reports round trip: the request
+        # into the handshake actor, the reports off the topic events). Internal, never a user parameter: the delivery
+        # attaches the collection's compute boundary from here, and an array without an entry still serves its eager
+        # aggregates and refuses the rest.
         self._ondemand_transports: Dict[str, Callable[[Any], Any]] = {}
+        # Where the reports of a dispatched plan land: the topic handler feeds every event's ``plan_reports`` in, and
+        # the exchange blocked on that request id wakes up. One collector for the whole host, keyed by request id.
+        self._plan_reports = PlanReportCollector()
         # One record per array for BOTH delivery facts and the newest delivered timestep. A ``precompute=True``
         # callback files ``ondemand`` (declared to the bridges over the handshake by
         # ``_flush_delivery_state_to_handshake``, because eager scalar aggregates for an array no callback
@@ -264,12 +276,14 @@ class Deisa(IDeisa):
         self._attach_ondemand_transports()
 
     def _attach_ondemand_transports(self) -> None:
-        """Attach the production transport of every registered array: the array's pair of dask queues.
+        """Attach the production transport of every registered array: the handshake actor plus the topic events.
 
-        This is the writer of ``_ondemand_transports``. The queues are named by convention and per array, the same way
-        the feedback queues are, so the bridges attach to them without the host sending them anything: the host puts a
-        request on ``plan_request_queue_name``, the array's root bridge picks it up and answers on
-        ``plan_report_queue_name``, and what comes back is merged exactly as a test-injected exchange's reports are.
+        This is the writer of ``_ondemand_transports``. The request side is the ONE handshake actor the run already
+        starts (:meth:`deisa.dask.handshake.Handshake.put_plan`); the report side is the event the array root already
+        publishes, which the topic handler feeds into ``_plan_reports``. Nothing is spawned and nothing is queued: the
+        host puts a request in the actor's per-array slot, the array's root bridge takes it at its next ``send``
+        boundary, and the reports come back on that send's event -- merged exactly as a test-injected exchange's
+        reports are.
 
         Every array gets one: the first on-demand request can arrive as soon as the first delivered timestep, which is
         before any callback has necessarily run, so there is no later point at which attaching could be justified over
@@ -280,9 +294,9 @@ class Deisa(IDeisa):
             bridge_count = _grid_size_from_metadata(metadata)
             if not bridge_count:
                 continue
-            self._ondemand_transports[array_name] = QueuePlanExchange(
-                Queue(plan_request_queue_name(array_name), client=self.client),
-                Queue(plan_report_queue_name(array_name), client=self.client),
+            self._ondemand_transports[array_name] = PlanEventExchange(
+                self.handshake,
+                self._plan_reports,
                 bridge_count,
             )
             logger.debug(f"on-demand transport attached for array {array_name!r} over {bridge_count} bridge(s)")
@@ -638,6 +652,11 @@ class Deisa(IDeisa):
                 _, payload = event
 
                 logger.debug(f"topic_handler: array_name={array_name}, payload={payload}")
+
+                # The reports of a plan request the array root served at ITS boundary ride THIS event. Hand them to
+                # the collector FIRST: the callback that dispatched that plan is blocked on them, and the sooner it is
+                # woken the sooner the rest of this handler has a free worker thread to run the other callbacks on.
+                _weak_self._plan_reports.deliver(_as_partial_reports(payload.get("plan_reports")))
 
                 iteration = payload["iteration"]
                 futures = payload["futures"]
@@ -1026,6 +1045,22 @@ def _as_eager_aggregates(aggregates: Any) -> List[EagerAggregates]:
     normalized: List[EagerAggregates] = []
     for entry in aggregates or ():
         normalized.append(entry if isinstance(entry, EagerAggregates) else EagerAggregates.from_payload(dict(entry)))
+    return normalized
+
+
+def _as_partial_reports(reports: Any) -> List[PartialReport]:
+    """Normalize the topic event's ``plan_reports`` entry into :class:`PartialReport` objects.
+
+    Mirrors :func:`_as_eager_aggregates` for the same reason: the bridges encode each report with
+    ``PartialReport.as_payload`` (the bus is msgpack), while a test or an alternative transport may hand over live
+    reports. ``None`` -- the entry is absent unless a boundary served a plan -- becomes an empty list.
+
+    - ``:param reports:`` The event's ``plan_reports`` entry: ``None``, or a sequence of
+      ``PartialReport``/mapping entries.
+    """
+    normalized: List[PartialReport] = []
+    for entry in reports or ():
+        normalized.append(entry if isinstance(entry, PartialReport) else PartialReport.from_payload(dict(entry)))
     return normalized
 
 

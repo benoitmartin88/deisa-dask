@@ -27,7 +27,7 @@
 # POSSIBILITY OF SUCH DAMAGE.
 # =============================================================================
 import logging
-from typing import Optional
+from typing import Any, List, Optional
 
 from distributed import Client, Event, Future, get_client
 
@@ -58,6 +58,11 @@ class Handshake:
             # would be pure critical-path waste. An array the host never filed -- nobody registered a callback on it --
             # is ``"plain"``: the full-chunk scatter is the DEFAULT, not a registration fact.
             self.delivery_modes: dict = {}
+            # The analytics host's on-demand plan requests, ONE slot per array: ``array_name -> PlanRequest``. The
+            # root bridge of the array takes the slot at each ``send`` boundary and folds it there, which is why no
+            # queue (and no polling thread) is needed to carry a request: this actor is already the one round trip
+            # both sides make, so a request rides the mechanism every other handshake fact rides.
+            self.plan_requests: dict = {}
             self.timestep: Optional[int] = None
 
         def set_bridges_ready(self, nb_bridges: int, arrays_metadata: dict) -> None:
@@ -106,6 +111,35 @@ class Handshake:
             so the bridge's path for an unknown array matches today's behaviour exactly.
             """
             return {"delivery": self.delivery_modes.get(array_name, "plain")}
+
+        def put_plan(self, array_name: str, plan: Any) -> None:
+            """Park the host's on-demand plan request for ONE array, replacing any request not yet taken.
+
+            ONE slot per array, and that is a correctness statement, not a simplification: the host's
+            ``PlanEventExchange`` blocks until the reports of the request it put have arrived, so it never has two
+            requests for the same array in flight -- a second put can only follow a completed round. Where an older
+            request is still parked, nobody is waiting for it any more (its host side timed out and refused), so the
+            latest request is the only one worth serving. A queue here would instead let a request nobody waits for
+            be served at a later boundary, which is work whose reports are dropped.
+
+            - ``:param array_name:`` Registered array the request is rooted in; the array root's slot key.
+            - ``:param plan:`` The composed :class:`~deisa.dask.ondemand_dispatch.PlanRequest`.
+            """
+            self.plan_requests[str(array_name)] = plan
+
+        def take_plans(self, array_name: str) -> List[Any]:
+            """Take the array's parked request, and answer at once: ``[]`` or ``[plan]``, never a wait.
+
+            The bridge calls this at the array's ``send`` boundary. It is non-blocking by construction -- the actor
+            answers with what is stored, or with an empty list when nothing was put since the last take -- so an idle
+            boundary costs one actor round trip and no deadline is hidden in the scheduler. A list rather than a
+            single request because it is what the boundary broadcasts to the array's peers: the root hands the
+            broadcast exactly what it took, empty or not, so every rank enters the same collective every timestep.
+
+            - ``:param array_name:`` Registered array whose slot is drained.
+            """
+            plan = self.plan_requests.pop(str(array_name), None)
+            return [] if plan is None else [plan]
 
         def __go(self) -> None:
             logger.debug("Handshake go !")
@@ -163,6 +197,28 @@ class Handshake:
     def get_task_state(self, array_name: str) -> dict:
         assert self.__handshake_actor is not None
         return self.__handshake_actor.get_task_state(array_name).result()
+
+    def put_plan(self, array_name: str, plan: Any) -> None:
+        """Hand ONE on-demand plan request to the array's root bridge, through the handshake actor.
+
+        The host half of the plan transport: the request waits in the actor's per-array slot until the array root
+        takes it at its next ``send`` boundary. One actor call, no queue, no subscription.
+
+        - ``:param array_name:`` Registered array the request is rooted in.
+        - ``:param plan:`` The composed :class:`~deisa.dask.ondemand_dispatch.PlanRequest`.
+        """
+        assert self.__handshake_actor is not None
+        self.__handshake_actor.put_plan(array_name, plan).result()
+
+    def take_plans(self, array_name: str) -> List[Any]:
+        """Take the array's parked plan request, if any: ``[]`` or ``[plan]``, without waiting for one.
+
+        The bridge half of the plan transport, called by the array root at its ``send`` boundary.
+
+        - ``:param array_name:`` Registered array whose request slot is drained.
+        """
+        assert self.__handshake_actor is not None
+        return self.__handshake_actor.take_plans(array_name).result()
 
     def __wait_for_go(self) -> None:
         Event(Handshake._DEISA_WAIT_FOR_GO_EVENT, client=self.client).wait()

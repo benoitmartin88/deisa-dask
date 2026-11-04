@@ -67,11 +67,10 @@ from deisa.dask.deisa_array import OndemandDeisaArray
 from deisa.dask.handshake import Handshake
 from deisa.dask.ondemand_dispatch import (
     EagerAggregates,
+    PartialReport,
     PlanRequestBacklog,
     PlanResponder,
     build_eager_aggregates,
-    plan_report_queue_name,
-    plan_request_queue_name,
 )
 from deisa.dask.utils import called_from_event_loop, get_client, run_coro_on_private_loop
 
@@ -112,7 +111,7 @@ class DeliveryState:
 
 
 class PlanPump:
-    """The on-demand reduction transport of ONE array on ONE bridge: its backlog and its pair of dask queues.
+    """The on-demand reduction transport of ONE array on ONE bridge: its backlog and its handshake handle.
 
     Every participating rank gets a pump, and the ``backlog`` is unconditional: presence of the array in
     ``Bridge._plan_pumps`` is what makes ``send`` enter the array's boundary collective. Gating it on a per-process
@@ -120,12 +119,14 @@ class PlanPump:
     on one communicator, i.e. a hang instead of a refusal. The array's participating set is the same on every rank, so
     the pumps are too.
 
-    The pair of queues exists only on the sub-comm root that owns the array's dask client: that rank is the array's ONE
-    queue consumer, and it fans the requests out through the boundary broadcast, which is enough. Nothing polls them
-    between boundaries -- the pickup is one non-blocking drain inside :meth:`serve`, at the send boundary itself.
+    The transport handle exists only on the sub-comm root that owns the array's dask client: that rank takes the
+    host's request out of the handshake actor and fans it out through the boundary broadcast, which is enough.
+    Nothing polls the actor between boundaries -- the take is one actor call inside :meth:`serve`, at the send boundary
+    itself.
 
     The pump owns its array identity (name, sub-comm, chunk position), so :meth:`serve` -- the send-boundary half --
-    only needs the chunk ``send`` retained.
+    only needs the chunk ``send`` retained, and returns the reports the boundary gathered for the event that ``send``
+    is about to publish.
     """
 
     def __init__(self, array_name: str, sub_comm: Any, chunk_position: Any, bridge_id: int):
@@ -140,53 +141,50 @@ class PlanPump:
         self.chunk_position = chunk_position
         self.bridge_id = bridge_id
         self.backlog = PlanRequestBacklog()
-        self.request_queue: Optional[Any] = None
-        self.report_queue: Optional[Any] = None
+        self.handshake: Optional[Any] = None
 
-    def open_queues(self, client: Optional[Client]) -> None:
-        """Create the array's pair of plan queues, if this rank is the one that can reach them.
+    def attach_handshake(self, handshake: Optional[Handshake]) -> None:
+        """Attach the array's plan transport, if this rank is the one that can reach it.
 
-        The transport is a pair of dask queues per array, named by convention (``plan_request_queue_name`` /
-        ``plan_report_queue_name``), so the host and the bridges agree without exchanging anything. Only the rank that
-        owns the array's dask client can reach them, which is the array sub-comm's root; a rank without a client opens
-        no queue (its pump still answers through the boundary broadcast).
+        The request side of the transport is the handshake actor, which is reachable only through the dask client the
+        array sub-comm's root owns; a rank without one attaches nothing (its pump still answers through the boundary
+        broadcast). A rank that roots ONE array and merely participates in another keeps a handle for the first and
+        none for the second -- the gate is the rank INSIDE THIS ARRAY's sub-comm, not the process.
 
-        - ``:param client:`` The bridge's dask client, or ``None`` on a rank that has none.
+        - ``:param handshake:`` The bridge's handshake handle, or ``None`` on a rank that has none.
         """
-        if self.sub_comm.Get_rank() != 0 or client is None:
+        if self.sub_comm.Get_rank() != 0 or handshake is None:
             return
-        self.report_queue = Queue(plan_report_queue_name(self.array_name), client=client)
-        self.request_queue = Queue(plan_request_queue_name(self.array_name), client=client)
-        logger.debug(f"[{self.bridge_id}] plan queues open for array '{self.array_name}'")
+        self.handshake = handshake
+        logger.debug(f"[{self.bridge_id}] plan transport attached for array '{self.array_name}'")
 
     def close(self) -> None:
-        """Drop the pump's queue handles, before the client they belong to goes away.
+        """Drop the pump's transport handle, before the client it belongs to goes away.
 
-        A pump that never opened a queue (no client, or a non-root rank) has nothing to drop.
+        A pump that never attached one (no client, or a non-root rank) has nothing to drop.
         """
-        self.request_queue = None
-        self.report_queue = None
+        self.handshake = None
 
-    def serve(self, last_chunk: Tuple[Any, Any]) -> None:
-        """Answer the on-demand reduction requests that reached the queue before this ``send`` for the array.
+    def serve(self, last_chunk: Tuple[Any, Any]) -> List[PartialReport]:
+        """Answer the on-demand reduction requests that reached the actor before this ``send`` for the array.
 
         Called at the send boundary, where every rank of the array is about to enter the same collectives: the root
-        polls the host's request queue, broadcasts what it collected, every rank folds its OWN chunk with the requested
-        program, and the root posts the reports back to the host. The chunk is this rank's last-sent chunk, which is
-        why it is retained -- the host's request for timestep N necessarily arrives after ``send`` returned for N.
+        takes the host's parked request out of the handshake actor, broadcasts what it took, every rank folds its OWN
+        chunk with the requested program, and the root GATHERS the reports -- which it returns, because they travel
+        back on the topic event this ``send`` publishes. The chunk is this rank's last-sent chunk, which is why it is
+        retained -- the host's request for timestep N necessarily arrives after ``send`` returned for N.
 
-        THE PICKUP INVARIANT: the queue is drained exactly once per boundary, by the root, without waiting. A
-        request that is already queued is served here; a request that arrives AFTER that drain stays in the queue and is
+        THE PICKUP INVARIANT: the actor slot is taken exactly once per boundary, by the root, without waiting. A
+        request that is already parked is served here; a request that arrives AFTER that take stays parked and is
         served at the NEXT boundary -- it is never dropped and never served twice. That is the guarantee the dedicated
-        polling thread gave: a request is answered at the first send boundary after it reached the queue, and
-        ``QueuePlanExchange``'s timeout is what tolerates the wait.
+        polling thread gave: a request is answered at the first send boundary after it reached the actor, and
+        ``PlanEventExchange``'s timeout is what tolerates the wait.
 
-        THE PER-BOUNDARY COST is ONE non-blocking scheduler round trip (~0.2 ms measured on a local cluster), and every
-        other rank enters the broadcast with the root, so all ranks issue the same collectives in the same order whether
-        or not a request is in flight. The drain must NOT be a ``get(timeout=...)`` poll: the scheduler handler is
-        ``wait_for(queue.get(), timeout=timeout)``, so an EMPTY queue answers only when that timeout expires (~25 ms
-        measured, ~100x the drain) -- and this call is on the send critical path of EVERY participating array, with the
-        array's peers parked in the boundary broadcast.
+        THE PER-BOUNDARY COST is ONE actor round trip (the actor is an ordinary object on a worker; the call is
+        host-side client -> scheduler -> worker and back, sub-millisecond idle on a local cluster), and every other rank
+        enters the broadcast with the root, so all ranks issue the same collectives in the same order whether or not a
+        request is in flight. The take must NOT become a wait for a request: this call is on the send critical path of
+        EVERY participating array, with the array's peers parked in the boundary broadcast.
 
         A request whose timestep this rank no longer holds is answered with an error report by ``PlanResponder``: the
         host refuses the set rather than merging a partial from another timestep.
@@ -194,18 +192,18 @@ class PlanPump:
         - ``:param last_chunk:`` The ``(timestep, chunk)`` this bridge last sent for the array, or ``(None, None)``
           when it has sent nothing yet.
         """
-        if self.request_queue is not None:  # only the array root holds one, and only when it owns a dask client
-            # Non-blocking scheduler-side drain: whatever is already queued is served by THIS boundary, and an empty
-            # queue answers at once instead of waiting out a timeout (see the per-boundary cost above).
-            for plan in self.request_queue.get(batch=True):
+        if self.handshake is not None:  # only the array root holds one, and only when it owns a dask client
+            # The actor answers with what is parked and returns at once: whatever is there is served by THIS boundary.
+            for plan in self.handshake.take_plans(self.array_name):
                 self.backlog.put(plan)
         requests = self.backlog.drain()  # every other rank's backlog is empty: it gets the requests by broadcast
         if self.sub_comm.Get_size() > 1:
             requests = self.sub_comm.bcast(requests, root=0)
         if not requests:
-            return
+            return []
         served_timestep, served_chunk = last_chunk
         rank = self.sub_comm.Get_rank()
+        collected: List[PartialReport] = []
         for plan in requests:
             responder = PlanResponder(
                 self.array_name,
@@ -216,13 +214,14 @@ class PlanPump:
             )
             report = responder.respond(plan)
             reports = self.sub_comm.gather(report, root=0) if self.sub_comm.Get_size() > 1 else [report]
-            if rank == 0 and self.report_queue is not None:
-                for answered in reports or ():
-                    self.report_queue.put(answered)
+            if rank == 0:
+                collected.extend(reports or ())
             logger.debug(
                 f"[{self.bridge_id}] served plan {plan.request_id} for array '{self.array_name}' "
                 f"at timestep {served_timestep}"
             )
+        # Only the root has the gathered set: every other rank returns nothing, and only the root publishes the event.
+        return collected
 
 
 class Bridge(IBridge):
@@ -274,8 +273,8 @@ class Bridge(IBridge):
         # first never touches the handshake again. An array outside this table has no known delivery state, so ``send``
         # ships its chunk.
         self._delivery: Dict[str, DeliveryState] = {}
-        # On-demand reduction transport, one PlanPump per participating array: its plan backlog and the pair of dask
-        # queues the array root polls at each boundary live there. Presence in this table -- not a flag -- is what
+        # On-demand reduction transport, one PlanPump per participating array: its plan backlog and the handshake
+        # handle the array root takes requests through live there. Presence in this table -- not a flag -- is what
         # makes ``send`` enter the array's boundary collective.
         self._plan_pumps: Dict[str, PlanPump] = {}
 
@@ -298,9 +297,9 @@ class Bridge(IBridge):
         # Auto-discover array participation and create sub-communicators
         self._setup_array_comms()
 
-        # The on-demand reduction transport is attached here, before the first send: the plan queues must be
-        # listening by the time the analytics host dispatches (its first on-demand request follows the first
-        # delivered event).
+        # The on-demand reduction transport's PUMPS are attached here, before the first send: presence in
+        # ``_plan_pumps`` is what makes ``send`` enter the array's boundary collective, and a request can follow the
+        # first delivered event. Their transport handles are attached below, once the handshake actor is reachable.
         self._start_ondemand_plan_pumps()
 
         if self.id == 0:
@@ -318,6 +317,12 @@ class Bridge(IBridge):
             # first send().
             if kwargs.get("wait_for_go", True):
                 Event(WAIT_FOR_EXECUTE_CB_EVENT, client=self.client).wait()
+
+        # Every array root now holds a handshake handle (id 0 above, the other sub-comm roots in
+        # ``_setup_array_comms``), so the pumps can be given the plan transport. Rank 0's handle is created AFTER the
+        # pumps (the handshake needs the client, which the pumps do not), which is why this is a second, explicit step
+        # rather than part of ``_start_ondemand_plan_pumps``. Nothing here is a collective.
+        self._attach_plan_transports()
 
         # World-wide barrier: rank 0 waited for the go event (all callbacks registered), the other ranks skipped that
         # wait. The barrier aligns every rank past callback registration so the prefetch below reads a consistent
@@ -479,12 +484,12 @@ class Bridge(IBridge):
             logger.error(f"[{self.id}] Could not cleanly close bridge. exception={e}")
 
     def _release_client(self) -> None:
-        """Release the bridge's non-collective resources: the on-demand plan queues and the client.
+        """Release the bridge's non-collective resources: the on-demand plan transport handles and the client.
 
         Safe from any thread that is not running the client's own loop: it starts no collective and no ``sync()``.
         """
         if self.client:
-            # The plan queues belong to this client, so their handles are dropped before it goes away.
+            # The plan transport rides this client's handshake actor, so its handles are dropped before it goes away.
             self._stop_ondemand_plan_pumps()
             self.client.close()
 
@@ -546,9 +551,10 @@ class Bridge(IBridge):
         # rank participates in, flag or no flag: a rank whose own flag is off still has to answer a request its root
         # broadcast, so neither the collective nor the retention may depend on the per-process flag.
         pump = self._plan_pumps.get(array_name)
+        plan_reports: List[PartialReport] = []
         if pump is not None:
             state = self._delivery.setdefault(array_name, DeliveryState())  # unfetched: only ``last_chunk`` is used
-            pump.serve(state.last_chunk)
+            plan_reports = pump.serve(state.last_chunk)
             state.last_chunk = (int(timestep), chunk)
 
         # Fetch (and cache) the array's delivery state BEFORE deciding whether data must ship: on the lazy path
@@ -566,11 +572,11 @@ class Bridge(IBridge):
         # entirely by the aggregates and by the on-demand plans served above, so nothing on the workers ever
         # reads its data. Everything else keeps the previous behaviour.
         if not self._needs_chunk_delivery(array_name):
-            self._send_data_free(array_name, chunk, timestep, sub_comm)
+            self._send_data_free(array_name, chunk, timestep, sub_comm, plan_reports)
         elif ondemand_delivery:
-            self._send_ondemand(array_name, chunk, timestep, sub_comm, workers)
+            self._send_ondemand(array_name, chunk, timestep, sub_comm, workers, plan_reports)
         else:
-            self._send_legacy(array_name, chunk, timestep, sub_comm, workers)
+            self._send_legacy(array_name, chunk, timestep, sub_comm, workers, plan_reports)
 
     def _select_workers(self, array_name: str, timestep: int, **kwargs) -> List[str]:
         """Pick the ONE worker this bridge's chunk goes to: round-robin over the sorted worker list.
@@ -623,7 +629,9 @@ class Bridge(IBridge):
         assert len(workers) == 1, "worker list should be of length 1."
         return workers
 
-    def _send_data_free(self, array_name: str, chunk: np.ndarray, timestep: int, sub_comm: Any) -> None:
+    def _send_data_free(
+        self, array_name: str, chunk: np.ndarray, timestep: int, sub_comm: Any, plan_reports: List[PartialReport]
+    ) -> None:
         """On-demand-only delivery: the eager aggregates ARE the payload and no data leaves the bridge.
 
         Every callback on this array reads the aggregates or dispatches an on-demand plan, and the plans were
@@ -633,6 +641,7 @@ class Bridge(IBridge):
         - ``:param chunk:`` This bridge's own numpy chunk, which stays here.
         - ``:param timestep:`` The current timestep.
         - ``:param sub_comm:`` The array's sub-communicator on this rank.
+        - ``:param plan_reports:`` The reports this boundary gathered (empty on a non-root rank): they ride the event.
         """
         # The aggregates are folded HERE, on the local numpy chunk and before ANY scatter, for the reason spelled out in
         # ``_send_ondemand``: on this path it is the ENTIRE payload, so it must still be built.
@@ -643,10 +652,26 @@ class Bridge(IBridge):
             f"chunk shape={chunk.shape} stays on the bridge"
         )
         res = {"future": [], "who_has": {}, "nbytes": {}}
-        self._publish(array_name, res, chunk, timestep, sub_comm, aggregates, aggregates_error, data_free=True)
+        self._publish(
+            array_name,
+            res,
+            chunk,
+            timestep,
+            sub_comm,
+            aggregates,
+            aggregates_error,
+            data_free=True,
+            plan_reports=plan_reports,
+        )
 
     def _send_ondemand(
-        self, array_name: str, chunk: np.ndarray, timestep: int, sub_comm: Any, workers: List[str]
+        self,
+        array_name: str,
+        chunk: np.ndarray,
+        timestep: int,
+        sub_comm: Any,
+        workers: List[str],
+        plan_reports: List[PartialReport],
     ) -> None:
         """On-demand delivery that still needs the chunk: the eager aggregates AND the full-chunk scatter.
 
@@ -659,6 +684,7 @@ class Bridge(IBridge):
         - ``:param timestep:`` The current timestep.
         - ``:param sub_comm:`` The array's sub-communicator on this rank.
         - ``:param workers:`` The single worker the chunk is scattered to.
+        - ``:param plan_reports:`` The reports this boundary gathered (empty on a non-root rank): they ride the event.
         """
         # Eager scalar aggregates (the zero-round-trip half of the transfer strategy): computed HERE, on the local numpy
         # chunk and before ANY scatter, so the aggregate values are chunk-local reductions and the chunk itself is never
@@ -668,10 +694,26 @@ class Bridge(IBridge):
         # The only scatter site left: the full chunk (the legacy ``precompute=False`` delivery path).
         logger.debug(f"[{self.id}] send() scattering full chunk shape={chunk.shape}")
         res = self._scatter_full(chunk, workers=workers, hash=False)
-        self._publish(array_name, res, chunk, timestep, sub_comm, aggregates, aggregates_error, data_free=False)
+        self._publish(
+            array_name,
+            res,
+            chunk,
+            timestep,
+            sub_comm,
+            aggregates,
+            aggregates_error,
+            data_free=False,
+            plan_reports=plan_reports,
+        )
 
     def _send_legacy(
-        self, array_name: str, chunk: np.ndarray, timestep: int, sub_comm: Any, workers: List[str]
+        self,
+        array_name: str,
+        chunk: np.ndarray,
+        timestep: int,
+        sub_comm: Any,
+        workers: List[str],
+        plan_reports: List[PartialReport],
     ) -> None:
         """Full-chunk delivery with NO aggregates: the chunk alone crosses the boundary.
 
@@ -684,10 +726,21 @@ class Bridge(IBridge):
         - ``:param timestep:`` The current timestep.
         - ``:param sub_comm:`` The array's sub-communicator on this rank.
         - ``:param workers:`` The single worker the chunk is scattered to.
+        - ``:param plan_reports:`` The reports this boundary gathered (empty on a non-root rank): they ride the event.
         """
         logger.debug(f"[{self.id}] send() scattering full chunk shape={chunk.shape}")
         res = self._scatter_full(chunk, workers=workers, hash=False)
-        self._publish(array_name, res, chunk, timestep, sub_comm, None, None, data_free=False)
+        self._publish(
+            array_name,
+            res,
+            chunk,
+            timestep,
+            sub_comm,
+            None,
+            None,
+            data_free=False,
+            plan_reports=plan_reports,
+        )
 
     def _publish(
         self,
@@ -699,12 +752,13 @@ class Bridge(IBridge):
         aggregates: Optional[EagerAggregates],
         aggregates_error: Optional[str],
         data_free: bool,
+        plan_reports: Optional[List[PartialReport]] = None,
     ) -> None:
         """Publish one timestep's topic event: the single-bridge fast path, or the sub-comm gather and rank-0 merge.
 
         Shared by the three regimes -- the ONLY thing they differ in is what they scattered and whether they built
-        aggregates, so the payload assembly (and the ``futures``/``aggregates``/``aggregates_error`` contract) lives
-        in exactly one place.
+        aggregates, so the payload assembly (and the ``futures``/``aggregates``/``aggregates_error``/``plan_reports``
+        contract) lives in exactly one place.
 
         - ``:param array_name:`` Registered array the event is for.
         - ``:param res:`` The scatter result (``{"future", "who_has", "nbytes"}``); on the data-free path an empty one.
@@ -715,6 +769,8 @@ class Bridge(IBridge):
         - ``:param aggregates_error:`` The cause of a failed aggregates build, or ``None``.
         - ``:param data_free:`` True when nothing was scattered: nothing to register, nothing to desire, no future to
           name.
+        - ``:param plan_reports:`` The reports this boundary gathered for a plan request, or ``None``/empty when the
+          boundary served nothing.
         """
         # ``precomputed_meta`` stays in the payload contract but is empty by construction -- no branch is ever filed,
         # so nothing but the chunk can cross the boundary.
@@ -731,6 +787,7 @@ class Bridge(IBridge):
                 aggregates=aggregates,
                 aggregates_error=aggregates_error,
                 data_free=data_free,
+                plan_reports=plan_reports,
             )
             return
 
@@ -835,6 +892,12 @@ class Bridge(IBridge):
                 # analytics side fails the RUN at its cycle boundary instead of serving a silently aggregates-less
                 # delivery.
                 to_send["aggregates_error"] = " | ".join(aggregates_errors)
+            if plan_reports:
+                # The reports of the plan request THIS boundary served. They ride this event because an event is the
+                # only reverse channel the array root already publishes -- one per send, addressed to the host that
+                # asked. Encoded with ``PartialReport.as_payload`` for the same msgpack reason as the aggregates: the
+                # bus is ``Client.log_event``, and a report holds numpy partials or a live ``PCASummary``.
+                to_send["plan_reports"] = [report.as_payload() for report in plan_reports]
             logger.debug(
                 f"[{self.id}] send() log_event: array={array_name}, "
                 f"timestep={timestep}, n_futures={len(futures_payload)}"
@@ -853,12 +916,12 @@ class Bridge(IBridge):
         the pumps are too.
 
         Two things are deliberately not gated: the broadcast itself (every rank enters it every timestep, and a rank
-        with no request simply gets an empty list back -- one small collective per array per ``send``), and the queue
-        pair's lifetime. The idle cost is two queue handles per array, plus one non-blocking batch drain per boundary,
-        on the rank that owns the dask client: one scheduler round trip (~0.2 ms), never a wait, so a legacy array that
-        can never receive a request pays a round trip and nothing more. They are opened for the life of the bridge
-        because the first on-demand request can arrive as soon as the first delivered timestep, not because a callback
-        was registered yet. An array this rank does not participate in gets neither a backlog nor a pump.
+        with no request simply gets an empty list back -- one small collective per array per ``send``), and the
+        transport's lifetime. The idle cost is one handshake handle per array, plus one actor call per boundary, on the
+        rank that owns the dask client: never a wait, so a legacy array that can never receive a request pays one
+        round trip and nothing more. The handles are attached for the life of the bridge because the first on-demand
+        request can arrive as soon as the first delivered timestep, not because a callback was registered yet. An
+        array this rank does not participate in gets neither a backlog nor a pump.
         """
         for array_name, sub_comm in self._array_comms.items():
             if sub_comm is None or sub_comm is _COMM_NULL:
@@ -869,15 +932,23 @@ class Bridge(IBridge):
                 self.arrays_metadata.get(array_name, {}).get("chunk_position", ()),
                 self.id,
             )
+
+    def _attach_plan_transports(self) -> None:
+        """Give every pump the plan transport of ITS array: the handshake actor, on the array root only.
+
+        Separate from :meth:`_start_ondemand_plan_pumps` because of creation order: the pumps are built before this
+        process's own handshake handle exists on id 0. Nothing here is collective, and a rank with no handle (a
+        non-participant, or a rank owning no client) simply attaches nothing.
+        """
         for pump in self._plan_pumps.values():
-            pump.open_queues(self.client)
+            pump.attach_handshake(self.handshake)
 
     def _stop_ondemand_plan_pumps(self) -> None:
-        """Drop every array's plan queue handles.
+        """Drop every array's plan transport handle.
 
-        Called from ``close()`` before the client goes away: the queues belong to that client. Nothing is polled
-        between boundaries, so there is no poller to stop. The defensive ``getattr`` covers ``__del__`` on a
-        half-built bridge, where the pump table may not exist yet.
+        Called from ``close()`` before the client goes away: the handle belongs to that client's handshake actor.
+        Nothing is polled between boundaries, so there is no poller to stop. The defensive ``getattr`` covers
+        ``__del__`` on a half-built bridge, where the pump table may not exist yet.
         """
         pumps = getattr(self, "_plan_pumps", {})
         for pump in pumps.values():
@@ -946,6 +1017,7 @@ class Bridge(IBridge):
         aggregates: Optional[EagerAggregates] = None,
         aggregates_error: Optional[str] = None,
         data_free: bool = False,
+        plan_reports: Optional[List[PartialReport]] = None,
     ) -> None:
         """
         Handle single-bridge array send without collective.
@@ -968,6 +1040,8 @@ class Bridge(IBridge):
             at its boundary.
         - ``:param data_free:`` True when nothing was scattered because no callback reads this array's data: the event
             then carries ``futures: []``, the aggregates being the entire payload.
+        - ``:param plan_reports:`` The reports this boundary gathered for a plan request: on a single-bridge array the
+            one rank IS the whole grid, so its reports are already the complete set.
         """
         assert self.client is not None, "client cannot be None for single-bridge send."
 
@@ -1011,6 +1085,10 @@ class Bridge(IBridge):
             to_send["aggregates"] = [aggregates.as_payload()]
         if aggregates_error is not None:
             to_send["aggregates_error"] = aggregates_error
+        if plan_reports:
+            # The reports of the plan request served at this send's boundary: the one rank is the whole grid, so its
+            # gathered set is already the complete answer (see ``_publish`` for why they ride the event at all).
+            to_send["plan_reports"] = [report.as_payload() for report in plan_reports]
         self.client.log_event(array_name, to_send)
 
     def get(self, key: str, timestep: Optional[int] = None, default: Any = None) -> Optional[Union[Deque, Any]]:
