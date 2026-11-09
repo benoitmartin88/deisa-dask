@@ -139,9 +139,15 @@ def test_mpi_bridge(global_size: Tuple, parallelism: int, comm: str):
 
         deisa.set("hello", "world", timestep=1)
 
+        # Set instead of raised: ``Deisa._handle_callback_exception`` wraps the handler in
+        # ``except BaseException`` and merely unregisters the callback, so an exception raised
+        # here would be swallowed and the subprocess would still exit 0. The flag is read after
+        # ``execute_callbacks()`` so the exit code actually reflects a failed callback.
+        callback_failed = []
+
         def exception_handler(exception: BaseException):
             print(f"exception_handler: exception={exception}", flush=True)
-            pytest.fail("exception thrown in callback")  # TODO: this should fail the test
+            callback_failed.append(exception)
 
         @deisa.register("temperature", exception_handler=exception_handler)
         def cb(window):
@@ -153,6 +159,9 @@ def test_mpi_bridge(global_size: Tuple, parallelism: int, comm: str):
             )
 
         deisa.execute_callbacks()
+        if callback_failed:
+            print(f"callback raised {callback_failed!r}", flush=True)
+            return 1
         return 0
 
     pool = ThreadPool(processes=1)

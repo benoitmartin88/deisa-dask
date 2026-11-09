@@ -47,7 +47,7 @@ from deisa.dask.branch import BranchSpec
 from deisa.dask.constants import CLIENT_KEY, FEEDBACK_QUEUE_PREFIX, KEY_PREFIX, WAIT_FOR_EXECUTE_CB_EVENT
 from deisa.dask.handshake import Handshake
 from deisa.dask.precompute_analyzer import PrecomputeRuntimeError
-from deisa.dask.utils import get_client, run_coro_on_private_loop
+from deisa.dask.utils import called_from_event_loop, get_client, run_coro_on_private_loop
 
 logger = logging.getLogger(__name__)
 
@@ -246,11 +246,29 @@ class Bridge(IBridge):
         (``sys.is_finalizing()``): ``close()`` synchronizes all bridges with an
         MPI barrier, and at shutdown the peer ranks may already be torn down,
         so that barrier would hang forever -- a hang is worse than an
-        exception. During normal (non-shutdown) garbage collection the full
-        ``close()`` still runs.
+        exception.
+
+        Never runs it from an event-loop callback either. The collector runs
+        ``__del__`` on whichever thread dropped the last reference, and for a
+        leaked bridge that is a distributed "IO loop" thread. ``close()``
+        synchronizes with the world (MPI barrier) and with the scheduler
+        (``Handshake.set_bridges_done`` -> ``Client.sync()``), and ``Client.sync()``
+        blocks the calling thread until the client's loop runs the callback: from
+        inside that very loop the callback can never run, so the thread sits out the
+        whole ``sync()`` timeout (60 s measured) and, with an in-process cluster whose
+        scheduler, workers and client share that loop, freezes the whole cluster.
+
+        During normal (non-shutdown) garbage collection from any other thread the
+        full ``close()`` still runs.
         """
         if sys.is_finalizing():
             logger.debug(f"[{self.id}] Bridge.__del__ during interpreter shutdown: skipping close()")
+            return
+        if called_from_event_loop():
+            logger.debug(
+                f"[{self.id}] Bridge.__del__ from inside an event-loop callback: skipping close(), it would "
+                f"block the loop that has to service its collectives"
+            )
             return
         try:
             self.close(timestep=sys.maxsize)
@@ -294,7 +312,7 @@ class Bridge(IBridge):
         except Exception as e:
             logger.error(f"[{self.id}] Could not cleanly close bridge. exception={e}")
 
-    def send(self, array_name: str, chunk: np.ndarray, timestep: int, *args, **kwargs):
+    def send(self, array_name: str, chunk: np.ndarray, timestep: Union[int, np.ndarray], *args, **kwargs):
         """
         Distribute a data chunk to a Dask workers.
 
@@ -316,6 +334,16 @@ class Bridge(IBridge):
 
         if array_name not in self.arrays_metadata:
             raise ValueError(f"array {array_name} is unknown.")
+
+        # handle different types of timestep. Cast to int if necessary.
+        if isinstance(timestep, np.ndarray):
+            if timestep.ndim == 0:
+                timestep = int(timestep)
+            elif timestep.ndim == 1 and timestep.size == 1:
+                timestep = timestep.item()
+            else:
+                raise ValueError("timestep must be a scalar, a 0D array or a 1D array of size 1.")
+        assert isinstance(timestep, int)
 
         assert isinstance(self.workers, dict)
         workers = dict(self.workers)  # make a copy so that the user-defined function does not modify self
