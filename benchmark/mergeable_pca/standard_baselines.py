@@ -123,6 +123,7 @@ from measurement_common import (  # noqa: E402
     regime_of,
     safe_import,
     subspace_distance,
+    subspace_metrics,
     time_repeated,
     variance_errors,
     write_result,
@@ -171,6 +172,13 @@ METRIC_DEFINITIONS: dict[str, str] = {
         "blocks, computed independently of the merge path. This is the INDEPENDENT truth; vs_mergeable is the "
         "pairwise comparison the card asks for."
     ),
+    "sin_theta_max_vs_exact": (
+        "sin(theta_max), the sine of the largest principal angle between the arm's retained span and the exact "
+        "reference: sqrt(1 - sigma_min**2) of A @ B.T. Unlike the 1 - cos(theta_max) distance (which cannot resolve "
+        "angles below ~1e-8 rad in double precision) this figure CAN be read right down to roundoff: 2.2e-16 is a "
+        "roundoff-level angle. Reported next to the distance per R45-style review."
+    ),
+    "sin_theta_max_vs_mergeable": ("the same sine, between the arm's retained span and the mergeable path's."),
     "explained_variance_ratio_error": (
         "sum over the scored components of |explained-variance ratio of the arm - the same ratio of the exact "
         "reference|. Computed on SINGULAR VALUES, which are sign-free, via measurement_common.variance_errors with "
@@ -218,14 +226,9 @@ def load_baselines() -> dict[str, Any]:
         ("scipy_linalg_svd", ("scipy.linalg", "svd"), "scipy.linalg.svd, explicit gesdd driver, on the centered data"),
         ("sklearn_pca_full", ("sklearn.decomposition", "PCA"), 'sklearn.decomposition.PCA, svd_solver="full"'),
         (
-            "sklearn_incremental_pca",
-            ("sklearn.decomposition", "IncrementalPCA"),
-            "scikit-learn batched IncrementalPCA",
-        ),
-        (
-            "dask_ml_incremental_pca",
-            ("dask_ml.decomposition", "IncrementalPCA"),
-            "dask-distributed IncrementalPCA",
+            "dask_ml_tsqr_svd",
+            ("dask_ml.decomposition", "TruncatedSVD"),
+            'dask-distributed exact TSQR (TruncatedSVD, algorithm="tsqr")',
         ),
     )
     out: dict[str, Any] = {}
@@ -328,6 +331,44 @@ def _dask_ml_ipca_arm(X: np.ndarray, k: int, state: Mapping[str, Any]) -> dict[s
     }
 
 
+def _dask_ml_tsqr_arm(X: np.ndarray, k: int, state: Mapping[str, Any]) -> dict[str, Any]:
+    """Fit ``dask_ml.decomposition.TruncatedSVD`` with the EXACT ``tsqr`` solver on the chunked dask array.
+
+    This is the exact distributed SVD the Dask stack itself exposes: per-chunk QR of the tall blocks, the ``d x d``
+    factors shipped through a merge tree (Benson et al.'s TSQR). It is the standing baseline: same data, same
+    truncation target, and the same tree shape class as the mergeable path, so its wall time is what the mergeable
+    reduction has to beat.
+
+    ``dask_ml`` REFUSES a numpy array, so this arm necessarily builds and executes a dask graph: the array is rebuilt
+    inside every timed call so the reported time includes the construction a real caller pays. The mean is computed
+    on the Dask side because ``TruncatedSVD`` centers internally without exposing ``mean_``.
+
+    - ``:param X:`` ``(n_samples, n_features)`` input.
+    - ``:param k:`` Number of components to retain.
+    - ``:param state:`` Per-configuration state carrying ``"chunk_rows"``.
+    """
+    import dask.array as da
+
+    chunk_rows = int(state["chunk_rows"])
+    n_features = int(X.shape[1])
+    dX = da.from_array(X, chunks=(chunk_rows, n_features))
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        est = state["object"](n_components=int(k), algorithm="tsqr", random_state=SEED)
+        est.fit(dX)
+        components = np.asarray(est.components_, dtype=np.float64)
+        raw_singular = est.singular_values_
+        singular = np.zeros(0) if raw_singular is None else np.asarray(raw_singular, dtype=np.float64)
+        mean = np.asarray(dX.mean(axis=0).compute(), dtype=np.float64)
+    return {
+        "components": components,
+        "singular_values": singular,
+        "mean": mean,
+        "n_samples": int(X.shape[0]),
+        "warnings": sorted({f"{type(w.message).__name__}: {w.message}" for w in caught}),
+    }
+
+
 def _numpy_svd_arm(X: np.ndarray, k: int, state: Mapping[str, Any]) -> dict[str, Any]:
     """Fit the batch reference: ``numpy.linalg.svd`` on the centered data.
 
@@ -382,8 +423,7 @@ ARMS: tuple[tuple[str, Callable[..., dict[str, Any]]], ...] = (
     ("numpy_svd", _numpy_svd_arm),
     ("scipy_linalg_svd", _scipy_svd_arm),
     ("sklearn_pca_full", _sklearn_pca_arm),
-    ("sklearn_incremental_pca", _sklearn_ipca_arm),
-    ("dask_ml_incremental_pca", _dask_ml_ipca_arm),
+    ("dask_ml_tsqr_svd", _dask_ml_tsqr_arm),
 )
 
 #: One-line caveat per baseline, so a reader is never left to infer what the arm's number does or does not include.
@@ -410,15 +450,11 @@ ARM_NOTES: dict[str, str] = {
         'svd_solver="full" forced, because "auto" would select randomized above a sample-size threshold and turn the '
         "baseline into an approximation of an approximation"
     ),
-    "sklearn_incremental_pca": (
-        "batch_size set to the per-block row count so it consumes data at the SAME leaf granularity as the mergeable "
-        "path. It is an approximation by construction, so a non-zero subspace distance to the exact SVD is expected "
-        "rather than a defect"
-    ),
-    "dask_ml_incremental_pca": (
-        "requires a dask.array and refuses numpy outright, so this arm pays an intra-process graph execution a numpy "
-        "arm does not; that is the cost of the library path. Its n_samples_ attribute reports the LAST BATCH's count, "
-        "so n_samples_seen_ is used for the variance comparison"
+    "dask_ml_tsqr_svd": (
+        'the exact distributed TSQR the Dask stack itself exposes (dask.array + TruncatedSVD, algorithm="tsqr"). '
+        "It requires a dask.array and refuses numpy outright, so this arm pays an intra-process graph execution a "
+        "numpy arm does not; that is the cost of the library path. Centers on the Dask side: TruncatedSVD does not "
+        "expose mean_"
     ),
 }
 
@@ -540,6 +576,8 @@ def score_arm(
         "n_components_scored": int(k),
         "subspace_distance_vs_mergeable": subspace_distance(basis, mergeable_basis),
         "subspace_distance_vs_exact": subspace_distance(basis, reference["components"][:k]),
+        "sin_theta_max_vs_mergeable": subspace_metrics(basis, mergeable_basis)[1],
+        "sin_theta_max_vs_exact": subspace_metrics(basis, reference["components"][:k])[1],
         "reconstruction_relative_error": float(np.linalg.norm(centered - (centered @ basis.T) @ basis) / denom)
         if denom > 0.0
         else float("nan"),

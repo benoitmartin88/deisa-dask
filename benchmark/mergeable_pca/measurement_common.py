@@ -376,10 +376,19 @@ def machine_info() -> dict[str, Any]:
     except Exception:
         lapack = "unavailable"
 
+    cpu_model = "unknown"
+    for entry in Path("/proc/cpuinfo").read_text(encoding="utf-8").split("\n\n"):
+        for line in entry.splitlines():
+            if line.lower().startswith("model name") and ":" in line:
+                cpu_model = line.split(":", 1)[1].strip()
+                break
+        if cpu_model != "unknown":
+            break
     return {
         "hostname": socket.gethostname(),
         "platform": platform.platform(),
         "processor": platform.processor() or "unknown",
+        "cpu_model": cpu_model,
         "machine": platform.machine(),
         "python": platform.python_version(),
         "cpu_count_logical": logical,
@@ -642,6 +651,32 @@ def enforce_sign_invariant_results(payload: Mapping[str, Any], _path: str = "res
 
 
 # ----------------------------------------------------------------------------- sign-invariant accuracy
+def subspace_metrics(basis_a: np.ndarray, basis_b: np.ndarray) -> tuple[float, float]:
+    """Signed-invariant subspace distance AND the largest principal angle's sine, from one SVD.
+
+    The singular values of ``A @ B.T`` are the cosines of the principal angles. ``1 - min(sigma)`` is the
+    quadratically insensitive distance (``1 - cos theta_max``); ``sin theta_max = sqrt(1 - sigma_min**2)`` is the
+    linearly sensitive figure a reader can compare to roundoff directly. Both are returned so callers can report the
+    two metrics side by side without a second decomposition.
+
+    - ``:param basis_a:`` ``(k, d)`` orthonormal rows.
+    - ``:param basis_b:`` ``(k, d)`` orthonormal rows, same ``k`` as ``basis_a``.
+    - ``:return:`` ``(1 - cos theta_max, sin theta_max)``.
+    """
+    A = np.asarray(basis_a, dtype=np.float64)
+    B = np.asarray(basis_b, dtype=np.float64)
+    if A.shape != B.shape:
+        raise ValueError(
+            f"subspace_metrics: bases must have equal shape to compare spans of equal rank, "
+            f"got {A.shape} and {B.shape}."
+        )
+    if A.shape[0] == 0:
+        return 0.0, 0.0
+    sigma_min = float(np.linalg.svd(A @ B.T, compute_uv=False)[-1])
+    sigma_min = min(1.0, max(0.0, sigma_min))
+    return float(1.0 - sigma_min), float(np.sqrt(max(0.0, 1.0 - sigma_min**2)))
+
+
 def subspace_distance(basis_a: np.ndarray, basis_b: np.ndarray) -> float:
     """Sign-invariant distance between two subspaces, ``1 - min(svd(A @ B.T))``.
 
