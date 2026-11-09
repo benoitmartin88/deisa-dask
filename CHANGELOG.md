@@ -25,10 +25,16 @@ Types of changes:
 ### Added
 
 - CI: continuous benchmark using Bencher.
-- Bridge-local precompute: callbacks whose compute operations are chunk-local reductions (`sum`, `mean`, `var`, `std`, 
-  `min`, `max`, `prod`) are analyzed at registration time and shipped to Dask workers as small per-bridge partials 
-  instead of the full array chunk. Branches are registered per array, so a multi-array callback gets one branch set per 
-  array. Expressions whose reduction depends on another reduction's output are refused with`UnsupportedReductionError`.
+- Runtime reduction delivery: a callback registered with `precompute=True` (the default) receives one `DeisaArray`
+  per array and timestep, and its chunk-local reductions (`sum`, `mean`, `var`, `std`, `min`, `max`, `prod`) are
+  evaluated by the bridge on the numpy chunk it already holds. Two transports carry the answer back, and the array's
+  data crosses neither of them: the bridge publishes eager scalar aggregates on the topic event, which answer the common
+  folds with no round trip, and serves the expressions the aggregates cannot answer on demand, when the worker asks for the
+  reduction of a chunk the bridge retains. When no callback on an array reads the chunk itself, `Bridge.send()` ships
+  no data at all -- no scatter and an empty `futures` list -- so a whole-array `sum()` costs a few scalars per bridge
+  per timestep instead of the chunk. `precompute=False` keeps the legacy full-chunk scatter, and an array that has
+  at least one such reader keeps it even when a `precompute=True` callback is registered on the same array. Expressions
+  whose reduction depends on another reduction's output are refused with `UnsupportedReductionError`.
 - `deisa.dask.mergeable_pca`: exact mergeable PCA primitives. A local summary of one data block (`n_samples`, `mean`,
   `components`, `singular_values`) merges with another summary into the exact summary of their
   union, without either source sample ever reaching a merge node, so only a compact summary has to cross a process or
@@ -50,7 +56,68 @@ Types of changes:
 
 ### Changed
 
+- The public callback payload is `DeisaArray` again (`K13C`): `DeisaCollection` is gone, so a callback receives one
+  `deisa.dask.DeisaArray` per array and timestep -- the class `deisa-core` defines, copied into `deisa-dask` for now
+  (see the Removed entry for the migration; the interim `deisa.core.types.DeisaArray` / `deisa.dask.DeisaArray`
+  `isinstance` caveat is documented in the `deisa.dask.deisa_array` module docstring). `deisa.dask.DeisaArray` and `deisa.dask.OndemandDeisaArray` are public exports: the delivered
+  operand is an `OndemandDeisaArray` (a `DeisaArray` subclass that carries the lazy, on-demand surface) for
+  analytic delivery, and a plain `DeisaArray` holding a real Dask graph for the legacy full-chunk scatter.
+- The on-demand reduction plan no longer uses a pair of `distributed.Queue` objects (`K13B`): the request is filed
+  with the ONE handshake actor the run already starts (`Handshake.put_plan` appends it to the array's FIFO of
+  requests, drained whole once per `send` boundary), and the partial reports return on the event the array root
+  already publishes, under the new `plan_reports` key, which the host's collector merges per request id.
+  `QueuePlanExchange`, `plan_request_queue_name`, `plan_report_queue_name` and `PlanPump.open_queues` are gone;
+  nothing is spawned, no scheduler-held queue remains for this path, and the fold-at-boundary collective (broadcast
+  request, fold, gather partials) is unchanged.
+- The per-array delivery registration is ONE fact now (`K13A`): the handshake files a single
+  `delivery` mode per array -- `"plain"` (chunk alone), `"mixed"` (aggregates AND chunk; the mixed regime stays) or
+  `"data_free"` (aggregates only, nothing ships) -- derived host-side from the surviving callbacks' `precompute`
+  flags. `set_ondemand_arrays`/`set_legacy_arrays` and the two-set handshake are gone; `Handshake.set_delivery_modes`
+  files the dict in one call, `get_task_state` returns one key, and the bridge's `DeliveryState` carries the mode.
 - `mpi4py` is now a required dependency.
+- `Deisa.add_callback(..., precompute=...)` now selects the delivery mode only. `precompute=True` (the default) hands
+  each callback one `DeisaArray` per array and timestep, carrying the reductions the runtime planner dispatched to
+  the bridges; `precompute=False` keeps the legacy full-chunk scatter. Registration no longer parses the callback
+  source: the reductions are planned from the Dask graph the callback itself builds, so the registration-time refusals
+  for unplannable expressions become run-time refusals raised at the operator that cannot be planned
+  (`UnsupportedReductionError`, `RawFieldReadError`, ...).
+- A `precompute=True` callback's operand now answers only the closed operator surface. `len(field)` and any attribute
+  outside it raise `UnsupportedReductionError` instead of being served from metadata: a length or a foreign attribute
+  invites reading a shape or a value that is never delivered to the worker. The surface itself is unchanged and
+  complete -- `field.shape`, `field.dtype`, `field.ndim`, the pointwise operators and the reductions all still work.
+- The eager aggregate vocabulary is renamed: `EagerMenu` is now `EagerAggregates`, `build_eager_menu` is now
+  `build_eager_aggregates`, `EAGER_MENU_OPS` is now `EAGER_AGGREGATES_OPS`, and the topic-event payload keys
+  `menu`/`menu_error` are now `aggregates`/`aggregates_error`. The rename is one commit because the bridge writes and
+  the analytics host reads those two keys in lockstep; no cross-version wire compatibility is claimed for them.
+
+### Removed
+
+- `deisa.dask.precompute_analyzer`, the AST analyzer that turned a callback source into branch descriptors, along with
+  its `_WindowProxy` scratch wrapper. Nothing in the package imports it. **Migration:** the refusal classes it defined
+  are unchanged, name for name, in `deisa.dask.precompute_errors` — update an import of
+  `deisa.dask.precompute_analyzer` to that module. Code that called the analyzer to obtain branch specs must use the
+  runtime planner instead (`deisa.dask.ondemand_dispatch.PlanDispatcher`).
+- `DeisaCollection`, the per-array wrapper a `precompute=True` callback used to receive, is deleted (`K13C`). A
+  callback is handed one `DeisaArray` per registered array, exactly as before the collection existed, so the shape of
+  the public API did not change with it. **Migration:** replace `collection[name]` (or iteration over the collection)
+  with the array itself -- a callback registered on one array already receives that array -- and `MergeablePCA().fit`
+  takes that array directly. `DeisaCollection` was not part of the `deisa.dask` exports and nothing else in the
+  package referenced it.
+- `deisa.dask.utils.make_precomputed_view`, the `_PrecomputedDeisaArray` dispatch view it built, and the
+  `_PrecomputedDeisaArray` / `make_precomputed_view` re-export from `deisa.dask.deisa`. A callback registered with
+  `precompute=True` now receives one `DeisaArray` per array; **migration:** a callback that
+  read the view's attributes (`_deisa_pca_summary`, the reduction signature routing) should read the delivered array
+  and, for PCA, call `MergeablePCA().fit(<array>)`, which dispatches and merges the summaries itself.
+  `_PrecomputedDeisaArray.std`/`.var` refusing `ddof != 0` and the "second reduction on an already-final array"
+  interception were properties of that view; the runtime path refuses both at the estimator/planner instead.
+- `DEISA_DASK_RUNTIME_REDUCTION` and `deisa.dask.ondemand_dispatch.runtime_delivery_enabled()`, the opt-in flag that
+  held runtime delivery behind an environment variable while the analyzer was still the default. The flag has no
+  meaning left: with the analyzer gone there is no third delivery mode, so `precompute` is the only selector. Unset the
+  environment variable; setting it is now inert.
+- The test-only analyzer port under `test/_oracle/` (the AST walker, the chain walkers and `BranchSpec`), dropped by
+  maintainer decision: with the analyzer's delivery path gone from `src/`, a second implementation kept only to diff the
+  runtime against tested a deleted design. The plan is now its own contract -- golden literals for every published
+  fixture plus the per-op value tests -- and no test-only production code remains.
 
 ### Fixed
 

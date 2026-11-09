@@ -11,6 +11,7 @@ except PackageNotFoundError:
 
 from .bridge import Bridge
 from .deisa import Deisa
+from .deisa_array import DeisaArray, OndemandDeisaArray
 from .mergeable_pca import (
     MergeablePCA,
     PCASummary,
@@ -24,7 +25,9 @@ from .utils import get_connection_info
 __all__ = [
     "Bridge",
     "Deisa",
+    "DeisaArray",
     "MergeablePCA",
+    "OndemandDeisaArray",
     "PCASummary",
     "__version__",
     "get_connection_info",
