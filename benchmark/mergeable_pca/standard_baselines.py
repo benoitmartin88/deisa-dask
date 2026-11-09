@@ -340,8 +340,9 @@ def _dask_ml_tsqr_arm(X: np.ndarray, k: int, state: Mapping[str, Any]) -> dict[s
     reduction has to beat.
 
     ``dask_ml`` REFUSES a numpy array, so this arm necessarily builds and executes a dask graph: the array is rebuilt
-    inside every timed call so the reported time includes the construction a real caller pays. The mean is computed
-    on the Dask side because ``TruncatedSVD`` centers internally without exposing ``mean_``.
+    inside every timed call so the reported time includes the construction a real caller pays. The input is CENTERED
+    on the Dask side inside the same call, because ``TruncatedSVD`` (sklearn and dask-ml alike) treats its input as
+    already centered and does not center it; the exact reference and every other arm are computed on centered data.
 
     - ``:param X:`` ``(n_samples, n_features)`` input.
     - ``:param k:`` Number of components to retain.
@@ -354,12 +355,18 @@ def _dask_ml_tsqr_arm(X: np.ndarray, k: int, state: Mapping[str, Any]) -> dict[s
     dX = da.from_array(X, chunks=(chunk_rows, n_features))
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
+        # TruncatedSVD (sklearn and dask-ml alike) treats its input as ALREADY CENTERED and does not center it. The
+        # exact reference and every other arm work on centered data, so the correct USE of this library is to center
+        # first; an uncentered fit would compare the raw data's subspace (mean direction included) against reference
+        # subspaces of centered data and report a mean-mismatch deflection instead of the TSQR's own error.
+        dmean = dX.mean(axis=0)
+        dXc = dX - dmean
         est = state["object"](n_components=int(k), algorithm="tsqr", random_state=SEED)
-        est.fit(dX)
+        est.fit(dXc)
         components = np.asarray(est.components_, dtype=np.float64)
         raw_singular = est.singular_values_
         singular = np.zeros(0) if raw_singular is None else np.asarray(raw_singular, dtype=np.float64)
-        mean = np.asarray(dX.mean(axis=0).compute(), dtype=np.float64)
+        mean = np.asarray(dmean.compute(), dtype=np.float64)
     return {
         "components": components,
         "singular_values": singular,
@@ -453,8 +460,8 @@ ARM_NOTES: dict[str, str] = {
     "dask_ml_tsqr_svd": (
         'the exact distributed TSQR the Dask stack itself exposes (dask.array + TruncatedSVD, algorithm="tsqr"). '
         "It requires a dask.array and refuses numpy outright, so this arm pays an intra-process graph execution a "
-        "numpy arm does not; that is the cost of the library path. Centers on the Dask side: TruncatedSVD does not "
-        "expose mean_"
+        "numpy arm does not; that is the cost of the library path. It centers its input on the Dask side because "
+        "TruncatedSVD (sklearn and dask-ml alike) treats the input as already centered and does not center it"
     ),
 }
 
