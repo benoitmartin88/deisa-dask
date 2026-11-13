@@ -16,6 +16,11 @@ Types of changes:
 
 ## [Unreleased]
 
+### Added
+
+- `AGENTS.md`: agent-oriented contributor guidance, following the
+  [AGENTS.md](https://agents.md) convention.
+
 ### Changed
 
 - getting-started: add feedback (`bridge.get()` and `deisa.set()`)
