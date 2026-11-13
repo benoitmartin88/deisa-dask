@@ -238,24 +238,23 @@ class TestBridge:
         original_buffer_addr = data.__array_interface__["data"][0]
 
         # (a) The benchmark call shape: one ndarray, no ``workers`` argument.
-        res = bridge._scatter_full(data)
-        future = res["future"]
-        assert set(res["who_has"]) == {future}
-        assert res["nbytes"][future] == data.nbytes
-        assert res["who_has"][future] == [sorted_workers[0]], res["who_has"]
+        scatter_result = bridge._scatter_full(data)
+        future = scatter_result["future"][0]
+        assert set(scatter_result["who_has"]) == {future}
+        assert scatter_result["nbytes"][future] == data.nbytes
+        assert scatter_result["who_has"][future] == [sorted_workers[0]], scatter_result["who_has"]
 
         who_has = client.who_has()
         assert who_has[future] == [sorted_workers[0]], "default scatter did not register the key with the scheduler"
         worker = self._inproc_workers(cluster)[sorted_workers[0]]
         assert worker.data[future].__array_interface__["data"][0] == original_buffer_addr, "default scatter copied"
 
-        # (b) The default really is the FULL worker set, not just the first one: a multi-element payload must
-        # round-robin across every worker the bridge knows about.
-        results = bridge._scatter_full([np.zeros(2), np.ones(2)])
-        assert len(results) == 2
-        keys = [r["future"] for r in results]
-        who_has = client.who_has()
-        assert {addr for k in keys for addr in who_has[k]} == all_addrs
+        # (b) The default really is the FULL worker set, not just the first one: the scatter primitive round-robins
+        # a multi-key payload across every worker it is given, and ``_scatter_full`` defaults that list to the full
+        # set.
+        payload = {"k-a": np.zeros(2), "k-b": np.ones(2)}
+        who_has, _nbytes = bridge.client.sync(bridge._scatter_payload, sorted_workers, payload)
+        assert {addr for addrs in who_has.values() for addr in addrs} == all_addrs
 
     def test_precompute_partial_is_zero_copy_local(self, env_setup_inproc):
         """A LOCAL precompute partial reaches the in-process worker numerically intact on an ``inproc://`` cluster.
@@ -436,7 +435,7 @@ class TestBridge:
     def test_precompute_partial_reaches_inprocess_worker_zero_copy(self):
         """The precompute path delivers its PARTIAL to an in-process worker ZERO-COPIED.
 
-        ``send()`` with precompute-active routes ``_scatter_partials`` -> ``_scatter_to_workers_async`` ->
+        ``send()`` with precompute-active routes ``_scatter_partials`` -> ``_scatter_payload`` ->
         ``_better_scatter_to_workers``, so on one send() it asserts: (1) the worker's partial buffer address is
         identical to what the bridge wrote -- nothing serialized; (2) the callback's reduction is the true sum of
         the global data; (3) the full chunk is resident on no worker (only the partial may cross bridge -> worker).
@@ -503,7 +502,9 @@ class TestBridge:
                 return {k: (v.nbytes if hasattr(v, "nbytes") else None) for k, v in dask_worker.data.items()}
 
             out = original_scatter_partials(partials, branches, array_name_arg, workers)
-            scatter_info.update(out)
+            scatter_result, futures_entries = out
+            scatter_info["scatter"] = scatter_result
+            scatter_info["entries"] = {entry["output_key"]: entry for entry in futures_entries}
             snapshot["per_worker"] = client.run(inspect)
             snapshot["inproc"] = {k: v for k, v in inproc_worker.data.items()}
             return out
@@ -530,10 +531,10 @@ class TestBridge:
         assert bridge._task_branches.get(array_name), "bridge has no cached branch: the precompute path never engaged"
 
         try:
-            future_info = scatter_info["future-info"]
+            future_info = scatter_info["scatter"]
             for output_key, partial in recorded.items():
                 # Use the key the scatter reported rather than pattern-matching who_has (may already be released).
-                meta = scatter_info["precomputed"][output_key]
+                meta = scatter_info["entries"][output_key]
                 key = meta["future"]
                 assert key in future_info["who_has"], f"scattered key {key!r} missing from the who_has report"
                 assert future_info["who_has"][key] == [inproc_worker.address], (
