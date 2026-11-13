@@ -88,6 +88,9 @@ Notes:
   diff hunk is yours.
 - Record user-visible changes in [CHANGELOG.md](CHANGELOG.md) (Keep a
   Changelog) under the appropriate `Unreleased` section, in the same PR.
+- When the change addresses an open issue, the commit message must state that
+  it closes it with a closing keyword — e.g. `Closes #149` in the commit body
+  — so the issue closes automatically when the PR merges.
 - Do not reference `.md` files from code — comments, docstrings, and error
   messages must be self-contained.
 - Commits must be authored with the contributor's real identity (`git config

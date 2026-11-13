@@ -34,6 +34,9 @@ pip install -e ".[test,mpi]"
 - Branch per concern: keep each branch focused on a single logical change so it
   stays easy to review. If you find yourself mixing unrelated edits, split them.
 - Base your branch on the latest `main` before opening a PR.
+- When a change addresses an open issue, the commit message must state that it
+  closes it with a closing keyword (e.g. `Closes #149` in the commit body), so
+  the issue is closed automatically when the PR merges.
 
 The repository uses git worktrees for parallel branches; you may find
 
